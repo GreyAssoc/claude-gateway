@@ -1,0 +1,43 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - SIDECAR_URL=http://sidecar:3001
+      - WORK_DIR=${WORK_DIR:-/home/user/project}
+      - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-50}
+      - RATE_LIMIT_ITPM=${RATE_LIMIT_ITPM:-40000}
+      - RATE_LIMIT_OTPM=${RATE_LIMIT_OTPM:-8000}
+    depends_on:
+      sidecar:
+        condition: service_healthy
+    restart: unless-stopped
+
+  sidecar:
+    build:
+      context: .
+      dockerfile: Dockerfile.sidecar
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - WORK_DIR=${WORK_DIR:-/home/user/project}
+      - SIDECAR_PORT=3001
+      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}
+      - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET}
+    volumes:
+      # Your project files
+      - ${PROJECT_PATH:-./my-project}:/home/user/project
+      # Pre-authenticated Google OAuth tokens
+      - ./google-tokens:/root/.config/workspace-mcp
+    expose:
+      - "3001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped

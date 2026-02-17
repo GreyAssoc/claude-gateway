@@ -1,0 +1,16 @@
+.env
+google-tokens/
+my-project/
+
+# Go
+gateway
+*.exe
+
+# Node
+node_modules/
+sidecar/node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp

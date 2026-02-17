@@ -1,0 +1,29 @@
+FROM node:20-slim
+
+# Install Python for Google Workspace MCP server
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-venv pipx git ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code globally
+RUN npm install -g @anthropic-ai/claude-code
+
+# Install Google Workspace MCP server
+RUN pipx install workspace-mcp && pipx ensurepath
+ENV PATH="/root/.local/bin:$PATH"
+
+# Sidecar app
+WORKDIR /app
+COPY sidecar/package.json sidecar/package-lock.json* ./
+RUN npm install --production
+COPY sidecar/index.js .
+
+# Claude Code MCP configuration
+# This tells Claude Code where to find the Google Workspace MCP server
+RUN mkdir -p /root/.config/claude-code
+COPY configs/claude-code-settings.json /root/.config/claude-code/settings.json
+
+EXPOSE 3001
+
+CMD ["node", "index.js"]

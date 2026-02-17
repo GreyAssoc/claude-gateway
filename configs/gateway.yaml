@@ -1,0 +1,59 @@
+# Gateway configuration
+# Cron schedules use standard cron syntax: min hour day month weekday
+
+cron:
+  morning_briefing:
+    schedule: "0 7 * * 1-5"
+    prompt: >
+      Check my Gmail for urgent unread messages from the last 12 hours,
+      check my calendar for today's events, and give me a concise morning
+      briefing. Keep it short — bullet the top 3 priorities.
+    enabled: true
+
+  end_of_day:
+    schedule: "0 18 * * 1-5"
+    prompt: >
+      Summarize what happened today: important emails received, calendar
+      events completed, and any action items I should follow up on tomorrow.
+    enabled: true
+
+  weekly_review:
+    schedule: "0 9 * * 1"
+    prompt: >
+      Check my Google Drive for files modified in the last week in my
+      Projects folder. Summarize key changes and flag anything that
+      needs attention this week.
+    enabled: true
+
+watchers:
+  gmail:
+    enabled: true
+    interval_seconds: 120
+    prompt: >
+      Check Gmail for messages received after {since}. If there are none,
+      reply with exactly "NONE". If there are new messages, list sender
+      and subject for each, one per line.
+
+  calendar:
+    enabled: true
+    interval_seconds: 300
+    prompt: >
+      Check my calendar for events starting in the next 15 minutes.
+      Reply with JSON array: [{"id":"...","title":"...","time":"...","location":"..."}].
+      If none, reply with [].
+
+heartbeat:
+  enabled: true
+  interval_seconds: 300
+  max_failures: 3
+
+sidecar:
+  url: "${SIDECAR_URL:-http://sidecar:3001}"
+  timeout_seconds: 300
+  health_path: "/health"
+
+ratelimiter:
+  rpm: ${RATE_LIMIT_RPM:-50}
+  itpm: ${RATE_LIMIT_ITPM:-40000}
+  otpm: ${RATE_LIMIT_OTPM:-8000}
+  safety_margin: 0.85
