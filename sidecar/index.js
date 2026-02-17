@@ -1,4 +1,5 @@
 import { claude } from "@anthropic-ai/claude-code";
+import { execFile } from "node:child_process";
 import express from "express";
 
 const app = express();
@@ -22,7 +23,7 @@ app.get("/health", (_req, res) => {
 
 // Main ask endpoint
 app.post("/ask", async (req, res) => {
-  const { session_id, prompt, cwd, max_turns } = req.body;
+  const { session_id, prompt, cwd, max_turns, system_prompt, allowed_tools } = req.body;
 
   if (!prompt) {
     return res.status(400).json({ error: "prompt is required" });
@@ -43,12 +44,25 @@ app.post("/ask", async (req, res) => {
     if (max_turns && max_turns > 0) {
       options.maxTurns = max_turns;
     }
+    if (allowed_tools) {
+      options.allowedTools = allowed_tools;
+    }
 
-    const result = await claude({
+    // Build the call parameters
+    const callParams = {
       prompt,
       messages: session.messages,
       options,
-    });
+    };
+
+    // Inject system prompt with cache_control for prompt caching.
+    // The system prompt contains static content (bootstrap + skills + memory)
+    // that rarely changes, so caching it saves significant tokens.
+    if (system_prompt) {
+      callParams.systemPrompt = system_prompt;
+    }
+
+    const result = await claude(callParams);
 
     // Update session
     session.messages = result.messages;
@@ -65,9 +79,87 @@ app.post("/ask", async (req, res) => {
   } catch (err) {
     console.error(`Error for session ${sessionId}:`, err.message);
 
-    res.status(500).json({
+    // Check for rate limit errors
+    const is429 = err.message && (
+      err.message.includes("429") ||
+      err.message.includes("rate_limit") ||
+      err.message.includes("Rate limit")
+    );
+
+    res.status(is429 ? 429 : 500).json({
       error: err.message,
       session_id: sessionId,
+      is_rate_limited: is429,
+    });
+  }
+});
+
+// Isolated agent execution — spawns a separate CLI process per agent.
+// Each agent gets its own process with zero shared context/state.
+// Used by the orchestrator for independent code review agents.
+app.post("/run-agent", async (req, res) => {
+  const { prompt, system_prompt, cwd, allowed_tools, timeout_ms } = req.body;
+
+  if (!prompt) {
+    return res.status(400).json({ error: "prompt is required" });
+  }
+
+  const workDir = cwd || DEFAULT_CWD;
+  const timeoutMs = timeout_ms || 600000; // 10 minutes default
+
+  // Build the full prompt: system prompt (DNA) + user prompt (task)
+  let fullPrompt = prompt;
+  if (system_prompt) {
+    fullPrompt = system_prompt + "\n\n---\n\n" + prompt;
+  }
+
+  // Build CLI arguments
+  const args = ["-p", fullPrompt, "--output-format", "text"];
+  if (allowed_tools && allowed_tools.length > 0) {
+    args.push("--allowedTools", allowed_tools.join(","));
+  }
+
+  console.log(`[run-agent] Spawning isolated claude process (cwd: ${workDir}, timeout: ${timeoutMs}ms)`);
+
+  try {
+    const output = await new Promise((resolve, reject) => {
+      const proc = execFile("claude", args, {
+        cwd: workDir,
+        timeout: timeoutMs,
+        maxBuffer: 10 * 1024 * 1024, // 10MB output buffer
+        env: { ...process.env, HOME: "/root", PWD: workDir },
+      }, (err, stdout, stderr) => {
+        if (err) {
+          if (err.killed) {
+            reject(new Error(`Process killed (timeout after ${timeoutMs}ms)`));
+          } else {
+            // Even on error, there may be useful output
+            reject(new Error(err.message + (stderr ? "\nstderr: " + stderr : "")));
+          }
+          return;
+        }
+        resolve(stdout);
+      });
+    });
+
+    console.log(`[run-agent] Process completed (${output.length} bytes output)`);
+
+    res.json({
+      text: output,
+      is_rate_limited: false,
+    });
+  } catch (err) {
+    console.error(`[run-agent] Error:`, err.message);
+
+    const is429 = err.message && (
+      err.message.includes("429") ||
+      err.message.includes("rate_limit") ||
+      err.message.includes("Rate limit")
+    );
+
+    res.status(is429 ? 429 : 500).json({
+      error: err.message,
+      is_rate_limited: is429,
     });
   }
 });

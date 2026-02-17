@@ -16,6 +16,11 @@ type Config struct {
 	Cron        map[string]CronJob
 	Watchers    WatchersConfig
 	Heartbeat   HeartbeatConfig
+	Database    DatabaseConfig
+	Skills      SkillsConfig
+	Memory      MemoryConfig
+	Orchestrator OrchestratorConfig
+	Dashboard   DashboardConfig
 	WorkDir     string
 }
 
@@ -61,6 +66,32 @@ type HeartbeatConfig struct {
 	MaxFailures     int  `yaml:"max_failures"`
 }
 
+type DatabaseConfig struct {
+	Path string `yaml:"path"`
+}
+
+type SkillsConfig struct {
+	Dirs []string `yaml:"dirs"`
+}
+
+type MemoryConfig struct {
+	BootstrapDir     string `yaml:"bootstrap_dir"`
+	DailyDir         string `yaml:"daily_dir"`
+	MaxCuratedInject int    `yaml:"max_curated_inject"`
+	MaxDailyDays     int    `yaml:"max_daily_days"`
+}
+
+type OrchestratorConfig struct {
+	AgentDNADir string `yaml:"agent_dna_dir"`
+	Timeout     int    `yaml:"timeout_seconds"`
+}
+
+type DashboardConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Port     int    `yaml:"port"`
+	BearerToken string
+}
+
 // rawConfig mirrors the YAML structure before env var resolution
 type rawConfig struct {
 	Cron      map[string]CronJob `yaml:"cron"`
@@ -77,6 +108,11 @@ type rawConfig struct {
 		OTPM         interface{} `yaml:"otpm"`
 		SafetyMargin float64     `yaml:"safety_margin"`
 	} `yaml:"ratelimiter"`
+	Database     DatabaseConfig     `yaml:"database"`
+	Skills       SkillsConfig       `yaml:"skills"`
+	Memory       MemoryConfig       `yaml:"memory"`
+	Orchestrator OrchestratorConfig `yaml:"orchestrator"`
+	Dashboard    DashboardConfig    `yaml:"dashboard"`
 }
 
 func Load(yamlPath string) (*Config, error) {
@@ -122,6 +158,33 @@ func Load(yamlPath string) (*Config, error) {
 	if cfg.Heartbeat.MaxFailures == 0 {
 		cfg.Heartbeat.MaxFailures = 3
 	}
+	if cfg.Database.Path == "" {
+		cfg.Database.Path = "data/gateway.db"
+	}
+	if len(cfg.Skills.Dirs) == 0 {
+		cfg.Skills.Dirs = []string{"skills"}
+	}
+	if cfg.Memory.BootstrapDir == "" {
+		cfg.Memory.BootstrapDir = "memory/bootstrap"
+	}
+	if cfg.Memory.DailyDir == "" {
+		cfg.Memory.DailyDir = "memory/daily"
+	}
+	if cfg.Memory.MaxCuratedInject == 0 {
+		cfg.Memory.MaxCuratedInject = 20
+	}
+	if cfg.Memory.MaxDailyDays == 0 {
+		cfg.Memory.MaxDailyDays = 7
+	}
+	if cfg.Orchestrator.AgentDNADir == "" {
+		cfg.Orchestrator.AgentDNADir = "/app/agents"
+	}
+	if cfg.Orchestrator.Timeout == 0 {
+		cfg.Orchestrator.Timeout = 600
+	}
+	if cfg.Dashboard.Port == 0 {
+		cfg.Dashboard.Port = 8080
+	}
 
 	return cfg, nil
 }
@@ -151,6 +214,12 @@ func loadYAML(path string, cfg *Config) error {
 	cfg.RateLimiter.RPM = resolveInt(raw.RateLimiter.RPM, 50)
 	cfg.RateLimiter.ITPM = resolveInt(raw.RateLimiter.ITPM, 40000)
 	cfg.RateLimiter.OTPM = resolveInt(raw.RateLimiter.OTPM, 8000)
+
+	cfg.Database = raw.Database
+	cfg.Skills = raw.Skills
+	cfg.Memory = raw.Memory
+	cfg.Orchestrator = raw.Orchestrator
+	cfg.Dashboard = raw.Dashboard
 
 	return nil
 }
@@ -197,6 +266,13 @@ func loadEnv(cfg *Config) {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.RateLimiter.OTPM = n
 		}
+	}
+
+	if v := os.Getenv("DB_PATH"); v != "" {
+		cfg.Database.Path = v
+	}
+	if v := os.Getenv("DASHBOARD_TOKEN"); v != "" {
+		cfg.Dashboard.BearerToken = v
 	}
 }
 

@@ -3,15 +3,22 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.gateway
+    env_file: .env
     environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - SIDECAR_URL=http://sidecar:3001
-      - WORK_DIR=${WORK_DIR:-/home/user/project}
-      - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-50}
-      - RATE_LIMIT_ITPM=${RATE_LIMIT_ITPM:-40000}
-      - RATE_LIMIT_OTPM=${RATE_LIMIT_OTPM:-8000}
+      - DB_PATH=/app/data/gateway.db
+      # WORK_DIR must match the sidecar's mount point, not the host path.
+      # The sidecar has the workspace at /workspace — gateway sends this as cwd.
+      - WORK_DIR=/workspace
+    volumes:
+      - gateway-data:/app/data
+      - ./skills:/app/skills
+      - ./memory:/app/memory
+      - ./configs:/app/configs
+      # Agent DNA files for orchestrator (read-only)
+      - ${WORK_DIR}/.claude/agents:/app/agents:ro
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"
     depends_on:
       sidecar:
         condition: service_healthy
@@ -22,15 +29,14 @@ services:
       context: .
       dockerfile: Dockerfile.sidecar
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - WORK_DIR=${WORK_DIR:-/home/user/project}
       - SIDECAR_PORT=3001
-      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}
-      - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET}
+      - WORK_DIR=/workspace
     volumes:
-      # Your project files
-      - ${PROJECT_PATH:-./my-project}:/home/user/project
-      # Pre-authenticated Google OAuth tokens
+      # Host workspace — mounted so Claude Code can read/write project files
+      - ${WORK_DIR}:/workspace
+      # Claude OAuth credentials — subscription auth (no API key)
+      - ${CLAUDE_CONFIG_DIR}:/root/.claude:ro
+      # Google Workspace MCP tokens (optional)
       - ./google-tokens:/root/.config/workspace-mcp
     expose:
       - "3001"
@@ -41,3 +47,6 @@ services:
       retries: 5
       start_period: 15s
     restart: unless-stopped
+
+volumes:
+  gateway-data:

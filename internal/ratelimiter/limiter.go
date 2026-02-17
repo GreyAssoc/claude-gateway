@@ -8,6 +8,11 @@ import (
 	"github.com/you/claude-gateway/internal/agent"
 )
 
+// DBRecorder is an optional interface for persisting rate limit snapshots.
+type DBRecorder interface {
+	RecordRateLimitSnapshot(requests, inputTokens, outputTokens int, headroom float64) error
+}
+
 // Status represents the current rate limit state.
 type Status struct {
 	RPM          string  `json:"rpm"`
@@ -27,13 +32,16 @@ type Limiter struct {
 	maxOTPM int
 	margin  float64
 
-	requests    int
-	inputTokens int
+	requests     int
+	inputTokens  int
 	outputTokens int
-	windowStart time.Time
+	windowStart  time.Time
 
 	// Queued requests when over limit
 	queue []queuedRequest
+
+	// Optional DB recorder for snapshots
+	db DBRecorder
 }
 
 type queuedRequest struct {
@@ -49,6 +57,13 @@ func New(rpm, itpm, otpm int, safetyMargin float64) *Limiter {
 		margin:      safetyMargin,
 		windowStart: time.Now(),
 	}
+}
+
+// SetDB attaches a database recorder for persisting snapshots.
+func (l *Limiter) SetDB(db DBRecorder) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.db = db
 }
 
 // CanProceed checks if a request with the estimated input tokens can be made.
@@ -82,6 +97,18 @@ func (l *Limiter) Record(usage *agent.Usage) {
 	// Only uncached input tokens count towards ITPM
 	l.inputTokens += usage.InputTokens
 	l.outputTokens += usage.OutputTokens
+
+	// Async-write snapshot to DB if available
+	if l.db != nil {
+		headroom := l.calcHeadroom()
+		db := l.db
+		reqs := l.requests
+		inp := l.inputTokens
+		out := l.outputTokens
+		go func() {
+			_ = db.RecordRateLimitSnapshot(reqs, inp, out, headroom)
+		}()
+	}
 }
 
 // GetStatus returns current rate limit utilization.
@@ -94,25 +121,7 @@ func (l *Limiter) GetStatus() Status {
 	elapsed := time.Since(l.windowStart)
 	remaining := time.Minute - elapsed
 
-	headroom := 1.0
-	if l.maxRPM > 0 {
-		rpmUtil := float64(l.requests) / (float64(l.maxRPM) * l.margin)
-		if rpmUtil > headroom || rpmUtil < headroom {
-			headroom = min(headroom, 1.0-rpmUtil)
-		}
-	}
-	if l.maxITPM > 0 {
-		itpmUtil := float64(l.inputTokens) / (float64(l.maxITPM) * l.margin)
-		headroom = min(headroom, 1.0-itpmUtil)
-	}
-	if l.maxOTPM > 0 {
-		otpmUtil := float64(l.outputTokens) / (float64(l.maxOTPM) * l.margin)
-		headroom = min(headroom, 1.0-otpmUtil)
-	}
-
-	if headroom < 0 {
-		headroom = 0
-	}
+	headroom := l.calcHeadroom()
 
 	return Status{
 		RPM:          fmt.Sprintf("%d/%d", l.requests, l.maxRPM),
@@ -122,6 +131,27 @@ func (l *Limiter) GetStatus() Status {
 		QueueDepth:   len(l.queue),
 		WindowResets: fmt.Sprintf("%.0fs", remaining.Seconds()),
 	}
+}
+
+// calcHeadroom returns the minimum headroom across all dimensions. Must hold mu.
+func (l *Limiter) calcHeadroom() float64 {
+	headroom := 1.0
+	if l.maxRPM > 0 {
+		rpmUtil := float64(l.requests) / (float64(l.maxRPM) * l.margin)
+		headroom = min(headroom, 1.0-rpmUtil)
+	}
+	if l.maxITPM > 0 {
+		itpmUtil := float64(l.inputTokens) / (float64(l.maxITPM) * l.margin)
+		headroom = min(headroom, 1.0-itpmUtil)
+	}
+	if l.maxOTPM > 0 {
+		otpmUtil := float64(l.outputTokens) / (float64(l.maxOTPM) * l.margin)
+		headroom = min(headroom, 1.0-otpmUtil)
+	}
+	if headroom < 0 {
+		headroom = 0
+	}
+	return headroom
 }
 
 func (l *Limiter) resetIfNewWindow() {

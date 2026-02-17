@@ -1,15 +1,15 @@
 FROM node:20-slim
 
-# Install Python for Google Workspace MCP server
+# Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv pipx git ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code globally
+# Install Claude Code globally (provides both CLI and SDK auth)
 RUN npm install -g @anthropic-ai/claude-code
 
-# Install Google Workspace MCP server
+# Install Google Workspace MCP server (optional, for Gmail/Calendar)
 RUN pipx install workspace-mcp && pipx ensurepath
 ENV PATH="/root/.local/bin:$PATH"
 
@@ -19,10 +19,13 @@ COPY sidecar/package.json sidecar/package-lock.json* ./
 RUN npm install --production
 COPY sidecar/index.js .
 
-# Claude Code MCP configuration
-# This tells Claude Code where to find the Google Workspace MCP server
+# Claude Code settings (MCP server config, permissions)
 RUN mkdir -p /root/.config/claude-code
 COPY configs/claude-code-settings.json /root/.config/claude-code/settings.json
+
+# OAuth credentials are mounted at runtime via docker-compose:
+#   ${CLAUDE_CONFIG_DIR} -> /root/.claude:ro
+# No ANTHROPIC_API_KEY needed — uses subscription OAuth.
 
 EXPOSE 3001
 

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Gateway v2</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>Claude Gateway <span class="version">v2</span></h1>
+        <div id="status-indicator" class="status-dot"></div>
+    </header>
+
+    <main>
+        <section id="status-section" class="card">
+            <h2>Status</h2>
+            <div id="status-content">Loading...</div>
+        </section>
+
+        <section id="rate-limits-section" class="card">
+            <h2>Rate Limits</h2>
+            <div id="rate-limits-content">Loading...</div>
+            <canvas id="usage-chart" width="600" height="200"></canvas>
+        </section>
+
+        <section id="skills-section" class="card">
+            <h2>Skills</h2>
+            <div id="skills-content">Loading...</div>
+        </section>
+
+        <section id="memory-section" class="card">
+            <h2>Memory</h2>
+            <div id="memory-content">Loading...</div>
+        </section>
+
+        <section id="sessions-section" class="card">
+            <h2>Recent Sessions</h2>
+            <div id="sessions-content">Loading...</div>
+        </section>
+
+        <section id="agents-section" class="card">
+            <h2>Agents</h2>
+            <div id="agents-content">Loading...</div>
+        </section>
+
+        <section id="runs-section" class="card">
+            <h2>Orchestrator Runs</h2>
+            <div id="runs-content">Loading...</div>
+        </section>
+    </main>
+
+    <footer>
+        <span id="last-updated">Last updated: never</span>
+        <span>Polling every 30s</span>
+    </footer>
+
+    <script src="app.js"></script>
+</body>
+</html>

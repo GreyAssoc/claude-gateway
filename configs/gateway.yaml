@@ -1,6 +1,27 @@
 # Gateway configuration
 # Cron schedules use standard cron syntax: min hour day month weekday
 
+database:
+  path: "data/gateway.db"
+
+skills:
+  dirs:
+    - "skills"
+
+memory:
+  bootstrap_dir: "memory/bootstrap"
+  daily_dir: "memory/daily"
+  max_curated_inject: 20
+  max_daily_days: 7
+
+orchestrator:
+  agent_dna_dir: "/app/agents"
+  timeout_seconds: 600
+
+dashboard:
+  enabled: true
+  port: 8080
+
 cron:
   morning_briefing:
     schedule: "0 7 * * 1-5"
@@ -23,6 +44,11 @@ cron:
       Check my Google Drive for files modified in the last week in my
       Projects folder. Summarize key changes and flag anything that
       needs attention this week.
+    enabled: true
+
+  memory_compaction:
+    schedule: "0 0 * * *"
+    prompt: "__INTERNAL_MEMORY_COMPACT__"
     enabled: true
 
 watchers:

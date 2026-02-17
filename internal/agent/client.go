@@ -21,10 +21,21 @@ type Usage struct {
 
 // Response is what the sidecar returns.
 type Response struct {
-	Text      string `json:"text"`
-	SessionID string `json:"session_id"`
-	Usage     *Usage `json:"usage,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Text          string `json:"text"`
+	SessionID     string `json:"session_id"`
+	Usage         *Usage `json:"usage,omitempty"`
+	Error         string `json:"error,omitempty"`
+	IsRateLimited bool   `json:"is_rate_limited,omitempty"`
+}
+
+// AskOptions configures a request to the sidecar.
+type AskOptions struct {
+	SessionID    string
+	Prompt       string
+	WorkDir      string
+	MaxTurns     int
+	SystemPrompt string
+	AllowedTools []string
 }
 
 // Client talks to the Node.js sidecar over HTTP.
@@ -46,14 +57,31 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 }
 
 // Ask sends a prompt to Claude via the sidecar and returns the response.
+// For backward compatibility, accepts the old positional arguments.
 func (c *Client) Ask(ctx context.Context, sessionID, prompt, workDir string, maxTurns int) (*Response, error) {
+	return c.AskWithOptions(ctx, AskOptions{
+		SessionID: sessionID,
+		Prompt:    prompt,
+		WorkDir:   workDir,
+		MaxTurns:  maxTurns,
+	})
+}
+
+// AskWithOptions sends a prompt with full configuration options.
+func (c *Client) AskWithOptions(ctx context.Context, opts AskOptions) (*Response, error) {
 	payload := map[string]interface{}{
-		"session_id": sessionID,
-		"prompt":     prompt,
-		"cwd":        workDir,
+		"session_id": opts.SessionID,
+		"prompt":     opts.Prompt,
+		"cwd":        opts.WorkDir,
 	}
-	if maxTurns > 0 {
-		payload["max_turns"] = maxTurns
+	if opts.MaxTurns > 0 {
+		payload["max_turns"] = opts.MaxTurns
+	}
+	if opts.SystemPrompt != "" {
+		payload["system_prompt"] = opts.SystemPrompt
+	}
+	if len(opts.AllowedTools) > 0 {
+		payload["allowed_tools"] = opts.AllowedTools
 	}
 
 	body, err := json.Marshal(payload)
@@ -76,18 +104,100 @@ func (c *Client) Ask(ctx context.Context, sessionID, prompt, workDir string, max
 
 	c.setHealthy(true)
 
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("sidecar returned %d: %s", resp.StatusCode, string(respBody))
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
 	}
 
 	var result Response
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		result.IsRateLimited = true
+		return &result, fmt.Errorf("rate limited (429): %s", result.Error)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("sidecar returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	if result.Error != "" {
 		return &result, fmt.Errorf("claude error: %s", result.Error)
+	}
+
+	return &result, nil
+}
+
+// RunAgentOptions configures an isolated CLI agent execution.
+type RunAgentOptions struct {
+	Prompt       string
+	SystemPrompt string
+	WorkDir      string
+	AllowedTools []string
+	TimeoutMs    int
+}
+
+// RunIsolatedAgent spawns an isolated claude CLI process via the sidecar.
+// Each call creates a completely separate process with zero shared context.
+// Used by the orchestrator for independent code review agents.
+func (c *Client) RunIsolatedAgent(ctx context.Context, opts RunAgentOptions) (*Response, error) {
+	payload := map[string]interface{}{
+		"prompt": opts.Prompt,
+		"cwd":    opts.WorkDir,
+	}
+	if opts.SystemPrompt != "" {
+		payload["system_prompt"] = opts.SystemPrompt
+	}
+	if len(opts.AllowedTools) > 0 {
+		payload["allowed_tools"] = opts.AllowedTools
+	}
+	if opts.TimeoutMs > 0 {
+		payload["timeout_ms"] = opts.TimeoutMs
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/run-agent", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		c.setHealthy(false)
+		return nil, fmt.Errorf("sidecar request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	c.setHealthy(true)
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	var result Response
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		result.IsRateLimited = true
+		return &result, fmt.Errorf("rate limited (429): %s", result.Error)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("sidecar returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	if result.Error != "" {
+		return &result, fmt.Errorf("agent error: %s", result.Error)
 	}
 
 	return &result, nil
