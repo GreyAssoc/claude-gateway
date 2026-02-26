@@ -128,7 +128,7 @@ func (t *Triager) Analyze(ctx context.Context, message string) (*Analysis, error
 	}
 
 	var resp triageResponse
-	err := t.llm.GenerateJSON(ctx, message, triageSystemPrompt, &resp)
+	err := t.llm.GenerateJSONWithOpts(ctx, message, triageSystemPrompt, &resp, ollama.FastClassifyOpts)
 	if err != nil {
 		log.Printf("Triage analysis failed (passing to Claude): %v", err)
 		return &Analysis{CanHandleLocally: false}, nil

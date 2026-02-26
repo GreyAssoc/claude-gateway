@@ -18,6 +18,10 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN curl -fsSL https://github.com/steipete/gogcli/releases/download/v0.11.0/gogcli_0.11.0_linux_amd64.tar.gz \
     | tar -xz -C /usr/local/bin gog && chmod +x /usr/local/bin/gog
 
+# Install Playwright MCP server + Chromium for web browsing
+RUN npm install -g @playwright/mcp@latest && \
+    npx playwright install --with-deps chromium
+
 # Sidecar app
 WORKDIR /app
 COPY sidecar/package.json sidecar/package-lock.json* ./
@@ -35,8 +39,10 @@ COPY configs/claude-code-settings.json /root/.config/claude-code/settings.json
 
 EXPOSE 3001
 
-# Copy OAuth creds and gog config from read-only mounts to writable dirs, then start
+# Copy OAuth creds and gog config from read-only mounts to writable dirs, then start.
+# Settings are copied AFTER OAuth creds to ensure they aren't overwritten.
 CMD ["sh", "-c", "\
   mkdir -p /root/.claude && cp -a /root/.claude-ro/. /root/.claude/ && echo 'Claude OAuth creds copied OK' && \
+  cp /root/.config/claude-code/settings.json /root/.claude/settings.json && echo 'Claude Code settings applied' && \
   if [ -d /root/.config/gogcli-ro ]; then mkdir -p /root/.config/gogcli && cp -a /root/.config/gogcli-ro/. /root/.config/gogcli/ && echo 'gog config copied OK'; fi && \
   exec node index.js"]

@@ -92,6 +92,25 @@ Steve will refer to projects by road name, client name, or abbreviation. Search 
 find /clients/current/ -maxdepth 1 -iname "*redan*" -type d
 ```
 
+## Web Browsing & Research
+
+You have full internet access. Use these tools to find information online:
+
+### Quick Lookups (preferred — fast and lightweight)
+- **WebFetch** — Fetch and read any web page. Give it a URL and describe what to extract.
+  Example: `WebFetch("https://docs.example.com/api", "Find the authentication endpoints")`
+- **WebSearch** — Search the web for information. Returns titles, snippets, and URLs.
+  Example: `WebSearch("claude code agent SDK documentation 2026")`
+
+### Browser Automation (Playwright MCP — for interactive sites)
+For JavaScript-heavy pages, login flows, or complex interactions, use Playwright tools:
+- `mcp__playwright__browser_navigate` — Open a URL in the browser
+- `mcp__playwright__browser_screenshot` — Capture what's on screen
+- `mcp__playwright__browser_click` — Click elements on the page
+- `mcp__playwright__browser_type` — Type text into input fields
+
+**Always try WebFetch/WebSearch first** — they're faster and use less resources. Use Playwright only when you need to interact with a page (login forms, JavaScript-rendered content, multi-step workflows).
+
 ## How You're Accessed
 
 - **Telegram**: Users message you via @PTPClaudeBot

@@ -94,6 +94,7 @@ async function handleAsk(msg, send) {
     if (max_turns && max_turns > 0) options.maxTurns = max_turns;
     options.allowedTools = allowed_tools || [
       "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+      "WebFetch", "WebSearch",
     ];
     if (system_prompt) options.systemPrompt = system_prompt;
     // model is only passed to CLI (run-agent), not the SDK — the SDK does not

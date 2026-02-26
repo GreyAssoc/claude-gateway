@@ -4,7 +4,16 @@
       "Bash(*)",
       "Read(*)",
       "Write(*)",
-      "Edit(*)"
+      "Edit(*)",
+      "WebFetch(*)",
+      "WebSearch(*)",
+      "mcp__playwright__*"
     ]
+  },
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest", "--headless"]
+    }
   }
 }

@@ -111,14 +111,27 @@ func (c *Client) EmbedBatch(ctx context.Context, texts []string) ([][]float32, e
 	return results, nil
 }
 
-// Generate sends a prompt to the LLM and returns the response text.
-func (c *Client) Generate(ctx context.Context, prompt, systemPrompt string) (string, error) {
-	return c.generate(ctx, prompt, systemPrompt, "")
+// GenerateOpts controls Ollama generation parameters for performance tuning.
+type GenerateOpts struct {
+	// NumPredict caps the maximum tokens generated. Lower = faster for short outputs.
+	// 0 means use Ollama's default.
+	NumPredict int
+	// Temperature controls randomness. 0 = greedy (fastest), 1 = default sampling.
+	// Negative means use Ollama's default.
+	Temperature float64
+	// KeepAlive tells Ollama how long to keep the model loaded after the request.
+	// Examples: "10m", "1h", "0" (unload immediately). Empty = Ollama default (5m).
+	KeepAlive string
 }
 
-// generate is the internal implementation that supports an optional format parameter.
-// When format is "json", Ollama constrains the model's output to valid JSON.
-func (c *Client) generate(ctx context.Context, prompt, systemPrompt, format string) (string, error) {
+// Generate sends a prompt to the LLM and returns the response text.
+func (c *Client) Generate(ctx context.Context, prompt, systemPrompt string) (string, error) {
+	return c.generate(ctx, prompt, systemPrompt, "", nil)
+}
+
+// generate is the internal implementation that supports an optional format parameter
+// and performance options. When format is "json", Ollama constrains output to valid JSON.
+func (c *Client) generate(ctx context.Context, prompt, systemPrompt, format string, opts *GenerateOpts) (string, error) {
 	if prompt == "" {
 		return "", fmt.Errorf("ollama generate: empty prompt")
 	}
@@ -133,6 +146,21 @@ func (c *Client) generate(ctx context.Context, prompt, systemPrompt, format stri
 	}
 	if format != "" {
 		payload["format"] = format
+	}
+	if opts != nil {
+		options := map[string]any{}
+		if opts.NumPredict > 0 {
+			options["num_predict"] = opts.NumPredict
+		}
+		if opts.Temperature >= 0 {
+			options["temperature"] = opts.Temperature
+		}
+		if len(options) > 0 {
+			payload["options"] = options
+		}
+		if opts.KeepAlive != "" {
+			payload["keep_alive"] = opts.KeepAlive
+		}
 	}
 
 	body, err := json.Marshal(payload)
@@ -166,11 +194,24 @@ func (c *Client) generate(ctx context.Context, prompt, systemPrompt, format stri
 	return result.Response, nil
 }
 
+// FastClassifyOpts are tuned for short JSON classification tasks like triage.
+// Greedy decoding (temperature=0), capped output (256 tokens), model kept warm (10m).
+var FastClassifyOpts = &GenerateOpts{
+	NumPredict:  256,
+	Temperature: 0,
+	KeepAlive:   "10m",
+}
+
 // GenerateJSON sends a prompt to the LLM, expecting JSON output, and unmarshals
 // the response into result. Uses Ollama's JSON mode (format: "json") to constrain
 // the model to valid JSON output. Falls back to extracting JSON substring if needed.
 func (c *Client) GenerateJSON(ctx context.Context, prompt, systemPrompt string, result any) error {
-	text, err := c.generate(ctx, prompt, systemPrompt, "json")
+	return c.GenerateJSONWithOpts(ctx, prompt, systemPrompt, result, nil)
+}
+
+// GenerateJSONWithOpts is like GenerateJSON but accepts performance tuning options.
+func (c *Client) GenerateJSONWithOpts(ctx context.Context, prompt, systemPrompt string, result any, opts *GenerateOpts) error {
+	text, err := c.generate(ctx, prompt, systemPrompt, "json", opts)
 	if err != nil {
 		return err
 	}
