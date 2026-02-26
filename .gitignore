@@ -1,14 +1,24 @@
+# Secrets & credentials
 .env
+client_secret_*.json
 google-tokens/
-my-project/
 
-# Go
-gateway
+# Runtime data
+data/
+my-project/
+.claude-progress.json
+
+# Go compiled binary (root only — not cmd/gateway/)
+/gateway
 *.exe
 
 # Node
 node_modules/
 sidecar/node_modules/
+
+# Ad-hoc test files
+sidecar/test-*.js
+/test_*.go
 
 # IDE
 .vscode/
