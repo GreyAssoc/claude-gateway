@@ -1,3 +1,4 @@
+// Package orchestrator runs multi-agent code review teams with consensus-based verdicts.
 package orchestrator
 
 import (
@@ -10,6 +11,7 @@ import (
 
 	"github.com/you/claude-gateway/internal/agent"
 	"github.com/you/claude-gateway/internal/db"
+	"github.com/you/claude-gateway/internal/format"
 )
 
 // Engine manages orchestrator team runs.
@@ -44,59 +46,7 @@ func NewEngine(database *db.DB, agentClient *agent.Client, agentDNADir, workspac
 
 // RunTeam executes all agents in a team sequentially and returns the consensus.
 func (e *Engine) RunTeam(ctx context.Context, teamName, task string) (*RunResult, error) {
-	team, ok := GetTeam(teamName)
-	if !ok {
-		return nil, fmt.Errorf("unknown team: %s (available: %s)", teamName, strings.Join(TeamNames(), ", "))
-	}
-
-	start := time.Now()
-	log.Printf("Orchestrator: running team %s (%d agents)", teamName, len(team.Agents))
-
-	// Create run record
-	runID, err := e.createRun(teamName, task)
-	if err != nil {
-		log.Printf("Orchestrator: warning creating run record: %v", err)
-	}
-
-	// Run each agent sequentially (independence: agents can't see each other's output)
-	var verdicts []Verdict
-	for _, ag := range team.Agents {
-		log.Printf("Orchestrator: running %s...", ag.Name)
-
-		verdict := RunAgent(ctx, e.agentClient, ag, task, e.agentDNADir, e.workspaceDir, e.timeout)
-		LogVerdict(verdict)
-		verdicts = append(verdicts, verdict)
-
-		// Save verdict to DB
-		if runID > 0 {
-			e.saveVerdict(runID, verdict)
-		}
-
-		// Check for context cancellation
-		if ctx.Err() != nil {
-			break
-		}
-	}
-
-	// Apply consensus
-	consensus := ApplyConsensus(verdicts)
-	duration := time.Since(start)
-
-	log.Printf("Orchestrator: %s complete in %v — %s", teamName, duration, consensus.Summary)
-
-	// Update run record
-	if runID > 0 {
-		e.completeRun(runID, consensus, verdicts, duration)
-	}
-
-	return &RunResult{
-		Team:      teamName,
-		Task:      task,
-		Consensus: consensus,
-		Verdicts:  verdicts,
-		Duration:  duration,
-		RunID:     runID,
-	}, nil
+	return e.RunTeamStreaming(ctx, teamName, task, nil)
 }
 
 // RunTeamStreaming executes all agents with streaming output via callback.
@@ -111,7 +61,10 @@ func (e *Engine) RunTeamStreaming(ctx context.Context, teamName, task string, on
 		onProgress(fmt.Sprintf("Starting %s (%d agents)...", teamName, len(team.Agents)))
 	}
 
-	runID, _ := e.createRun(teamName, task)
+	runID, err := e.createRun(ctx, teamName, task)
+	if err != nil {
+		log.Printf("Orchestrator: warning creating run record: %v", err)
+	}
 
 	var verdicts []Verdict
 	for i, ag := range team.Agents {
@@ -124,21 +77,12 @@ func (e *Engine) RunTeamStreaming(ctx context.Context, teamName, task string, on
 		verdicts = append(verdicts, verdict)
 
 		if runID > 0 {
-			e.saveVerdict(runID, verdict)
+			e.saveVerdict(ctx, runID, verdict)
 		}
 
 		// Report individual result
 		if onProgress != nil {
-			icon := "?"
-			switch {
-			case verdict.IsApproval():
-				icon = "PASS"
-			case verdict.IsRejection():
-				icon = "FAIL"
-			default:
-				icon = "WARN"
-			}
-			onProgress(fmt.Sprintf("[%s] %s — %d issues", icon, ag.Name, len(verdict.Issues)))
+			onProgress(fmt.Sprintf("[%s] %s — %d issues", verdict.Icon(), ag.Name, len(verdict.Issues)))
 		}
 
 		if ctx.Err() != nil {
@@ -150,7 +94,7 @@ func (e *Engine) RunTeamStreaming(ctx context.Context, teamName, task string, on
 	duration := time.Since(start)
 
 	if runID > 0 {
-		e.completeRun(runID, consensus, verdicts, duration)
+		e.completeRun(ctx, runID, consensus, verdicts, duration)
 	}
 
 	if onProgress != nil {
@@ -201,8 +145,8 @@ func (e *Engine) RunGauntlet(ctx context.Context, task, language string, onProgr
 }
 
 // ListRecentRuns returns the most recent orchestrator runs.
-func (e *Engine) ListRecentRuns(limit int) ([]RunSummary, error) {
-	rows, err := e.db.Query(
+func (e *Engine) ListRecentRuns(ctx context.Context, limit int) ([]RunSummary, error) {
+	rows, err := e.db.QueryContext(ctx,
 		`SELECT id, team, task, outcome, duration_ms, created_at
 		 FROM orchestrator_runs ORDER BY created_at DESC LIMIT ?`,
 		limit,
@@ -239,7 +183,7 @@ func ListAgentsText() string {
 	sb.WriteString("*Orchestrator Agents*\n\n")
 
 	for _, teamName := range TeamNames() {
-		team := AllTeams[teamName]
+		team, _ := GetTeam(teamName)
 		sb.WriteString(fmt.Sprintf("*%s*\n", teamName))
 		for _, ag := range team.Agents {
 			veto := ""
@@ -254,8 +198,8 @@ func ListAgentsText() string {
 }
 
 // RecentRunsText returns a formatted list of recent runs for Telegram.
-func (e *Engine) RecentRunsText(limit int) string {
-	runs, err := e.ListRecentRuns(limit)
+func (e *Engine) RecentRunsText(ctx context.Context, limit int) string {
+	runs, err := e.ListRecentRuns(ctx, limit)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
@@ -266,17 +210,14 @@ func (e *Engine) RecentRunsText(limit int) string {
 	var sb strings.Builder
 	sb.WriteString("*Recent Orchestrator Runs*\n\n")
 	for _, r := range runs {
-		task := r.Task
-		if len(task) > 60 {
-			task = task[:60] + "..."
-		}
+		task := format.Truncate(r.Task, 60)
 		sb.WriteString(fmt.Sprintf("#%d [%s] %s — %s (%dms)\n", r.ID, r.Outcome, r.Team, task, r.DurationMs))
 	}
 	return sb.String()
 }
 
-func (e *Engine) createRun(team, task string) (int64, error) {
-	result, err := e.db.Exec(
+func (e *Engine) createRun(ctx context.Context, team, task string) (int64, error) {
+	result, err := e.db.ExecContext(ctx,
 		`INSERT INTO orchestrator_runs (team, task, outcome, created_at)
 		 VALUES (?, ?, 'running', datetime('now'))`,
 		team, task,
@@ -287,19 +228,22 @@ func (e *Engine) createRun(team, task string) (int64, error) {
 	return result.LastInsertId()
 }
 
-func (e *Engine) saveVerdict(runID int64, v Verdict) {
-	issuesJSON, _ := json.Marshal(v.Issues)
-	_, err := e.db.Exec(
+func (e *Engine) saveVerdict(ctx context.Context, runID int64, v Verdict) {
+	issuesJSON, err := json.Marshal(v.Issues)
+	if err != nil {
+		log.Printf("Orchestrator: error marshaling issues: %v", err)
+		issuesJSON = []byte("[]")
+	}
+	if _, err = e.db.ExecContext(ctx,
 		`INSERT INTO orchestrator_verdicts (run_id, agent_name, verdict, confidence, issues_json, duration_ms, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
 		runID, v.AgentName, v.VerdictStr, v.Confidence, string(issuesJSON), v.DurationMs,
-	)
-	if err != nil {
+	); err != nil {
 		log.Printf("Orchestrator: error saving verdict: %v", err)
 	}
 }
 
-func (e *Engine) completeRun(runID int64, consensus Consensus, verdicts []Verdict, duration time.Duration) {
+func (e *Engine) completeRun(ctx context.Context, runID int64, consensus Consensus, verdicts []Verdict, duration time.Duration) {
 	outcome := "approved"
 	if consensus.Blocked {
 		outcome = "blocked"
@@ -307,15 +251,22 @@ func (e *Engine) completeRun(runID int64, consensus Consensus, verdicts []Verdic
 		outcome = "rejected"
 	}
 
-	consensusJSON, _ := json.Marshal(consensus)
-	verdictsJSON, _ := json.Marshal(verdicts)
+	consensusJSON, err := json.Marshal(consensus)
+	if err != nil {
+		log.Printf("Orchestrator: error marshaling consensus: %v", err)
+		consensusJSON = []byte("{}")
+	}
+	verdictsJSON, err := json.Marshal(verdicts)
+	if err != nil {
+		log.Printf("Orchestrator: error marshaling verdicts: %v", err)
+		verdictsJSON = []byte("[]")
+	}
 
-	_, err := e.db.Exec(
+	if _, err = e.db.ExecContext(ctx,
 		`UPDATE orchestrator_runs SET outcome = ?, consensus_json = ?, verdicts_json = ?, duration_ms = ?
 		 WHERE id = ?`,
 		outcome, string(consensusJSON), string(verdictsJSON), duration.Milliseconds(), runID,
-	)
-	if err != nil {
+	); err != nil {
 		log.Printf("Orchestrator: error completing run: %v", err)
 	}
 }

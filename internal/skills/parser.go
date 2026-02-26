@@ -3,13 +3,17 @@ package skills
 import (
 	"crypto/sha256"
 	"fmt"
+	"path/filepath"
 	"strings"
+
+	"github.com/you/claude-gateway/internal/format"
 )
 
 // Skill represents a parsed SKILL.md file.
 type Skill struct {
 	Name        string
 	Description string
+	Command     string // Telegram /command trigger (empty = no command routing)
 	Content     string
 	SourcePath  string
 	ContentHash string
@@ -30,6 +34,7 @@ type Skill struct {
 func ParseSkillMD(content, sourcePath string, precedence int) (*Skill, error) {
 	name := extractNameFromPath(sourcePath)
 	description := ""
+	command := ""
 	body := content
 
 	// Try to extract YAML frontmatter (between --- delimiters)
@@ -52,6 +57,11 @@ func ParseSkillMD(content, sourcePath string, precedence int) (*Skill, error) {
 					description = strings.TrimSpace(strings.TrimPrefix(line, "description:"))
 					description = strings.Trim(description, `"'`)
 				}
+				if strings.HasPrefix(line, "command:") {
+					command = strings.TrimSpace(strings.TrimPrefix(line, "command:"))
+					command = strings.Trim(command, `"'`)
+					command = strings.TrimPrefix(command, "/") // normalize: strip leading /
+				}
 			}
 		}
 	}
@@ -65,6 +75,7 @@ func ParseSkillMD(content, sourcePath string, precedence int) (*Skill, error) {
 	return &Skill{
 		Name:        name,
 		Description: description,
+		Command:     command,
 		Content:     body,
 		SourcePath:  sourcePath,
 		ContentHash: hash,
@@ -74,7 +85,8 @@ func ParseSkillMD(content, sourcePath string, precedence int) (*Skill, error) {
 }
 
 // FormatSkillsXML formats a slice of skills into a compact XML block for injection.
-func FormatSkillsXML(skills []*Skill) string {
+// Uses CDATA sections to prevent XML injection from skill content.
+func FormatSkillsXML(skills []Skill) string {
 	if len(skills) == 0 {
 		return ""
 	}
@@ -82,10 +94,12 @@ func FormatSkillsXML(skills []*Skill) string {
 	var sb strings.Builder
 	sb.WriteString("<skills>\n")
 	for _, s := range skills {
-		sb.WriteString(fmt.Sprintf(`<skill name="%s">`, s.Name))
-		sb.WriteString("\n")
-		sb.WriteString(s.Content)
-		sb.WriteString("\n</skill>\n")
+		// Escape name attribute value and wrap content in CDATA
+		name := format.XMLEscapeAttr(s.Name)
+		sb.WriteString(fmt.Sprintf(`<skill name="%s">`, name))
+		sb.WriteString("\n<![CDATA[")
+		sb.WriteString(format.CDATAEscape(s.Content))
+		sb.WriteString("]]>\n</skill>\n")
 	}
 	sb.WriteString("</skills>")
 	return sb.String()
@@ -97,13 +111,11 @@ func hashContent(content string) string {
 }
 
 func extractNameFromPath(path string) string {
-	// Get filename
-	parts := strings.Split(path, "/")
-	filename := parts[len(parts)-1]
+	filename := filepath.Base(path)
 
 	// Remove extension
-	if idx := strings.LastIndex(filename, "."); idx > 0 {
-		filename = filename[:idx]
+	if ext := filepath.Ext(filename); ext != "" {
+		filename = strings.TrimSuffix(filename, ext)
 	}
 
 	// Convert SKILL to a reasonable name

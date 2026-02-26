@@ -1,7 +1,10 @@
+// Package ratelimiter tracks API usage against per-minute rate limits with queuing support.
 package ratelimiter
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -10,7 +13,7 @@ import (
 
 // DBRecorder is an optional interface for persisting rate limit snapshots.
 type DBRecorder interface {
-	RecordRateLimitSnapshot(requests, inputTokens, outputTokens int, headroom float64) error
+	RecordRateLimitSnapshot(ctx context.Context, requests, inputTokens, outputTokens int, headroom float64) error
 }
 
 // Status represents the current rate limit state.
@@ -25,6 +28,7 @@ type Status struct {
 
 // Limiter tracks API usage against rate limits using a rolling window.
 type Limiter struct {
+	// mu protects all mutable fields below.
 	mu sync.Mutex
 
 	maxRPM  int
@@ -38,10 +42,21 @@ type Limiter struct {
 	windowStart  time.Time
 
 	// Queued requests when over limit
-	queue []queuedRequest
+	queue   []queuedRequest
+	queueWg sync.WaitGroup // tracks goroutines spawned from queued callbacks
 
 	// Optional DB recorder for snapshots
-	db DBRecorder
+	db        DBRecorder
+	dbWrites  chan dbSnapshot
+	dbLoopWg  sync.WaitGroup // tracks the dbWriteLoop goroutine
+	closed    bool
+}
+
+type dbSnapshot struct {
+	requests     int
+	inputTokens  int
+	outputTokens int
+	headroom     float64
 }
 
 type queuedRequest struct {
@@ -49,6 +64,7 @@ type queuedRequest struct {
 	addedAt  time.Time
 }
 
+// New creates a rate limiter with the given per-minute limits and safety margin.
 func New(rpm, itpm, otpm int, safetyMargin float64) *Limiter {
 	return &Limiter{
 		maxRPM:      rpm,
@@ -59,11 +75,76 @@ func New(rpm, itpm, otpm int, safetyMargin float64) *Limiter {
 	}
 }
 
-// SetDB attaches a database recorder for persisting snapshots.
+// SetDB attaches a database recorder and starts a background writer.
+// Subsequent calls close the previous writer first.
+// No-op if the limiter has already been closed.
 func (l *Limiter) SetDB(db DBRecorder) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	if l.dbWrites != nil {
+		close(l.dbWrites) // close previous writer goroutine
+	}
 	l.db = db
+	ch := make(chan dbSnapshot, 64)
+	l.dbWrites = ch
+	// Capture db locally so the goroutine never races with a future SetDB call.
+	localDB := l.db
+	l.dbLoopWg.Add(1)
+	l.mu.Unlock()
+	go func() {
+		defer l.dbLoopWg.Done()
+		l.dbWriteLoop(ch, localDB)
+	}()
+}
+
+// Close shuts down the background DB writer goroutine, drains the pending
+// queue, and waits for any in-flight queued callback goroutines to finish.
+func (l *Limiter) Close() {
+	l.mu.Lock()
+	ch := l.dbWrites
+	l.dbWrites = nil
+	l.queue = nil // drain queue to prevent post-shutdown callbacks
+	l.closed = true
+	l.mu.Unlock()
+
+	// Wait for queued callbacks with a timeout to avoid blocking shutdown
+	// indefinitely if the sidecar is unreachable (HTTP client timeout is 300s+).
+	done := make(chan struct{})
+	go func() {
+		l.queueWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		log.Println("Rate limiter: timed out waiting for queued callbacks during shutdown")
+	}
+
+	if ch != nil {
+		close(ch)
+		l.dbLoopWg.Wait() // Wait for dbWriteLoop to drain and exit
+	}
+}
+
+func (l *Limiter) dbWriteLoop(ch chan dbSnapshot, db DBRecorder) {
+	var consecutiveFailures int
+	for snap := range ch {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := db.RecordRateLimitSnapshot(ctx, snap.requests, snap.inputTokens, snap.outputTokens, snap.headroom); err != nil {
+			consecutiveFailures++
+			if consecutiveFailures >= 5 {
+				log.Printf("ERROR: rate limit snapshot write failing consecutively (%d): %v", consecutiveFailures, err)
+			} else {
+				log.Printf("Failed to record rate limit snapshot: %v", err)
+			}
+		} else {
+			consecutiveFailures = 0
+		}
+		cancel()
+	}
 }
 
 // CanProceed checks if a request with the estimated input tokens can be made.
@@ -98,16 +179,18 @@ func (l *Limiter) Record(usage *agent.Usage) {
 	l.inputTokens += usage.InputTokens
 	l.outputTokens += usage.OutputTokens
 
-	// Async-write snapshot to DB if available
-	if l.db != nil {
-		headroom := l.calcHeadroom()
-		db := l.db
-		reqs := l.requests
-		inp := l.inputTokens
-		out := l.outputTokens
-		go func() {
-			_ = db.RecordRateLimitSnapshot(reqs, inp, out, headroom)
-		}()
+	// Send snapshot to buffered writer (non-blocking)
+	if l.dbWrites != nil {
+		select {
+		case l.dbWrites <- dbSnapshot{
+			requests:     l.requests,
+			inputTokens:  l.inputTokens,
+			outputTokens: l.outputTokens,
+			headroom:     l.calcHeadroom(),
+		}:
+		default:
+			log.Println("Rate limiter: snapshot dropped (channel full)")
+		}
 	}
 }
 
@@ -120,6 +203,9 @@ func (l *Limiter) GetStatus() Status {
 
 	elapsed := time.Since(l.windowStart)
 	remaining := time.Minute - elapsed
+	if remaining < 0 {
+		remaining = 0
+	}
 
 	headroom := l.calcHeadroom()
 
@@ -161,7 +247,9 @@ func (l *Limiter) resetIfNewWindow() {
 		l.outputTokens = 0
 		l.windowStart = time.Now()
 
-		// Process queued requests
+		// Process queued requests.
+		// Only one fires per window reset. Since the window just started,
+		// capacity is always available — no CanProceed re-check needed.
 		for len(l.queue) > 0 {
 			req := l.queue[0]
 			l.queue = l.queue[1:]
@@ -171,16 +259,26 @@ func (l *Limiter) resetIfNewWindow() {
 				continue
 			}
 
-			go req.callback()
+			l.queueWg.Add(1)
+			go func() {
+				defer l.queueWg.Done()
+				req.callback()
+			}()
 			break // one per window reset
 		}
 	}
 }
 
 // Enqueue adds a callback to be executed when capacity is available.
+// Returns queue position, or -1 if the queue is full.
 func (l *Limiter) Enqueue(cb func()) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	const maxQueue = 100
+	if len(l.queue) >= maxQueue {
+		return -1
+	}
 
 	l.queue = append(l.queue, queuedRequest{
 		callback: cb,

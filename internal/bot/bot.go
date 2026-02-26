@@ -1,23 +1,32 @@
+// Package bot implements the Telegram bot that bridges user messages to Claude.
 package bot
 
 import (
 	"context"
 	"fmt"
 	"log"
-	"strconv"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"github.com/you/claude-gateway/internal/agent"
 	"github.com/you/claude-gateway/internal/config"
+	"github.com/you/claude-gateway/internal/ctxbuilder"
 	"github.com/you/claude-gateway/internal/db"
+	"github.com/you/claude-gateway/internal/cron"
+	"github.com/you/claude-gateway/internal/journal"
 	"github.com/you/claude-gateway/internal/memory"
 	"github.com/you/claude-gateway/internal/orchestrator"
+	"github.com/you/claude-gateway/internal/people"
+	"github.com/you/claude-gateway/internal/pgdb"
+	"github.com/you/claude-gateway/internal/profile"
 	"github.com/you/claude-gateway/internal/ratelimiter"
 	"github.com/you/claude-gateway/internal/skills"
+	"github.com/you/claude-gateway/internal/triage"
 )
 
 const maxTelegramMessage = 4000
@@ -28,7 +37,11 @@ type SessionUsage struct {
 	OutputTokens int
 	Requests     int
 	StartedAt    time.Time
+	LastActive   time.Time
 }
+
+// maxConcurrentHandlers limits how many message handlers run simultaneously.
+const maxConcurrentHandlers = 10
 
 // Bot wraps the Telegram bot with gateway integrations.
 type Bot struct {
@@ -40,42 +53,138 @@ type Bot struct {
 	sessions   map[int64]*SessionUsage
 	sessionsMu sync.RWMutex
 
-	// CronStatus is set by the cron scheduler for /cron command
-	CronStatus func() string
+	// sem limits concurrent handler goroutines.
+	sem chan struct{}
+	// handlerWg tracks in-flight handler goroutines for clean shutdown.
+	handlerWg sync.WaitGroup
+	// bgWg tracks fire-and-forget background goroutines (RecordExchange, fact
+	// extraction, profile update) so shutdown waits for them to finish before
+	// closing the database.
+	bgWg sync.WaitGroup
 
-	// SystemPromptBuilder builds the system prompt for requests.
-	// Set by skills/memory managers after initialization.
-	SystemPromptBuilder func() string
+	cronStatus          func() string
+	cronScheduler       *cron.Scheduler
+	systemPromptBuilder func(ctx context.Context) string
+	skillsManager       *skills.Manager
+	memoryManager       *memory.Manager
+	memoryCompactor     *memory.Compactor
+	orchestrator        *orchestrator.Engine
 
-	// SkillsManager provides access to skills for bot commands.
-	SkillsManager *skills.Manager
-
-	// MemoryManager provides access to memory for bot commands.
-	MemoryManager *memory.Manager
-
-	// MemoryCompactor handles daily memory compaction.
-	MemoryCompactor *memory.Compactor
-
-	// Orchestrator runs agent team reviews.
-	Orchestrator *orchestrator.Engine
+	// v2: PostgreSQL-backed memory, context, triage, journal, profile
+	pgDB           *pgdb.DB
+	contextBuilder *ctxbuilder.Builder
+	peopleManager  *people.Manager
+	triager        *triage.Triager
+	journal        *journal.Manager
+	profiler       *profile.Profiler
 }
 
-func New(cfg *config.Config, agentClient *agent.Client, limiter *ratelimiter.Limiter, database *db.DB) (*Bot, error) {
+// Option configures optional Bot dependencies.
+type Option func(*Bot)
+
+// WithCronStatus sets the function that returns cron job status text.
+func WithCronStatus(fn func() string) Option {
+	return func(b *Bot) { b.cronStatus = fn }
+}
+
+// WithSystemPromptBuilder sets the function that builds the system prompt.
+func WithSystemPromptBuilder(fn func(ctx context.Context) string) Option {
+	return func(b *Bot) { b.systemPromptBuilder = fn }
+}
+
+// WithSkillsManager sets the skills manager.
+func WithSkillsManager(sm *skills.Manager) Option {
+	return func(b *Bot) { b.skillsManager = sm }
+}
+
+// WithMemoryManager sets the memory manager.
+func WithMemoryManager(mm *memory.Manager) Option {
+	return func(b *Bot) { b.memoryManager = mm }
+}
+
+// WithMemoryCompactor sets the memory compactor.
+func WithMemoryCompactor(mc *memory.Compactor) Option {
+	return func(b *Bot) { b.memoryCompactor = mc }
+}
+
+// WithOrchestrator sets the orchestrator engine.
+func WithOrchestrator(oe *orchestrator.Engine) Option {
+	return func(b *Bot) { b.orchestrator = oe }
+}
+
+// WithPgDB sets the PostgreSQL database for persistent memory.
+func WithPgDB(d *pgdb.DB) Option {
+	return func(b *Bot) { b.pgDB = d }
+}
+
+// WithContextBuilder sets the context builder for system/enriched prompts.
+func WithContextBuilder(cb *ctxbuilder.Builder) Option {
+	return func(b *Bot) { b.contextBuilder = cb }
+}
+
+// WithPeopleManager sets the people manager.
+func WithPeopleManager(pm *people.Manager) Option {
+	return func(b *Bot) { b.peopleManager = pm }
+}
+
+// WithTriager sets the local LLM triager.
+func WithTriager(t *triage.Triager) Option {
+	return func(b *Bot) { b.triager = t }
+}
+
+// WithJournal sets the daily journal manager.
+func WithJournal(j *journal.Manager) Option {
+	return func(b *Bot) { b.journal = j }
+}
+
+// WithProfiler sets the user profiler.
+func WithProfiler(p *profile.Profiler) Option {
+	return func(b *Bot) { b.profiler = p }
+}
+
+// New creates a new Bot. Optional dependencies are configured via Option functions.
+func New(cfg *config.Config, agentClient *agent.Client, limiter *ratelimiter.Limiter, database *db.DB, opts ...Option) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(cfg.Telegram.BotToken)
 	if err != nil {
 		return nil, fmt.Errorf("creating telegram bot: %w", err)
 	}
+	api.Client = &http.Client{Timeout: 30 * time.Second}
 
 	log.Printf("Telegram bot authorized as @%s", api.Self.UserName)
 
-	return &Bot{
+	b := &Bot{
 		api:      api,
 		agent:    agentClient,
 		limiter:  limiter,
 		cfg:      cfg,
 		database: database,
 		sessions: make(map[int64]*SessionUsage),
-	}, nil
+		sem:      make(chan struct{}, maxConcurrentHandlers),
+	}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b, nil
+}
+
+// SetCronStatus sets the cron status function. This exists as a separate method
+// because the cron scheduler requires the bot (for SendNotification), creating a
+// circular dependency that cannot be resolved through the constructor.
+func (b *Bot) SetCronStatus(fn func() string) {
+	b.cronStatus = fn
+}
+
+// SetCronScheduler gives the bot direct access to the cron scheduler for
+// dynamic job management (add/remove/enable/disable via Telegram commands).
+func (b *Bot) SetCronScheduler(s *cron.Scheduler) {
+	b.cronScheduler = s
+}
+
+// WaitBackground blocks until all fire-and-forget background goroutines
+// (RecordExchange, fact extraction, profile update) have finished. Call
+// during shutdown after the bot's Run has returned, before closing the DB.
+func (b *Bot) WaitBackground() {
+	b.bgWg.Wait()
 }
 
 // SendNotification sends a message to the configured notification chat.
@@ -88,6 +197,8 @@ func (b *Bot) SendNotification(text string) {
 
 // Run starts the bot polling loop. Blocks until ctx is cancelled.
 func (b *Bot) Run(ctx context.Context) {
+	b.registerTelegramCommands()
+
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 30
 
@@ -97,17 +208,43 @@ func (b *Bot) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			b.api.StopReceivingUpdates()
+			b.handlerWg.Wait()
 			return
 		case update := <-updates:
 			if update.Message == nil {
 				continue
 			}
-			go b.handleUpdate(ctx, update.Message)
+			// Acquire semaphore slot, but respect context cancellation
+			// to avoid blocking shutdown when all slots are occupied.
+			select {
+			case b.sem <- struct{}{}:
+			case <-ctx.Done():
+				b.api.StopReceivingUpdates()
+				b.handlerWg.Wait()
+				return
+			}
+			b.handlerWg.Add(1)
+			go func(msg *tgbotapi.Message) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("Handler panic recovered: %v", r)
+						b.SendNotification(fmt.Sprintf("PANIC in handler: %v", r))
+					}
+				}()
+				defer b.handlerWg.Done()
+				defer func() { <-b.sem }()
+				b.handleUpdate(ctx, msg)
+			}(update.Message)
 		}
 	}
 }
 
 func (b *Bot) handleUpdate(ctx context.Context, msg *tgbotapi.Message) {
+	// msg.From is nil for channel posts and anonymous messages
+	if msg.From == nil {
+		return
+	}
+
 	// Auth check
 	if !b.cfg.Telegram.AllowedUserIDs[msg.From.ID] {
 		log.Printf("Unauthorized user %d (%s)", msg.From.ID, msg.From.UserName)
@@ -124,452 +261,68 @@ func (b *Bot) handleUpdate(ctx context.Context, msg *tgbotapi.Message) {
 	b.handleMessage(ctx, msg)
 }
 
-func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
-	switch msg.Command() {
-	case "start":
-		b.sendMessage(msg.Chat.ID,
-			"Claude Gateway v2 is ready.\n\n"+
-				"Send me any message and I'll process it with Claude Code.\n\n"+
-				"Commands:\n"+
-				"/status — gateway health & rate limits\n"+
-				"/reset — clear conversation session\n"+
-				"/cost — token usage this session\n"+
-				"/cron — active scheduled jobs\n"+
-				"/skills — list loaded skills\n"+
-				"/memories — list curated memories\n"+
-				"/remember <text> — save a memory\n"+
-				"/context — current context layers")
-
-	case "status":
-		b.handleStatus(ctx, msg)
-
-	case "reset":
-		b.handleReset(ctx, msg)
-
-	case "cost":
-		b.handleCost(msg)
-
-	case "cron":
-		b.handleCronList(msg)
-
-	case "skills":
-		b.handleSkills(msg)
-
-	case "skill":
-		b.handleSkillDetail(msg)
-
-	case "skill_enable":
-		b.handleSkillToggle(msg, true)
-
-	case "skill_disable":
-		b.handleSkillToggle(msg, false)
-
-	case "remember":
-		b.handleRemember(msg)
-
-	case "forget":
-		b.handleForget(msg)
-
-	case "memories":
-		b.handleMemories(msg)
-
-	case "today":
-		b.handleToday(msg)
-
-	case "context":
-		b.handleContext(msg)
-
-	case "review_go":
-		b.handleOrchestratorTeam(ctx, msg, "go-dev-team")
-
-	case "review_go_sec":
-		b.handleOrchestratorTeam(ctx, msg, "go-sec-team")
-
-	case "review_fe":
-		b.handleOrchestratorTeam(ctx, msg, "fe-dev-team")
-
-	case "review_fe_sec":
-		b.handleOrchestratorTeam(ctx, msg, "fe-sec-team")
-
-	case "review_design":
-		b.handleOrchestratorTeam(ctx, msg, "design")
-
-	case "review_integration":
-		b.handleOrchestratorTeam(ctx, msg, "integration")
-
-	case "gauntlet":
-		b.handleGauntlet(ctx, msg)
-
-	case "agents":
-		b.handleAgentsList(msg)
-
-	case "runs":
-		b.handleRunsList(msg)
-
-	default:
-		b.sendMessage(msg.Chat.ID, "Unknown command. Try /status, /reset, /cost, /cron, /skills, or /agents.")
-	}
-}
-
-func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
-	if msg.Text == "" {
-		return
+// registerTelegramCommands registers bot commands with Telegram so users
+// get autocomplete in the command menu. Includes both built-in commands
+// and skill commands (skills with a non-empty Command field).
+func (b *Bot) registerTelegramCommands() {
+	commands := []tgbotapi.BotCommand{
+		{Command: "start", Description: "Show available commands"},
+		{Command: "status", Description: "Gateway health & rate limits"},
+		{Command: "reset", Description: "Clear conversation session"},
+		{Command: "cost", Description: "Token usage this session"},
+		{Command: "skills", Description: "List loaded skills"},
+		{Command: "memories", Description: "List curated memories"},
+		{Command: "context", Description: "Current context layers"},
+		{Command: "addperson", Description: "Add person to contacts"},
+		{Command: "people", Description: "List all people"},
+		{Command: "person", Description: "Find person by name"},
+		{Command: "addcontact", Description: "Add contact detail to person"},
+		{Command: "delperson", Description: "Remove a person"},
+		{Command: "setbootstrap", Description: "Add/update bootstrap instruction"},
+		{Command: "listmemory", Description: "List memories by category"},
+		{Command: "journal", Description: "View daily journal"},
+		{Command: "journal_search", Description: "Search journal entries"},
+		{Command: "profile", Description: "View user profile"},
+		{Command: "setprofile", Description: "Set profile aspect"},
+		{Command: "delprofile", Description: "Delete profile aspect"},
+		{Command: "cron", Description: "List scheduled jobs"},
+		{Command: "cronadd", Description: "Add cron job: name \"schedule\" prompt"},
+		{Command: "crondel", Description: "Remove a cron job"},
+		{Command: "cronenable", Description: "Enable a cron job"},
+		{Command: "crondisable", Description: "Disable a cron job"},
+		{Command: "remember", Description: "Save a memory"},
+		{Command: "forget", Description: "Remove a memory by text match"},
+		{Command: "dbcheck", Description: "Check PostgreSQL conversations"},
 	}
 
-	// Check rate limits (estimate ~1000 input tokens for a typical request)
-	if !b.limiter.CanProceed(1000) {
-		status := b.limiter.GetStatus()
-		position := b.limiter.Enqueue(func() {
-			b.processMessage(ctx, msg)
-		})
-		b.sendMessage(msg.Chat.ID,
-			fmt.Sprintf("Rate limited. Queued at position %d.\nWindow resets in %s.\nHeadroom: %.0f%%",
-				position, status.WindowResets, status.Headroom*100))
-		return
-	}
+	builtinCount := len(commands)
 
-	b.processMessage(ctx, msg)
-}
-
-func (b *Bot) processMessage(ctx context.Context, msg *tgbotapi.Message) {
-	// Send "working" indicator
-	thinking := tgbotapi.NewMessage(msg.Chat.ID, "Working...")
-	thinkingMsg, err := b.api.Send(thinking)
-	if err != nil {
-		log.Printf("Failed to send thinking message: %v", err)
-	}
-
-	// Create a session ID from the chat ID
-	sessionID := fmt.Sprintf("tg-%d", msg.Chat.ID)
-
-	// Build request options
-	opts := agent.AskOptions{
-		SessionID: sessionID,
-		Prompt:    msg.Text,
-		WorkDir:   b.cfg.WorkDir,
-	}
-
-	// Inject system prompt if builder is available
-	if b.SystemPromptBuilder != nil {
-		opts.SystemPrompt = b.SystemPromptBuilder()
-	}
-
-	// Call Claude via sidecar
-	resp, err := b.agent.AskWithOptions(ctx, opts)
-
-	// Delete "working" message
-	if thinkingMsg.MessageID != 0 {
-		del := tgbotapi.NewDeleteMessage(msg.Chat.ID, thinkingMsg.MessageID)
-		b.api.Send(del)
-	}
-
-	if err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Error: %v", err))
-		return
-	}
-
-	// Record usage
-	if resp.Usage != nil {
-		b.limiter.Record(resp.Usage)
-		b.recordSessionUsage(msg.Chat.ID, resp.Usage)
-
-		// Record to DB
-		if b.database != nil {
-			_ = b.database.RecordSession(
-				sessionID, "user", msg.Text,
-				resp.Usage.InputTokens, resp.Usage.OutputTokens,
-				resp.Usage.CacheCreationInputTokens, resp.Usage.CacheReadInputTokens,
-			)
+	if b.skillsManager != nil {
+		for _, s := range b.skillsManager.GetActiveSkills() {
+			if s.Command != "" {
+				desc := s.Description
+				if desc == "" {
+					desc = s.Name
+				}
+				// Telegram limits description to 256 characters (UTF-8 runes, not bytes)
+				if utf8.RuneCountInString(desc) > 256 {
+					runes := []rune(desc)
+					desc = string(runes[:253]) + "..."
+				}
+				commands = append(commands, tgbotapi.BotCommand{
+					Command:     s.Command,
+					Description: desc,
+				})
+			}
 		}
 	}
 
-	// Send response, splitting if needed
-	text := resp.Text
-	if text == "" {
-		text = "Done (no text output)."
-	}
-
-	b.sendLongMessage(msg.Chat.ID, text)
-}
-
-func (b *Bot) handleStatus(ctx context.Context, msg *tgbotapi.Message) {
-	rl := b.limiter.GetStatus()
-	sidecarStatus := "Healthy"
-	if err := b.agent.Health(ctx); err != nil {
-		sidecarStatus = fmt.Sprintf("Error: %v", err)
-	}
-
-	lines := []string{
-		"*Gateway Status*",
-		"",
-		fmt.Sprintf("Sidecar: %s", sidecarStatus),
-		"",
-		"*Rate Limits:*",
-		fmt.Sprintf("  RPM: %s", rl.RPM),
-		fmt.Sprintf("  ITPM: %s", rl.ITPM),
-		fmt.Sprintf("  OTPM: %s", rl.OTPM),
-		fmt.Sprintf("  Headroom: %.0f%%", rl.Headroom*100),
-		fmt.Sprintf("  Window resets: %s", rl.WindowResets),
-	}
-
-	if rl.QueueDepth > 0 {
-		lines = append(lines, fmt.Sprintf("  Queued: %d", rl.QueueDepth))
-	}
-
-	reply := tgbotapi.NewMessage(msg.Chat.ID, strings.Join(lines, "\n"))
-	reply.ParseMode = tgbotapi.ModeMarkdown
-	b.api.Send(reply)
-}
-
-func (b *Bot) handleReset(ctx context.Context, msg *tgbotapi.Message) {
-	sessionID := fmt.Sprintf("tg-%d", msg.Chat.ID)
-	if err := b.agent.ResetSession(ctx, sessionID); err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Reset failed: %v", err))
-		return
-	}
-
-	b.sessionsMu.Lock()
-	delete(b.sessions, msg.Chat.ID)
-	b.sessionsMu.Unlock()
-
-	b.sendMessage(msg.Chat.ID, "Session cleared. Fresh start.")
-}
-
-func (b *Bot) handleCost(msg *tgbotapi.Message) {
-	b.sessionsMu.RLock()
-	usage, ok := b.sessions[msg.Chat.ID]
-	b.sessionsMu.RUnlock()
-
-	if !ok {
-		b.sendMessage(msg.Chat.ID, "No usage recorded for this session yet.")
-		return
-	}
-
-	duration := time.Since(usage.StartedAt).Round(time.Minute)
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf(
-		"*Session Cost*\n\n"+
-			"Requests: %d\n"+
-			"Input tokens: %s\n"+
-			"Output tokens: %s\n"+
-			"Session duration: %s",
-		usage.Requests,
-		formatTokens(usage.InputTokens),
-		formatTokens(usage.OutputTokens),
-		duration.String(),
-	))
-}
-
-func (b *Bot) handleCronList(msg *tgbotapi.Message) {
-	if b.CronStatus != nil {
-		b.sendMessage(msg.Chat.ID, b.CronStatus())
-		return
-	}
-	b.sendMessage(msg.Chat.ID, "No cron jobs configured.")
-}
-
-func (b *Bot) handleRemember(msg *tgbotapi.Message) {
-	if b.MemoryManager == nil {
-		b.sendMessage(msg.Chat.ID, "Memory manager not initialized.")
-		return
-	}
-	text := strings.TrimSpace(msg.CommandArguments())
-	if text == "" {
-		b.sendMessage(msg.Chat.ID, "Usage: /remember <text to remember>")
-		return
-	}
-	id, err := b.MemoryManager.AddCuratedMemory("general", text, "user", 5)
-	if err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Error: %v", err))
-		return
-	}
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Remembered (#%d). Use /forget %d to remove.", id, id))
-}
-
-func (b *Bot) handleForget(msg *tgbotapi.Message) {
-	if b.MemoryManager == nil {
-		b.sendMessage(msg.Chat.ID, "Memory manager not initialized.")
-		return
-	}
-	idStr := strings.TrimSpace(msg.CommandArguments())
-	if idStr == "" {
-		b.sendMessage(msg.Chat.ID, "Usage: /forget <id>")
-		return
-	}
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		b.sendMessage(msg.Chat.ID, "Invalid ID. Use a number.")
-		return
-	}
-	if err := b.MemoryManager.RemoveCuratedMemory(id); err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Error: %v", err))
-		return
-	}
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Memory #%d forgotten.", id))
-}
-
-func (b *Bot) handleMemories(msg *tgbotapi.Message) {
-	if b.MemoryManager == nil {
-		b.sendMessage(msg.Chat.ID, "Memory manager not initialized.")
-		return
-	}
-	b.sendLongMessage(msg.Chat.ID, b.MemoryManager.CuratedMemoriesText())
-}
-
-func (b *Bot) handleToday(msg *tgbotapi.Message) {
-	if b.MemoryManager == nil {
-		b.sendMessage(msg.Chat.ID, "Memory manager not initialized.")
-		return
-	}
-	summary, err := b.MemoryManager.GetTodaySummary()
-	if err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Error: %v", err))
-		return
-	}
-	if summary == "" {
-		b.sendMessage(msg.Chat.ID, "No summary for today yet.")
-		return
-	}
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf("*Today's Summary*\n\n%s", summary))
-}
-
-func (b *Bot) handleContext(msg *tgbotapi.Message) {
-	if b.MemoryManager == nil {
-		b.sendMessage(msg.Chat.ID, "Memory manager not initialized.")
-		return
-	}
-	b.sendLongMessage(msg.Chat.ID, b.MemoryManager.StatusText())
-}
-
-func (b *Bot) handleOrchestratorTeam(ctx context.Context, msg *tgbotapi.Message, teamName string) {
-	if b.Orchestrator == nil {
-		b.sendMessage(msg.Chat.ID, "Orchestrator not initialized.")
-		return
-	}
-	task := strings.TrimSpace(msg.CommandArguments())
-	if task == "" {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Usage: /review_%s <task description>", strings.ReplaceAll(teamName, "-", "_")))
-		return
-	}
-
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Running %s...", teamName))
-
-	result, err := b.Orchestrator.RunTeamStreaming(ctx, teamName, task,
-		func(progress string) {
-			b.sendMessage(msg.Chat.ID, progress)
-		})
-	if err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Error: %v", err))
-		return
-	}
-
-	report := orchestrator.FormatConsensusText(teamName, task, result.Consensus, result.Verdicts)
-	b.sendLongMessage(msg.Chat.ID, report)
-}
-
-func (b *Bot) handleGauntlet(ctx context.Context, msg *tgbotapi.Message) {
-	if b.Orchestrator == nil {
-		b.sendMessage(msg.Chat.ID, "Orchestrator not initialized.")
-		return
-	}
-	task := strings.TrimSpace(msg.CommandArguments())
-	if task == "" {
-		b.sendMessage(msg.Chat.ID, "Usage: /gauntlet <task description>")
-		return
-	}
-
-	b.sendMessage(msg.Chat.ID, "Running full gauntlet pipeline...")
-
-	results, err := b.Orchestrator.RunGauntlet(ctx, task, "",
-		func(progress string) {
-			b.sendMessage(msg.Chat.ID, progress)
-		})
-	if err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Gauntlet error: %v", err))
-	}
-
-	for _, result := range results {
-		report := orchestrator.FormatConsensusText(result.Team, task, result.Consensus, result.Verdicts)
-		b.sendLongMessage(msg.Chat.ID, report)
-	}
-}
-
-func (b *Bot) handleAgentsList(msg *tgbotapi.Message) {
-	b.sendLongMessage(msg.Chat.ID, orchestrator.ListAgentsText())
-}
-
-func (b *Bot) handleRunsList(msg *tgbotapi.Message) {
-	if b.Orchestrator == nil {
-		b.sendMessage(msg.Chat.ID, "Orchestrator not initialized.")
-		return
-	}
-	b.sendLongMessage(msg.Chat.ID, b.Orchestrator.RecentRunsText(10))
-}
-
-func (b *Bot) handleSkills(msg *tgbotapi.Message) {
-	if b.SkillsManager == nil {
-		b.sendMessage(msg.Chat.ID, "Skills manager not initialized.")
-		return
-	}
-	b.sendMessage(msg.Chat.ID, b.SkillsManager.StatusText())
-}
-
-func (b *Bot) handleSkillDetail(msg *tgbotapi.Message) {
-	if b.SkillsManager == nil {
-		b.sendMessage(msg.Chat.ID, "Skills manager not initialized.")
-		return
-	}
-	name := strings.TrimSpace(msg.CommandArguments())
-	if name == "" {
-		b.sendMessage(msg.Chat.ID, "Usage: /skill <name>")
-		return
-	}
-	s, ok := b.SkillsManager.GetSkill(name)
-	if !ok {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Skill %q not found.", name))
-		return
-	}
-	status := "enabled"
-	if !s.Enabled {
-		status = "disabled"
-	}
-	preview := s.Content
-	if len(preview) > 500 {
-		preview = preview[:500] + "..."
-	}
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf(
-		"*%s* (%s)\nPrecedence: %d\nSource: %s\n\n%s",
-		s.Name, status, s.Precedence, s.SourcePath, preview))
-}
-
-func (b *Bot) handleSkillToggle(msg *tgbotapi.Message, enable bool) {
-	if b.SkillsManager == nil {
-		b.sendMessage(msg.Chat.ID, "Skills manager not initialized.")
-		return
-	}
-	name := strings.TrimSpace(msg.CommandArguments())
-	if name == "" {
-		action := "enable"
-		if !enable {
-			action = "disable"
-		}
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Usage: /skill_%s <name>", action))
-		return
-	}
-	var err error
-	if enable {
-		err = b.SkillsManager.EnableSkill(name)
+	cfg := tgbotapi.NewSetMyCommands(commands...)
+	if _, err := b.api.Request(cfg); err != nil {
+		log.Printf("Failed to register Telegram commands: %v", err)
 	} else {
-		err = b.SkillsManager.DisableSkill(name)
+		log.Printf("Registered %d Telegram commands (%d from skills)", len(commands), len(commands)-builtinCount)
 	}
-	if err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Error: %v", err))
-		return
-	}
-	action := "enabled"
-	if !enable {
-		action = "disabled"
-	}
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Skill %q %s.", name, action))
 }
 
 // --- helpers ---
@@ -581,13 +334,38 @@ func (b *Bot) sendMessage(chatID int64, text string) {
 	}
 }
 
+func (b *Bot) sendMarkdownMessage(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeMarkdown
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Failed to send message to %d: %v", chatID, err)
+	}
+}
+
 func (b *Bot) sendLongMessage(chatID int64, text string) {
-	for i := 0; i < len(text); i += maxTelegramMessage {
-		end := i + maxTelegramMessage
-		if end > len(text) {
-			end = len(text)
+	for len(text) > 0 {
+		// Telegram counts UTF-8 characters, not bytes. Find the byte offset
+		// of the maxTelegramMessage-th rune to split correctly.
+		runeCount := utf8.RuneCountInString(text)
+		if runeCount <= maxTelegramMessage {
+			b.sendMessage(chatID, text)
+			return
 		}
-		b.sendMessage(chatID, text[i:end])
+
+		// Walk forward to find the byte offset of the maxTelegramMessage-th rune.
+		end := 0
+		for i := 0; i < maxTelegramMessage; i++ {
+			_, size := utf8.DecodeRuneInString(text[end:])
+			end += size
+		}
+
+		// Prefer splitting at a newline for cleaner multi-part messages.
+		if nl := strings.LastIndex(text[:end], "\n"); nl > end/2 {
+			end = nl + 1 // include the newline in this chunk
+		}
+
+		b.sendMessage(chatID, text[:end])
+		text = text[end:]
 	}
 }
 
@@ -595,23 +373,45 @@ func (b *Bot) recordSessionUsage(chatID int64, usage *agent.Usage) {
 	b.sessionsMu.Lock()
 	defer b.sessionsMu.Unlock()
 
+	now := time.Now()
+
 	s, ok := b.sessions[chatID]
 	if !ok {
-		s = &SessionUsage{StartedAt: time.Now()}
+		s = &SessionUsage{StartedAt: now}
 		b.sessions[chatID] = s
 	}
 
 	s.InputTokens += usage.InputTokens
 	s.OutputTokens += usage.OutputTokens
 	s.Requests++
-}
+	s.LastActive = now
 
-func formatTokens(n int) string {
-	if n >= 1_000_000 {
-		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	// Evict sessions idle for >24h to prevent unbounded map growth.
+	// Hard cap at 1000: if still over after time-based eviction, drop least-recently-active.
+	const maxSessions = 1000
+	if len(b.sessions) > 50 {
+		for id, sess := range b.sessions {
+			if now.Sub(sess.LastActive) > 24*time.Hour {
+				delete(b.sessions, id)
+			}
+		}
 	}
-	if n >= 1_000 {
-		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	if len(b.sessions) > maxSessions {
+		// Same eviction pattern as calendarWatcher.check (watcher.go).
+		// O(n) per eviction, but bounded: the 24h eviction above handles normal
+		// churn, so this hard-cap path rarely fires and only evicts 1-2 entries.
+		for len(b.sessions) > maxSessions {
+			var oldestID int64
+			var oldestTime time.Time
+			first := true
+			for id, sess := range b.sessions {
+				if first || sess.LastActive.Before(oldestTime) {
+					oldestID = id
+					oldestTime = sess.LastActive
+					first = false
+				}
+			}
+			delete(b.sessions, oldestID)
+		}
 	}
-	return strconv.Itoa(n)
 }

@@ -9,7 +9,7 @@ RUN go mod download
 
 # Build
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o gateway ./cmd/gateway
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o gateway ./cmd/gateway
 
 # Runtime stage
 FROM alpine:3.20

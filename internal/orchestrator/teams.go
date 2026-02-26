@@ -1,5 +1,7 @@
 package orchestrator
 
+import "sort"
+
 // Agent represents a review agent with its DNA file and permissions.
 type Agent struct {
 	Name         string
@@ -16,9 +18,9 @@ type Team struct {
 	Agents []Agent
 }
 
-// AllTeams defines the available orchestrator teams.
+// allTeams defines the available orchestrator teams. Read-only after init.
 // Ported from /workspace/orchestrator/main.go team definitions.
-var AllTeams = map[string]Team{
+var allTeams = map[string]Team{
 	"go-dev-team": {
 		Name: "go-dev-team",
 		Agents: []Agent{
@@ -86,6 +88,21 @@ var AllTeams = map[string]Team{
 			{Name: "MobileHacker", DNAFile: "coding/kotlin-team/mobile-hacker-agent.md", Tier: 2, Weight: 100},
 		},
 	},
+	"python-dev-team": {
+		Name: "python-dev-team",
+		Agents: []Agent{
+			{Name: "PythonPurist", DNAFile: "coding/python-team/python-purist.md", Tier: 4, Weight: 1},
+			{Name: "PythonPragmatist", DNAFile: "coding/python-team/python-pragmatist.md", Tier: 4, Weight: 1},
+			{Name: "PythonPessimist", DNAFile: "coding/python-team/python-pessimist.md", Tier: 4, Weight: 1},
+		},
+	},
+	"python-sec-team": {
+		Name: "python-sec-team",
+		Agents: []Agent{
+			{Name: "PythonSecurity", DNAFile: "coding/python-team/python-security-agent.md", Tier: 1, Weight: 1000, HasVetoPower: true},
+			{Name: "PythonHacker", DNAFile: "coding/python-team/python-hacker-agent.md", Tier: 2, Weight: 100},
+		},
+	},
 	"research": {
 		Name: "research",
 		Agents: []Agent{
@@ -94,17 +111,18 @@ var AllTeams = map[string]Team{
 	},
 }
 
-// TeamNames returns all available team names.
+// TeamNames returns all available team names in sorted order.
 func TeamNames() []string {
-	names := make([]string, 0, len(AllTeams))
-	for name := range AllTeams {
+	names := make([]string, 0, len(allTeams))
+	for name := range allTeams {
 		names = append(names, name)
 	}
+	sort.Strings(names)
 	return names
 }
 
 // GetTeam returns a team by name.
 func GetTeam(name string) (Team, bool) {
-	t, ok := AllTeams[name]
+	t, ok := allTeams[name]
 	return t, ok
 }

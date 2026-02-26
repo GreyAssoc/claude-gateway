@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"fmt"
 	"strings"
+
+	"github.com/you/claude-gateway/internal/format"
 )
 
 // Consensus represents the aggregated result of all agents in a team.
@@ -28,7 +30,6 @@ var severityWeights = map[string]float64{
 }
 
 // ApplyConsensus evaluates a set of verdicts and produces a consensus result.
-// Ported from /workspace/orchestrator/main.go lines 1554-1594.
 func ApplyConsensus(verdicts []Verdict) Consensus {
 	c := Consensus{
 		TotalAgents: len(verdicts),
@@ -66,10 +67,13 @@ func ApplyConsensus(verdicts []Verdict) Consensus {
 		}
 	}
 
-	// Approval: simple majority of valid verdicts, unless blocked
+	// Approval: simple majority of valid verdicts, unless blocked.
+	// Quorum: at least half+1 of total agents must have valid verdicts
+	// to prevent a single surviving agent from approving when others error.
+	quorum := c.TotalAgents/2 + 1
 	if c.Blocked {
 		c.Approved = false
-	} else if validVerdicts > 0 {
+	} else if validVerdicts >= quorum {
 		c.Approved = c.Approvals > validVerdicts/2
 	}
 
@@ -104,21 +108,11 @@ func FormatConsensusText(team string, task string, consensus Consensus, verdicts
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("*Orchestrator: %s*\n", team))
-	sb.WriteString(fmt.Sprintf("Task: %s\n\n", truncateStr(task, 200)))
+	sb.WriteString(fmt.Sprintf("Task: %s\n\n", format.Truncate(task, 200)))
 	sb.WriteString(fmt.Sprintf("Result: %s\n\n", consensus.Summary))
 
 	for _, v := range verdicts {
-		icon := "?"
-		switch {
-		case v.IsApproval():
-			icon = "PASS"
-		case v.IsRejection():
-			icon = "FAIL"
-		case v.IsError():
-			icon = "ERR"
-		default:
-			icon = "WARN"
-		}
+		icon := v.Icon()
 
 		vetoLabel := ""
 		if v.VetoPower {
@@ -145,7 +139,7 @@ func FormatConsensusText(team string, task string, consensus Consensus, verdicts
 		}
 
 		if v.Notes != "" {
-			sb.WriteString(fmt.Sprintf("  Notes: %s\n", truncateStr(v.Notes, 300)))
+			sb.WriteString(fmt.Sprintf("  Notes: %s\n", format.Truncate(v.Notes, 300)))
 		}
 
 		if v.Error != "" {
@@ -156,11 +150,4 @@ func FormatConsensusText(team string, task string, consensus Consensus, verdicts
 	}
 
 	return sb.String()
-}
-
-func truncateStr(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
 }

@@ -10,13 +10,17 @@ skills:
 
 memory:
   bootstrap_dir: "memory/bootstrap"
+  profiles_dir: "memory/profiles"
   daily_dir: "memory/daily"
   max_curated_inject: 20
   max_daily_days: 7
+  claude_md_paths:
+    - "/workspace/CLAUDE.md"
+    - "/workspace/projects/CLAUDE.md"
 
 orchestrator:
   agent_dna_dir: "/app/agents"
-  timeout_seconds: 600
+  timeout_seconds: 3600
 
 dashboard:
   enabled: true
@@ -75,11 +79,34 @@ heartbeat:
 
 sidecar:
   url: "${SIDECAR_URL:-http://sidecar:3001}"
-  timeout_seconds: 300
+  timeout_seconds: 3600
   health_path: "/health"
+  default_model: "claude-opus-4-5-20251101"
 
 ratelimiter:
-  rpm: ${RATE_LIMIT_RPM:-50}
-  itpm: ${RATE_LIMIT_ITPM:-40000}
-  otpm: ${RATE_LIMIT_OTPM:-8000}
-  safety_margin: 0.85
+  rpm: ${RATE_LIMIT_RPM:-100}
+  itpm: ${RATE_LIMIT_ITPM:-80000}
+  otpm: ${RATE_LIMIT_OTPM:-16000}
+  safety_margin: 0.90
+
+# PostgreSQL (local host instance with pgvector)
+postgres_url: "${POSTGRES_URL}"
+
+# Ollama (containerized, embeddings + 7B LLM)
+ollama_url: "${OLLAMA_URL:-http://ollama:11434}"
+ollama_embed_model: "nomic-embed-text"
+ollama_llm_model: "qwen2.5:7b"
+
+# Context builder settings
+context:
+  recent_turns: 20         # per-message enrichment (enriched user prompt)
+  replay_messages: 30      # conversation replay on new session (system prompt)
+  semantic_hits: 5         # max semantic search results per message
+  min_similarity: 0.75     # minimum cosine similarity threshold
+
+# Triage settings (local LLM pre-processing)
+triage:
+  enabled: true
+  auto_learn: true
+  max_auto_facts: 200
+  min_importance: 4

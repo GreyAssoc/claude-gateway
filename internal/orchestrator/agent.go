@@ -6,32 +6,63 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/you/claude-gateway/internal/agent"
+	"github.com/you/claude-gateway/internal/format"
 )
 
-// reviewToolsOnly restricts agents to read-only file access.
-var reviewToolsOnly = []string{"Read", "Glob", "Grep"}
+// reviewToolsOnly returns a fresh copy of the read-only tool list.
+// Returns a new slice each call to prevent accidental mutation of shared state.
+func reviewToolsOnly() []string {
+	return []string{"Read", "Glob", "Grep"}
+}
+
+// maxDNAFileSize is the maximum size for an agent DNA file (100 KB).
+const maxDNAFileSize = 100 * 1024
+
+// errorVerdict creates an ERROR verdict for an agent with timing info.
+func errorVerdict(ag Agent, errMsg string, start time.Time) Verdict {
+	return Verdict{
+		AgentName:  ag.Name,
+		Tier:       ag.Tier,
+		Weight:     ag.Weight,
+		VetoPower:  ag.HasVetoPower,
+		VerdictStr: "ERROR",
+		Error:      errMsg,
+		DurationMs: time.Since(start).Milliseconds(),
+	}
+}
 
 // RunAgent executes a single agent via the sidecar and returns its verdict.
 // Each agent gets a unique session so they can't see each other's output.
 func RunAgent(ctx context.Context, agentClient *agent.Client, ag Agent, task, agentDNADir, workspaceDir string, timeout time.Duration) Verdict {
 	start := time.Now()
 
-	// Load DNA file
+	// Load DNA file — read first, then check size to avoid TOCTOU race.
 	dnaPath := filepath.Join(agentDNADir, ag.DNAFile)
+
+	// Validate the resolved path stays within the agent DNA directory
+	// to prevent directory traversal if team definitions become configurable.
+	absDir, err := filepath.Abs(agentDNADir)
+	if err != nil {
+		return errorVerdict(ag, fmt.Sprintf("invalid DNA dir: %v", err), start)
+	}
+	absDNA, err := filepath.Abs(dnaPath)
+	if err != nil {
+		return errorVerdict(ag, fmt.Sprintf("invalid DNA path: %v", err), start)
+	}
+	if !strings.HasPrefix(absDNA, absDir+string(filepath.Separator)) {
+		return errorVerdict(ag, fmt.Sprintf("DNA path traversal blocked: %s", ag.DNAFile), start)
+	}
+
 	dna, err := os.ReadFile(dnaPath)
 	if err != nil {
-		return Verdict{
-			AgentName:  ag.Name,
-			Tier:       ag.Tier,
-			Weight:     ag.Weight,
-			VetoPower:  ag.HasVetoPower,
-			VerdictStr: "ERROR",
-			Error:      fmt.Sprintf("DNA not found: %s (%v)", ag.DNAFile, err),
-			DurationMs: time.Since(start).Milliseconds(),
-		}
+		return errorVerdict(ag, fmt.Sprintf("DNA not found: %s (%v)", ag.DNAFile, err), start)
+	}
+	if len(dna) > maxDNAFileSize {
+		return errorVerdict(ag, fmt.Sprintf("DNA file too large: %s (%d bytes, max %d)", ag.DNAFile, len(dna), maxDNAFileSize), start)
 	}
 
 	// Build system prompt (DNA) and user prompt (task) separately.
@@ -42,7 +73,7 @@ func RunAgent(ctx context.Context, agentClient *agent.Client, ag Agent, task, ag
 	// Determine allowed tools
 	var allowedTools []string
 	if !ag.CanWrite {
-		allowedTools = reviewToolsOnly
+		allowedTools = reviewToolsOnly()
 	}
 
 	// Set up timeout context
@@ -71,28 +102,13 @@ func RunAgent(ctx context.Context, agentClient *agent.Client, ag Agent, task, ag
 		} else if ctx.Err() != nil {
 			errMsg = "cancelled"
 		}
-		return Verdict{
-			AgentName:  ag.Name,
-			Tier:       ag.Tier,
-			Weight:     ag.Weight,
-			VetoPower:  ag.HasVetoPower,
-			VerdictStr: "ERROR",
-			Error:      errMsg,
-			DurationMs: durationMs,
-		}
+		return errorVerdict(ag, errMsg, start)
 	}
 
 	if resp.IsRateLimited {
-		return Verdict{
-			AgentName:  ag.Name,
-			Tier:       ag.Tier,
-			Weight:     ag.Weight,
-			VetoPower:  ag.HasVetoPower,
-			VerdictStr: "ERROR",
-			Error:      "rate limited (429)",
-			RawOutput:  resp.Text,
-			DurationMs: durationMs,
-		}
+		v := errorVerdict(ag, "rate limited (429)", start)
+		v.RawOutput = resp.Text
+		return v
 	}
 
 	// Parse verdict from sidecar response
@@ -148,31 +164,8 @@ After your analysis, provide your final verdict as JSON in this exact format:
 `+"```", task, ag.Name)
 }
 
-func errorVerdict(ag Agent, errMsg string, start time.Time) Verdict {
-	return Verdict{
-		AgentName:  ag.Name,
-		Tier:       ag.Tier,
-		Weight:     ag.Weight,
-		VetoPower:  ag.HasVetoPower,
-		VerdictStr: "ERROR",
-		Error:      errMsg,
-		DurationMs: time.Since(start).Milliseconds(),
-	}
-}
-
 // LogVerdict logs a verdict summary. Used during team runs.
 func LogVerdict(v Verdict) {
-	icon := "?"
-	switch {
-	case v.IsApproval():
-		icon = "PASS"
-	case v.IsRejection():
-		icon = "FAIL"
-	case v.IsError():
-		icon = "ERR"
-	default:
-		icon = "WARN"
-	}
 	log.Printf("  [%s] %s (T%d, %dms) issues=%d notes=%s",
-		icon, v.AgentName, v.Tier, v.DurationMs, len(v.Issues), truncateStr(v.Notes, 100))
+		v.Icon(), v.AgentName, v.Tier, v.DurationMs, len(v.Issues), format.Truncate(v.Notes, 100))
 }

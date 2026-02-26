@@ -3,15 +3,20 @@ FROM node:20-slim
 # Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-venv pipx git ca-certificates curl && \
+      python3 git ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code globally (provides both CLI and SDK auth)
+# Install Claude Code native binary (required by the Agent SDK).
+# The SDK needs the native binary, not the npm-installed Node.js wrapper.
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/root/.claude/local/bin:$PATH"
+
+# Also keep the npm CLI for backward compatibility with /run-agent endpoint
 RUN npm install -g @anthropic-ai/claude-code
 
-# Install Google Workspace MCP server (optional, for Gmail/Calendar)
-RUN pipx install workspace-mcp && pipx ensurepath
-ENV PATH="/root/.local/bin:$PATH"
+# Install gog CLI for Google Workspace (Gmail, Calendar, Drive, Sheets)
+RUN curl -fsSL https://github.com/steipete/gogcli/releases/download/v0.11.0/gogcli_0.11.0_linux_amd64.tar.gz \
+    | tar -xz -C /usr/local/bin gog && chmod +x /usr/local/bin/gog
 
 # Sidecar app
 WORKDIR /app
@@ -19,14 +24,19 @@ COPY sidecar/package.json sidecar/package-lock.json* ./
 RUN npm install --production
 COPY sidecar/index.js .
 
-# Claude Code settings (MCP server config, permissions)
+# Claude Code settings (tool permissions)
 RUN mkdir -p /root/.config/claude-code
 COPY configs/claude-code-settings.json /root/.config/claude-code/settings.json
 
-# OAuth credentials are mounted at runtime via docker-compose:
-#   ${CLAUDE_CONFIG_DIR} -> /root/.claude:ro
+# OAuth credentials are mounted at runtime via docker-compose.
+# We copy them to a writable location at startup so the SDK can
+# write session data without needing the mount to be read-write.
 # No ANTHROPIC_API_KEY needed — uses subscription OAuth.
 
 EXPOSE 3001
 
-CMD ["node", "index.js"]
+# Copy OAuth creds and gog config from read-only mounts to writable dirs, then start
+CMD ["sh", "-c", "\
+  mkdir -p /root/.claude && cp -a /root/.claude-ro/. /root/.claude/ && echo 'Claude OAuth creds copied OK' && \
+  if [ -d /root/.config/gogcli-ro ]; then mkdir -p /root/.config/gogcli && cp -a /root/.config/gogcli-ro/. /root/.config/gogcli/ && echo 'gog config copied OK'; fi && \
+  exec node index.js"]

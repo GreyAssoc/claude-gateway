@@ -5,11 +5,20 @@ services:
       dockerfile: Dockerfile.gateway
     env_file: .env
     environment:
+      - TZ=Europe/London
       - SIDECAR_URL=http://sidecar:3001
       - DB_PATH=/app/data/gateway.db
       # WORK_DIR must match the sidecar's mount point, not the host path.
       # The sidecar has the workspace at /workspace — gateway sends this as cwd.
       - WORK_DIR=/workspace
+      # PostgreSQL (local host instance via Docker host networking)
+      - POSTGRES_URL=postgresql://gateway:${POSTGRES_PASSWORD}@host.docker.internal:5432/gateway?sslmode=disable
+      # Ollama (host instance, embeddings + 7B LLM)
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - OLLAMA_EMBED_MODEL=${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      - OLLAMA_LLM_MODEL=${OLLAMA_LLM_MODEL:-qwen2.5:7b}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - gateway-data:/app/data
       - ./skills:/app/skills
@@ -31,13 +40,26 @@ services:
     environment:
       - SIDECAR_PORT=3001
       - WORK_DIR=/workspace
+      # Prevent IPv6 DNS resolution stalls when talking to Telegram/Claude APIs.
+      # Without this, Node.js may attempt IPv6 first, stall for 10-60s, then
+      # fall back to IPv4.
+      - NODE_OPTIONS=--dns-result-order=ipv4first
+      # gog CLI for Google Workspace access (Gmail, Calendar, Drive, Sheets)
+      - GOG_ACCOUNT=steve.w@greyandassociates.co.uk
+      - GOG_KEYRING_BACKEND=file
+      - GOG_KEYRING_PASSWORD=${GOG_KEYRING_PASSWORD}
+      # Gemini API key (for SoC audio transcription)
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
     volumes:
       # Host workspace — mounted so Claude Code can read/write project files
       - ${WORK_DIR}:/workspace
-      # Claude OAuth credentials — subscription auth (no API key)
-      - ${CLAUDE_CONFIG_DIR}:/root/.claude:ro
-      # Google Workspace MCP tokens (optional)
-      - ./google-tokens:/root/.config/workspace-mcp
+      # Client data directories (read-only — for skills that read/copy client data)
+      - /home/stevew/grey-unraid/clients-current:/clients/current:ro
+      - /home/stevew/grey-unraid/clients-past:/clients/past:ro
+      # Claude OAuth credentials — mounted read-only, copied to writable /root/.claude at startup
+      - ${CLAUDE_CONFIG_DIR}:/root/.claude-ro:ro
+      # gog CLI config & keyring (read-only, copied to writable dir at startup)
+      - ${HOME}/.config/gogcli:/root/.config/gogcli-ro:ro
     expose:
       - "3001"
     healthcheck:

@@ -1,9 +1,11 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
+	"time"
 )
 
 // migration represents a database schema migration.
@@ -177,9 +179,12 @@ var migrations = []migration{
 }
 
 // migrate runs all pending migrations in order.
-func (db *DB) migrate() error {
+func (d *DB) migrate() error {
 	// Ensure migrations table exists (bootstrap)
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS migrations (
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, err := d.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS migrations (
 		version    INTEGER PRIMARY KEY,
 		name       TEXT NOT NULL,
 		applied_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -190,7 +195,7 @@ func (db *DB) migrate() error {
 
 	// Get current version
 	var current int
-	err = db.QueryRow("SELECT COALESCE(MAX(version), 0) FROM migrations").Scan(&current)
+	err = d.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM migrations").Scan(&current)
 	if err != nil {
 		return fmt.Errorf("checking migration version: %w", err)
 	}
@@ -202,7 +207,7 @@ func (db *DB) migrate() error {
 
 		log.Printf("Running migration %d: %s", m.version, m.name)
 
-		if err := db.Tx(func(tx *sql.Tx) error {
+		if err := d.Tx(ctx, func(tx *sql.Tx) error {
 			if _, err := tx.Exec(m.sql); err != nil {
 				return fmt.Errorf("migration %d (%s): %w", m.version, m.name, err)
 			}

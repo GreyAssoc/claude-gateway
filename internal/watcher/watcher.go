@@ -1,3 +1,4 @@
+// Package watcher polls external services (Gmail, Calendar) and sends notifications.
 package watcher
 
 import (
@@ -24,17 +25,19 @@ type Manager struct {
 	notify  NotifyFunc
 	workDir string
 
-	watchers []*watcher
+	watchers []*watchTask
 	cancel   context.CancelFunc
+	wg       sync.WaitGroup
 }
 
-type watcher struct {
+type watchTask struct {
 	name     string
 	enabled  bool
 	interval time.Duration
 	runFn    func(ctx context.Context)
 }
 
+// NewManager creates a watcher manager that polls external services for notifications.
 func NewManager(agentClient *agent.Client, limiter *ratelimiter.Limiter, notify NotifyFunc, workDir string) *Manager {
 	return &Manager{
 		agent:   agentClient,
@@ -48,20 +51,20 @@ func NewManager(agentClient *agent.Client, limiter *ratelimiter.Limiter, notify 
 func (m *Manager) Configure(watchersCfg config.WatchersConfig) {
 	if watchersCfg.Gmail.Enabled {
 		gw := newGmailWatcher(m.agent, m.limiter, m.notify, m.workDir, watchersCfg.Gmail)
-		m.watchers = append(m.watchers, &watcher{
+		m.watchers = append(m.watchers, &watchTask{
 			name:     "gmail",
 			enabled:  true,
-			interval: time.Duration(watchersCfg.Gmail.IntervalSeconds) * time.Second,
+			interval: safeInterval(watchersCfg.Gmail.IntervalSeconds, "gmail"),
 			runFn:    gw.check,
 		})
 	}
 
 	if watchersCfg.Calendar.Enabled {
 		cw := newCalendarWatcher(m.agent, m.limiter, m.notify, m.workDir, watchersCfg.Calendar)
-		m.watchers = append(m.watchers, &watcher{
+		m.watchers = append(m.watchers, &watchTask{
 			name:     "calendar",
 			enabled:  true,
-			interval: time.Duration(watchersCfg.Calendar.IntervalSeconds) * time.Second,
+			interval: safeInterval(watchersCfg.Calendar.IntervalSeconds, "calendar"),
 			runFn:    cw.check,
 		})
 	}
@@ -76,19 +79,24 @@ func (m *Manager) Start() {
 		if !w.enabled {
 			continue
 		}
-		go m.runLoop(ctx, w)
+		m.wg.Add(1)
+		go func(w *watchTask) {
+			defer m.wg.Done()
+			m.runLoop(ctx, w)
+		}(w)
 		log.Printf("Watcher %q started (interval: %s)", w.name, w.interval)
 	}
 }
 
-// Stop halts all watchers.
+// Stop halts all watchers and waits for them to finish.
 func (m *Manager) Stop() {
 	if m.cancel != nil {
 		m.cancel()
 	}
+	m.wg.Wait()
 }
 
-func (m *Manager) runLoop(ctx context.Context, w *watcher) {
+func (m *Manager) runLoop(ctx context.Context, w *watchTask) {
 	// Initial delay to avoid startup burst
 	select {
 	case <-time.After(10 * time.Second):
@@ -107,6 +115,16 @@ func (m *Manager) runLoop(ctx context.Context, w *watcher) {
 			w.runFn(ctx)
 		}
 	}
+}
+
+// safeInterval validates watcher interval and returns a safe duration.
+// Prevents time.NewTicker(0) panic when IntervalSeconds is zero or negative.
+func safeInterval(seconds int, name string) time.Duration {
+	if seconds <= 0 {
+		log.Printf("Watcher %q: interval %ds invalid, defaulting to 60s", name, seconds)
+		return 60 * time.Second
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // --- Gmail Watcher ---
@@ -135,6 +153,9 @@ func newGmailWatcher(a *agent.Client, l *ratelimiter.Limiter, n NotifyFunc, wd s
 func (g *gmailWatcher) check(ctx context.Context) {
 	g.mu.Lock()
 	since := g.lastCheck
+	// Update lastCheck before the API call so that failed checks advance the
+	// timestamp, preventing duplicate notification windows on next success.
+	g.lastCheck = time.Now()
 	g.mu.Unlock()
 
 	if !g.limiter.CanProceed(500) {
@@ -143,7 +164,10 @@ func (g *gmailWatcher) check(ctx context.Context) {
 
 	prompt := strings.ReplaceAll(g.prompt, "{since}", since.Format(time.RFC3339))
 
-	resp, err := g.agent.Ask(ctx, "watcher-gmail", prompt, g.workDir, 2)
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	resp, err := g.agent.Ask(reqCtx, "watcher-gmail", prompt, g.workDir, 2)
 	if err != nil {
 		log.Printf("Gmail watcher error: %v", err)
 		return
@@ -153,16 +177,14 @@ func (g *gmailWatcher) check(ctx context.Context) {
 		g.limiter.Record(resp.Usage)
 	}
 
-	g.mu.Lock()
-	g.lastCheck = time.Now()
-	g.mu.Unlock()
-
 	output := strings.TrimSpace(resp.Text)
 	if output == "" || strings.EqualFold(output, "NONE") {
 		return
 	}
 
-	g.notify(fmt.Sprintf("📬 *New Mail*\n\n%s", output))
+	if g.notify != nil {
+		g.notify(fmt.Sprintf("📬 *New Mail*\n\n%s", output))
+	}
 }
 
 // --- Calendar Watcher ---
@@ -174,7 +196,7 @@ type calendarWatcher struct {
 	workDir        string
 	prompt         string
 	mu             sync.Mutex
-	notifiedEvents map[string]bool
+	notifiedEvents map[string]time.Time
 }
 
 type calendarEvent struct {
@@ -191,7 +213,7 @@ func newCalendarWatcher(a *agent.Client, l *ratelimiter.Limiter, n NotifyFunc, w
 		notify:         n,
 		workDir:        wd,
 		prompt:         cfg.Prompt,
-		notifiedEvents: make(map[string]bool),
+		notifiedEvents: make(map[string]time.Time),
 	}
 }
 
@@ -200,7 +222,10 @@ func (c *calendarWatcher) check(ctx context.Context) {
 		return
 	}
 
-	resp, err := c.agent.Ask(ctx, "watcher-calendar", c.prompt, c.workDir, 2)
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	resp, err := c.agent.Ask(reqCtx, "watcher-calendar", c.prompt, c.workDir, 2)
 	if err != nil {
 		log.Printf("Calendar watcher error: %v", err)
 		return
@@ -219,34 +244,68 @@ func (c *calendarWatcher) check(ctx context.Context) {
 	var events []calendarEvent
 	if err := json.Unmarshal([]byte(output), &events); err != nil {
 		// If not valid JSON, just forward the text
-		c.notify(fmt.Sprintf("📅 *Calendar*\n\n%s", output))
+		if c.notify != nil {
+			c.notify(fmt.Sprintf("📅 *Calendar*\n\n%s", output))
+		}
 		return
+	}
+
+	// Cap events per check to prevent runaway notifications
+	const maxEventsPerCheck = 50
+	if len(events) > maxEventsPerCheck {
+		events = events[:maxEventsPerCheck]
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	now := time.Now()
+
 	for _, event := range events {
 		key := event.ID
 		if key == "" {
-			key = event.Title + event.Time
+			key = event.Title + "|" + event.Time
 		}
 
-		if c.notifiedEvents[key] {
+		if _, seen := c.notifiedEvents[key]; seen {
 			continue
 		}
-		c.notifiedEvents[key] = true
+		c.notifiedEvents[key] = now
 
 		loc := event.Location
 		if loc == "" {
 			loc = "No location"
 		}
 
-		c.notify(fmt.Sprintf("⏰ *Upcoming*: %s\n📍 %s\n🕐 %s", event.Title, loc, event.Time))
+		if c.notify != nil {
+			c.notify(fmt.Sprintf("⏰ *Upcoming*: %s\n📍 %s\n🕐 %s", event.Title, loc, event.Time))
+		}
 	}
 
-	// Cleanup old entries (keep last 100)
-	if len(c.notifiedEvents) > 100 {
-		c.notifiedEvents = make(map[string]bool)
+	// Evict entries older than 24 hours
+	for key, notifiedAt := range c.notifiedEvents {
+		if now.Sub(notifiedAt) > 24*time.Hour {
+			delete(c.notifiedEvents, key)
+		}
+	}
+
+	// Hard cap to prevent unbounded growth within a 24h window.
+	// O(n) per eviction, but bounded: the 24h eviction above handles normal
+	// churn, so this hard-cap path rarely fires and only evicts 1-2 entries.
+	const maxNotifiedEvents = 10000
+	if len(c.notifiedEvents) > maxNotifiedEvents {
+		for len(c.notifiedEvents) > maxNotifiedEvents {
+			var oldestKey string
+			var oldestTime time.Time
+			first := true
+			for k, t := range c.notifiedEvents {
+				if first || t.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = t
+					first = false
+				}
+			}
+			delete(c.notifiedEvents, oldestKey)
+		}
 	}
 }

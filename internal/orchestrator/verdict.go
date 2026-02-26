@@ -19,13 +19,13 @@ type Issue struct {
 // Verdict is the result of a single agent's review.
 type Verdict struct {
 	// Metadata from agent config
-	AgentName  string
-	Tier       int
-	Weight     int
-	VetoPower  bool
-	DurationMs int64
-	Error      string
-	RawOutput  string
+	AgentName  string `json:"agent_name"`
+	Tier       int    `json:"tier"`
+	Weight     int    `json:"weight"`
+	VetoPower  bool   `json:"veto_power"`
+	DurationMs int64  `json:"duration_ms"`
+	Error      string `json:"error,omitempty"`
+	RawOutput  string `json:"raw_output,omitempty"`
 
 	// Parsed from agent JSON output
 	VerdictStr string  `json:"verdict"`
@@ -43,10 +43,7 @@ type jsonVerdict struct {
 	Notes      string  `json:"notes"`
 }
 
-var (
-	codeBlockRe = regexp.MustCompile("(?s)```json\\s*(.*?)\\s*```")
-	rawJSONRe   = regexp.MustCompile(`(?s)\{[\s\S]*"verdict"[\s\S]*?\}`)
-)
+var codeBlockRe = regexp.MustCompile("(?s)```json\\s*(.*?)\\s*```")
 
 // ParseVerdict extracts a JSON verdict from agent output text.
 func ParseVerdict(ag Agent, output string) Verdict {
@@ -64,12 +61,16 @@ func ParseVerdict(ag Agent, output string) Verdict {
 		return v
 	}
 
-	// Try code block first
+	// Try code block first — use the last match since agents may include
+	// example JSON before their actual verdict block.
 	jsonStr := ""
-	if matches := codeBlockRe.FindStringSubmatch(output); len(matches) > 1 {
-		jsonStr = matches[1]
-	} else if matches := rawJSONRe.FindString(output); matches != "" {
-		jsonStr = matches
+	if allMatches := codeBlockRe.FindAllStringSubmatch(output, -1); len(allMatches) > 0 {
+		jsonStr = allMatches[len(allMatches)-1][1]
+	} else {
+		// Fallback: find a valid JSON object containing "verdict" by scanning
+		// backwards from the last occurrence of "verdict" to find opening braces,
+		// then use json.Decoder to find the matching close.
+		jsonStr = findVerdictJSON(output)
 	}
 
 	if jsonStr == "" {
@@ -93,23 +94,78 @@ func ParseVerdict(ag Agent, output string) Verdict {
 	return v
 }
 
+// findVerdictJSON scans the text for a valid JSON object containing "verdict".
+// Limits the scan window to the last 8000 characters to avoid O(n^2) on large outputs.
+func findVerdictJSON(text string) string {
+	// Limit scan window to avoid O(n^2) on large outputs with many braces
+	const maxScanWindow = 8000
+	if len(text) > maxScanWindow {
+		text = text[len(text)-maxScanWindow:]
+	}
+
+	idx := strings.LastIndex(text, `"verdict"`)
+	if idx < 0 {
+		return ""
+	}
+
+	// Scan backwards from "verdict" to find candidate opening braces.
+	// Limit iterations to prevent excessive CPU on pathological input.
+	const maxAttempts = 50
+	attempts := 0
+	for start := idx - 1; start >= 0; start-- {
+		if text[start] != '{' {
+			continue
+		}
+		attempts++
+		if attempts > maxAttempts {
+			break
+		}
+		dec := json.NewDecoder(strings.NewReader(text[start:]))
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err == nil {
+			// Verify it actually contains a "verdict" field
+			var check map[string]any
+			if json.Unmarshal(raw, &check) == nil {
+				if _, ok := check["verdict"]; ok {
+					return string(raw)
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // IsApproval returns true if the verdict is an approval.
-func (v *Verdict) IsApproval() bool {
+func (v Verdict) IsApproval() bool {
 	return v.VerdictStr == "APPROVE" || v.VerdictStr == "APPROVED"
 }
 
 // IsRejection returns true if the verdict is a rejection.
-func (v *Verdict) IsRejection() bool {
+func (v Verdict) IsRejection() bool {
 	return v.VerdictStr == "REJECT" || v.VerdictStr == "REJECTED"
 }
 
 // IsError returns true if the verdict is an error.
-func (v *Verdict) IsError() bool {
+func (v Verdict) IsError() bool {
 	return v.VerdictStr == "ERROR"
 }
 
+// Icon returns a short status label for the verdict.
+func (v Verdict) Icon() string {
+	switch {
+	case v.IsApproval():
+		return "PASS"
+	case v.IsRejection():
+		return "FAIL"
+	case v.IsError():
+		return "ERR"
+	default:
+		return "WARN"
+	}
+}
+
 // IssuesBySeverity returns issues filtered by severity.
-func (v *Verdict) IssuesBySeverity(severity string) []Issue {
+func (v Verdict) IssuesBySeverity(severity string) []Issue {
 	var filtered []Issue
 	for _, iss := range v.Issues {
 		if strings.EqualFold(iss.Severity, severity) {

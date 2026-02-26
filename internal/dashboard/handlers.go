@@ -2,17 +2,21 @@ package dashboard
 
 import (
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/you/claude-gateway/internal/orchestrator"
+	"github.com/you/claude-gateway/internal/skills"
 )
 
-func (s *Server) writeJSON(w http.ResponseWriter, data interface{}) {
+func (s *Server) writeJSON(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("Dashboard: JSON encode error: %v", err)
+	}
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -24,41 +28,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	s.writeJSON(w, statusResponse{
 		Status:  "ok",
-		Uptime:  time.Since(startTime).Round(time.Second).String(),
+		Uptime:  time.Since(s.startTime).Round(time.Second).String(),
 		Version: "v2",
 	})
 }
 
-var startTime = time.Now()
-
 func (s *Server) handleRateLimits(w http.ResponseWriter, r *http.Request) {
-	status := s.limiter.GetStatus()
-
-	type rateLimitResponse struct {
-		Current struct {
-			RPM          string  `json:"rpm"`
-			ITPM         string  `json:"itpm"`
-			OTPM         string  `json:"otpm"`
-			Headroom     float64 `json:"headroom"`
-			QueueDepth   int     `json:"queue_depth"`
-			WindowResets string  `json:"window_resets"`
-		} `json:"current"`
-	}
-
-	resp := rateLimitResponse{}
-	resp.Current.RPM = status.RPM
-	resp.Current.ITPM = status.ITPM
-	resp.Current.OTPM = status.OTPM
-	resp.Current.Headroom = status.Headroom
-	resp.Current.QueueDepth = status.QueueDepth
-	resp.Current.WindowResets = status.WindowResets
-
-	s.writeJSON(w, resp)
+	s.writeJSON(w, map[string]any{"current": s.limiter.GetStatus()})
 }
 
 func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request) {
 	if s.skills == nil {
-		s.writeJSON(w, []interface{}{})
+		s.writeJSON(w, []any{})
 		return
 	}
 
@@ -88,52 +69,41 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSkillToggle(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	if s.skills == nil {
 		http.Error(w, "Skills not available", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Extract skill name from path: /api/skills/{name}/toggle
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/skills/"), "/")
-	if len(parts) < 2 || parts[1] != "toggle" {
+	name := r.PathValue("name")
+	if name == "" {
 		http.Error(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
-	name := parts[0]
 
-	sk, ok := s.skills.GetSkill(name)
-	if !ok {
-		http.Error(w, "Skill not found", http.StatusNotFound)
-		return
-	}
-
-	var err error
-	if sk.Enabled {
-		err = s.skills.DisableSkill(name)
-	} else {
-		err = s.skills.EnableSkill(name)
-	}
+	newEnabled, err := s.skills.ToggleSkill(r.Context(), name)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, skills.ErrSkillNotFound) {
+			http.Error(w, "Skill not found", http.StatusNotFound)
+		} else {
+			log.Printf("Dashboard: skill toggle error: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+		}
 		return
 	}
 
-	s.writeJSON(w, map[string]interface{}{"name": name, "enabled": !sk.Enabled})
+	s.writeJSON(w, map[string]any{"name": name, "enabled": newEnabled})
 }
 
 func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 	if s.memory == nil {
-		s.writeJSON(w, []interface{}{})
+		s.writeJSON(w, []any{})
 		return
 	}
 
-	curated, err := s.memory.GetCuratedMemories(100)
+	curated, err := s.memory.GetCuratedMemories(r.Context(), 100)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("Dashboard: memory query error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -142,7 +112,7 @@ func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMemoryDaily(w http.ResponseWriter, r *http.Request) {
 	if s.memory == nil {
-		s.writeJSON(w, []interface{}{})
+		s.writeJSON(w, []any{})
 		return
 	}
 
@@ -151,12 +121,16 @@ func (s *Server) handleMemoryDaily(w http.ResponseWriter, r *http.Request) {
 	if daysStr != "" {
 		if d, err := strconv.Atoi(daysStr); err == nil && d > 0 {
 			days = d
+			if days > 365 {
+				days = 365
+			}
 		}
 	}
 
-	dailies, err := s.memory.GetRecentDailySummaries(days)
+	dailies, err := s.memory.GetRecentDailySummaries(r.Context(), days)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("Dashboard: daily memory query error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -172,23 +146,34 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		CreatedAt    string `json:"created_at"`
 	}
 
-	rows, err := s.db.Query(
+	rows, err := s.db.QueryContext(r.Context(),
 		`SELECT session_id, source, input_tokens, output_tokens, created_at
 		 FROM session_history ORDER BY created_at DESC LIMIT 50`,
 	)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("Dashboard: session query error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
 	var sessions []sessionRow
+	var scanErrors int
 	for rows.Next() {
 		var sr sessionRow
 		if err := rows.Scan(&sr.SessionID, &sr.Source, &sr.InputTokens, &sr.OutputTokens, &sr.CreatedAt); err != nil {
+			scanErrors++
 			continue
 		}
 		sessions = append(sessions, sr)
+	}
+	if scanErrors > 0 {
+		log.Printf("Dashboard: skipped %d session rows due to scan errors", scanErrors)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Dashboard: rows iteration error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
 	}
 
 	s.writeJSON(w, sessions)
@@ -196,16 +181,17 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	type agentResponse struct {
-		Name     string `json:"name"`
-		Team     string `json:"team"`
-		Tier     int    `json:"tier"`
-		Weight   int    `json:"weight"`
-		HasVeto  bool   `json:"has_veto"`
-		DNAFile  string `json:"dna_file"`
+		Name    string `json:"name"`
+		Team    string `json:"team"`
+		Tier    int    `json:"tier"`
+		Weight  int    `json:"weight"`
+		HasVeto bool   `json:"has_veto"`
+		DNAFile string `json:"dna_file"`
 	}
 
 	var agents []agentResponse
-	for teamName, team := range orchestrator.AllTeams {
+	for _, teamName := range orchestrator.TeamNames() {
+		team, _ := orchestrator.GetTeam(teamName)
 		for _, ag := range team.Agents {
 			agents = append(agents, agentResponse{
 				Name:    ag.Name,
@@ -231,28 +217,36 @@ func (s *Server) handleOrchestratorRuns(w http.ResponseWriter, r *http.Request) 
 		CreatedAt  string `json:"created_at"`
 	}
 
-	rows, err := s.db.Query(
+	rows, err := s.db.QueryContext(r.Context(),
 		`SELECT id, team, task, outcome, duration_ms, created_at
 		 FROM orchestrator_runs ORDER BY created_at DESC LIMIT 20`,
 	)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("Dashboard: orchestrator runs query error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
 	var runs []runResponse
+	var scanErrors int
 	for rows.Next() {
-		var r runResponse
-		if err := rows.Scan(&r.ID, &r.Team, &r.Task, &r.Outcome, &r.DurationMs, &r.CreatedAt); err != nil {
+		var rr runResponse
+		if err := rows.Scan(&rr.ID, &rr.Team, &rr.Task, &rr.Outcome, &rr.DurationMs, &rr.CreatedAt); err != nil {
+			scanErrors++
 			continue
 		}
-		runs = append(runs, r)
+		runs = append(runs, rr)
+	}
+	if scanErrors > 0 {
+		log.Printf("Dashboard: skipped %d orchestrator run rows due to scan errors", scanErrors)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("Dashboard: rows iteration error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
 	}
 
 	s.writeJSON(w, runs)
 }
 
-func (s *Server) handleCron(w http.ResponseWriter, r *http.Request) {
-	s.writeJSON(w, map[string]string{"status": "see /cron telegram command"})
-}

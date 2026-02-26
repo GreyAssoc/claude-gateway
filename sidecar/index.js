@@ -1,6 +1,8 @@
-import { claude } from "@anthropic-ai/claude-code";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import { execFile } from "node:child_process";
+import { createServer } from "node:http";
 import express from "express";
+import { WebSocketServer } from "ws";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -8,224 +10,363 @@ app.use(express.json({ limit: "10mb" }));
 const PORT = process.env.SIDECAR_PORT || 3001;
 const DEFAULT_CWD = process.env.WORK_DIR || "/home/user/project";
 
-// In-memory session store: sessionId -> messages[]
+// In-memory session store: sessionId -> { sdkSessionId, lastActive }
 const sessions = new Map();
 
-// Session TTL: clear sessions older than 30 minutes of inactivity
 const SESSION_TTL_MS = 30 * 60 * 1000;
+const MAX_SESSIONS = 1000;
 
-// --- Routes ---
+// --- Shared helpers ---
 
-// Health check
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", sessions: sessions.size, uptime: process.uptime() });
-});
+const summarizeInput = (input) => {
+  if (!input || typeof input !== "object") return "";
+  const vals = Object.values(input);
+  return input.file_path
+    || input.command
+    || input.pattern
+    || input.path
+    || input.query
+    || input.url
+    || (vals.length > 0 && typeof vals[0] === "string" ? vals[0].slice(0, 200) : "");
+};
 
-// Main ask endpoint
-app.post("/ask", async (req, res) => {
-  const { session_id, prompt, cwd, max_turns, system_prompt, allowed_tools } = req.body;
+function evictOldestSession() {
+  if (sessions.size <= MAX_SESSIONS) return;
+  let oldest = null;
+  let oldestTime = Infinity;
+  for (const [id, s] of sessions) {
+    if (s.lastActive < oldestTime) {
+      oldest = id;
+      oldestTime = s.lastActive;
+    }
+  }
+  if (oldest) sessions.delete(oldest);
+}
+
+// Clean ANSI codes and box-drawing chars from CLI stderr output
+function cleanStderr(data) {
+  return data.toString()
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+    .replace(/\x1b\][^\x07]*\x07/g, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "")
+    .replace(/[╭╰╮╯│─┌┐└┘├┤┬┴┼]/g, "")
+    .replace(/[✻●○◆◇▶▷►▻⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "")
+    .trim();
+}
+
+function is429(msg) {
+  return msg && (
+    msg.includes("429") ||
+    msg.includes("rate_limit") ||
+    msg.includes("Rate limit")
+  );
+}
+
+// --- WebSocket Handlers ---
+
+async function handleAsk(msg, send) {
+  const { session_id, prompt, cwd, max_turns, system_prompt, allowed_tools, model } = msg;
 
   if (!prompt) {
-    return res.status(400).json({ error: "prompt is required" });
+    send({ type: "error", error: "prompt is required" });
+    return;
   }
 
   const sessionId = session_id || "default";
   const workDir = cwd || DEFAULT_CWD;
+  const session = sessions.get(sessionId);
 
-  // Get or create session
-  let session = sessions.get(sessionId);
-  if (!session) {
-    session = { messages: [], lastActive: Date.now() };
-    sessions.set(sessionId, session);
-  }
+  const keepalive = setInterval(() => {
+    send({ type: "heartbeat" });
+  }, 15000);
+
+  let resultText = "";
+  let sdkSessionId = null;
+  let usage = {};
 
   try {
-    const options = { cwd: workDir };
-    if (max_turns && max_turns > 0) {
-      options.maxTurns = max_turns;
-    }
-    if (allowed_tools) {
-      options.allowedTools = allowed_tools;
-    }
-
-    // Build the call parameters
-    const callParams = {
-      prompt,
-      messages: session.messages,
-      options,
+    const options = {
+      cwd: workDir,
+      permissionMode: "acceptEdits",
+      additionalDirectories: ["/clients/current", "/clients/past"],
     };
 
-    // Inject system prompt with cache_control for prompt caching.
-    // The system prompt contains static content (bootstrap + skills + memory)
-    // that rarely changes, so caching it saves significant tokens.
-    if (system_prompt) {
-      callParams.systemPrompt = system_prompt;
+    if (max_turns && max_turns > 0) options.maxTurns = max_turns;
+    options.allowedTools = allowed_tools || [
+      "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+    ];
+    if (system_prompt) options.systemPrompt = system_prompt;
+    // model is only passed to CLI (run-agent), not the SDK — the SDK does not
+    // support the model option with subscription auth.
+    if (session && session.sdkSessionId) options.resume = session.sdkSessionId;
+
+    options.stderr = (data) => {
+      process.stderr.write(`[claude-sdk] ${data}`);
+      const clean = cleanStderr(data);
+      if (clean.length > 2) {
+        send({ type: "progress", text: clean.slice(0, 300) });
+      }
+    };
+
+    console.log(`[ws-ask ${sessionId}] query (cwd: ${workDir}, model: ${model || "default"}, resume: ${session?.sdkSessionId || "none"})`);
+
+    const conversation = query({ prompt, options });
+
+    for await (const message of conversation) {
+      const type = message.type;
+      const sub = message.subtype ? `:${message.subtype}` : "";
+      console.log(`[ws-ask ${sessionId}] event: ${type}${sub}`);
+
+      if (type === "system" && message.subtype === "init") {
+        sdkSessionId = message.session_id;
+        send({ type: "progress", text: "Session initialized" });
+        continue;
+      }
+
+      if (type === "assistant") {
+        const content = message.content
+          || (message.message && message.message.content)
+          || [];
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === "tool_use") {
+              const toolName = block.name || "unknown";
+              const inputSummary = summarizeInput(block.input);
+              console.log(`[ws-ask ${sessionId}]   tool: ${toolName} → ${inputSummary.slice(0, 80)}`);
+              send({ type: "progress", tool: toolName, input: inputSummary });
+            } else if (block.type === "text" && block.text) {
+              send({ type: "progress", text: block.text });
+            }
+          }
+        }
+        continue;
+      }
+
+      if (type === "result") {
+        resultText = message.subtype === "success"
+          ? (message.result || "")
+          : ((message.errors || []).join("\n") || message.error || `Error: ${message.subtype}`);
+        usage = message.usage || {};
+        sdkSessionId = sdkSessionId || message.session_id;
+        continue;
+      }
+
+      // Forward unknown event types
+      const preview = JSON.stringify(message).slice(0, 200);
+      console.log(`[ws-ask ${sessionId}]   other: ${preview}`);
+      send({ type: "progress", text: `[${type}${sub}]` });
     }
 
-    const result = await claude(callParams);
+    clearInterval(keepalive);
 
-    // Update session
-    session.messages = result.messages;
-    session.lastActive = Date.now();
+    if (sdkSessionId) {
+      sessions.set(sessionId, { sdkSessionId, lastActive: Date.now() });
+    }
+    evictOldestSession();
 
-    // Extract usage from the result
-    const usage = extractUsage(result);
+    console.log(`[ws-ask ${sessionId}] done, result=${resultText.length} chars`);
 
-    res.json({
-      text: result.stdout || "",
+    send({
+      type: "result",
+      text: resultText || "(no output)",
       session_id: sessionId,
-      usage,
+      usage: {
+        input_tokens: usage.input_tokens || 0,
+        output_tokens: usage.output_tokens || 0,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens || 0,
+        cache_read_input_tokens: usage.cache_read_input_tokens || 0,
+      },
     });
   } catch (err) {
-    console.error(`Error for session ${sessionId}:`, err.message);
+    clearInterval(keepalive);
 
-    // Check for rate limit errors
-    const is429 = err.message && (
-      err.message.includes("429") ||
-      err.message.includes("rate_limit") ||
-      err.message.includes("Rate limit")
-    );
+    // The SDK throws "exit code 1" when the CLI process terminates, even after
+    // a successful result:success event. If we already captured a result, send
+    // it instead of the error.
+    if (resultText) {
+      console.log(`[ws-ask ${sessionId}] process exited with error after result, sending result (${resultText.length} chars)`);
 
-    res.status(is429 ? 429 : 500).json({
-      error: err.message,
-      session_id: sessionId,
-      is_rate_limited: is429,
-    });
+      if (sdkSessionId) {
+        sessions.set(sessionId, { sdkSessionId, lastActive: Date.now() });
+      }
+      evictOldestSession();
+
+      send({
+        type: "result",
+        text: resultText,
+        session_id: sessionId,
+        usage: {
+          input_tokens: usage.input_tokens || 0,
+          output_tokens: usage.output_tokens || 0,
+          cache_creation_input_tokens: usage.cache_creation_input_tokens || 0,
+          cache_read_input_tokens: usage.cache_read_input_tokens || 0,
+        },
+      });
+      return;
+    }
+
+    console.error(`[ws-ask ${sessionId}] error:`, err.message);
+    if (err.stderr) console.error(`  stderr: ${err.stderr}`);
+    if (err.stack) console.error(`  stack: ${err.stack}`);
+
+    if (session && session.sdkSessionId) {
+      sessions.delete(sessionId);
+      console.log(`Cleared stale session ${sessionId} after failure`);
+    }
+
+    send({ type: "error", error: err.message, is_rate_limited: is429(err.message) });
   }
-});
+}
 
-// Isolated agent execution — spawns a separate CLI process per agent.
-// Each agent gets its own process with zero shared context/state.
-// Used by the orchestrator for independent code review agents.
-app.post("/run-agent", async (req, res) => {
-  const { prompt, system_prompt, cwd, allowed_tools, timeout_ms } = req.body;
+async function handleRunAgent(msg, send) {
+  const { prompt, system_prompt, cwd, allowed_tools, timeout_ms, model } = msg;
 
   if (!prompt) {
-    return res.status(400).json({ error: "prompt is required" });
+    send({ type: "error", error: "prompt is required" });
+    return;
   }
 
   const workDir = cwd || DEFAULT_CWD;
-  const timeoutMs = timeout_ms || 600000; // 10 minutes default
+  const timeoutMs = timeout_ms || 3600000;
 
-  // Build the full prompt: system prompt (DNA) + user prompt (task)
   let fullPrompt = prompt;
   if (system_prompt) {
     fullPrompt = system_prompt + "\n\n---\n\n" + prompt;
   }
 
-  // Build CLI arguments
   const args = ["-p", fullPrompt, "--output-format", "text"];
+  if (model) args.push("--model", model);
   if (allowed_tools && allowed_tools.length > 0) {
     args.push("--allowedTools", allowed_tools.join(","));
   }
 
-  console.log(`[run-agent] Spawning isolated claude process (cwd: ${workDir}, timeout: ${timeoutMs}ms)`);
+  console.log(`[ws-agent] Spawning isolated process (cwd: ${workDir}, timeout: ${timeoutMs}ms)`);
 
   try {
     const output = await new Promise((resolve, reject) => {
-      const proc = execFile("claude", args, {
+      execFile("claude", args, {
         cwd: workDir,
         timeout: timeoutMs,
-        maxBuffer: 10 * 1024 * 1024, // 10MB output buffer
+        maxBuffer: 10 * 1024 * 1024,
         env: { ...process.env, HOME: "/root", PWD: workDir },
       }, (err, stdout, stderr) => {
         if (err) {
-          if (err.killed) {
-            reject(new Error(`Process killed (timeout after ${timeoutMs}ms)`));
-          } else {
-            // Even on error, there may be useful output
-            reject(new Error(err.message + (stderr ? "\nstderr: " + stderr : "")));
-          }
+          reject(err.killed
+            ? new Error(`Process killed (timeout after ${timeoutMs}ms)`)
+            : new Error(err.message + (stderr ? "\nstderr: " + stderr : "")));
           return;
         }
         resolve(stdout);
       });
     });
 
-    console.log(`[run-agent] Process completed (${output.length} bytes output)`);
-
-    res.json({
-      text: output,
-      is_rate_limited: false,
-    });
+    console.log(`[ws-agent] Done (${output.length} bytes)`);
+    send({ type: "result", text: output, is_rate_limited: false });
   } catch (err) {
-    console.error(`[run-agent] Error:`, err.message);
-
-    const is429 = err.message && (
-      err.message.includes("429") ||
-      err.message.includes("rate_limit") ||
-      err.message.includes("Rate limit")
-    );
-
-    res.status(is429 ? 429 : 500).json({
-      error: err.message,
-      is_rate_limited: is429,
-    });
+    console.error(`[ws-agent] Error:`, err.message);
+    send({ type: "error", error: err.message, is_rate_limited: is429(err.message) });
   }
-});
+}
 
-// Reset a session
-app.post("/reset", (req, res) => {
-  const { session_id } = req.body;
-  const sessionId = session_id || "default";
-
+function handleReset(msg, send) {
+  const sessionId = msg.session_id || "default";
   sessions.delete(sessionId);
   console.log(`Session ${sessionId} cleared`);
+  send({ type: "ack", session_id: sessionId });
+}
 
-  res.json({ status: "ok", session_id: sessionId });
+function handleCheckSession(msg, send) {
+  const sessionId = msg.session_id || "default";
+  const sess = sessions.get(sessionId);
+  send({
+    type: "session-status",
+    session_id: sessionId,
+    alive: !!sess,
+    sdk_session_id: sess?.sdkSessionId || null,
+    last_active: sess ? new Date(sess.lastActive).toISOString() : null,
+    idle_seconds: sess ? Math.floor((Date.now() - sess.lastActive) / 1000) : null,
+  });
+}
+
+// --- HTTP Routes (health + debugging only) ---
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", sessions: sessions.size, uptime: process.uptime() });
 });
 
-// List active sessions (for debugging)
 app.get("/sessions", (_req, res) => {
   const list = [];
   for (const [id, session] of sessions) {
     list.push({
       id,
-      messages: session.messages.length,
+      sdkSessionId: session.sdkSessionId,
       lastActive: new Date(session.lastActive).toISOString(),
     });
   }
   res.json(list);
 });
 
-// --- Helpers ---
+// --- Server Setup ---
 
-function extractUsage(result) {
-  // The SDK returns usage info in the result or in individual messages.
-  // Try to find cumulative usage.
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheCreation = 0;
-  let cacheRead = 0;
+const httpServer = createServer(app);
+const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
-  if (result.usage) {
-    return {
-      input_tokens: result.usage.input_tokens || 0,
-      output_tokens: result.usage.output_tokens || 0,
-      cache_creation_input_tokens: result.usage.cache_creation_input_tokens || 0,
-      cache_read_input_tokens: result.usage.cache_read_input_tokens || 0,
-    };
-  }
+wss.on("connection", (ws) => {
+  console.log("Gateway connected via WebSocket");
+  ws.isAlive = true;
 
-  // Walk through messages looking for usage data
-  if (result.messages) {
-    for (const msg of result.messages) {
-      if (msg.usage) {
-        inputTokens += msg.usage.input_tokens || 0;
-        outputTokens += msg.usage.output_tokens || 0;
-        cacheCreation += msg.usage.cache_creation_input_tokens || 0;
-        cacheRead += msg.usage.cache_read_input_tokens || 0;
-      }
+  ws.on("pong", () => { ws.isAlive = true; });
+
+  ws.on("message", (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch (e) {
+      try { ws.send(JSON.stringify({ type: "error", error: "Invalid JSON" })); } catch (_) {}
+      return;
     }
-  }
 
-  return {
-    input_tokens: inputTokens,
-    output_tokens: outputTokens,
-    cache_creation_input_tokens: cacheCreation,
-    cache_read_input_tokens: cacheRead,
-  };
-}
+    const { id, type } = msg;
+
+    // send() tags every response with the request id for correlation
+    const send = (obj) => {
+      if (ws.readyState === 1) {
+        try { ws.send(JSON.stringify({ id, ...obj })); } catch (_) {}
+      }
+    };
+
+    // Fire-and-forget — each request runs concurrently for multiplexing
+    const handle = async () => {
+      try {
+        switch (type) {
+          case "ask": await handleAsk(msg, send); break;
+          case "run-agent": await handleRunAgent(msg, send); break;
+          case "reset": handleReset(msg, send); break;
+          case "check-session": handleCheckSession(msg, send); break;
+          default: send({ type: "error", error: `Unknown message type: ${type}` });
+        }
+      } catch (err) {
+        console.error(`[ws] Unhandled error for ${type} ${id}:`, err);
+        send({ type: "error", error: err.message || "Internal error" });
+      }
+    };
+    handle();
+  });
+
+  ws.on("close", () => { console.log("Gateway disconnected"); });
+  ws.on("error", (err) => { console.error("WebSocket error:", err.message); });
+});
+
+// Ping all clients every 30s to detect dead connections
+const pingInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on("close", () => clearInterval(pingInterval));
 
 // --- Session cleanup ---
 
@@ -237,11 +378,18 @@ setInterval(() => {
       console.log(`Session ${id} expired (inactive)`);
     }
   }
-}, 60 * 1000); // check every minute
+}, 60 * 1000);
 
 // --- Start ---
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Sidecar listening on port ${PORT}`);
-  console.log(`Default working directory: ${DEFAULT_CWD}`);
+httpServer.listen(PORT, "0.0.0.0", () => {
+  console.log(`Sidecar listening on port ${PORT} (HTTP + WebSocket)`);
+  console.log(`  HTTP:      http://0.0.0.0:${PORT}/health`);
+  console.log(`  WebSocket: ws://0.0.0.0:${PORT}/ws`);
+  console.log(`  Work dir:  ${DEFAULT_CWD}`);
 });
+
+httpServer.timeout = 3600000;
+httpServer.requestTimeout = 0;
+httpServer.headersTimeout = 120000;
+httpServer.keepAliveTimeout = 30000;
