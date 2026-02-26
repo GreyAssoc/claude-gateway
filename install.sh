@@ -30,6 +30,7 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NON_INTERACTIVE=false
+IS_WSL=false
 
 # State variables (populated by wizards)
 OWNER_NAME="${OWNER_NAME:-}"
@@ -124,9 +125,21 @@ validate_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
-# Expand tilde in a path variable.
+# Expand tilde in a path variable. In WSL2, also convert Windows paths.
 expand_path() {
     local val="$1"
+    # Convert Windows paths (C:\Users\...) to WSL paths (/mnt/c/Users/...)
+    if $IS_WSL && [[ "$val" =~ ^[A-Za-z]:\\ ]]; then
+        if check_command wslpath; then
+            val="$(wslpath -u "$val")"
+        else
+            # Manual conversion: C:\foo\bar -> /mnt/c/foo/bar
+            local drive="${val:0:1}"
+            drive="${drive,,}" # lowercase
+            val="/mnt/${drive}${val:2}"
+            val="${val//\\//}"
+        fi
+    fi
     echo "${val/#\~/$HOME}"
 }
 
@@ -134,7 +147,31 @@ expand_path() {
 # OS detection
 # ──────────────────────────────────────────────────────────────
 
+# Check if running inside WSL2 (Windows Subsystem for Linux).
+detect_wsl() {
+    if grep -qi "microsoft\|WSL" /proc/version 2>/dev/null; then
+        return 0
+    fi
+    if [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 detect_os() {
+    # Detect native Windows (Git Bash / MSYS2 / Cygwin) — not supported directly
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            echo "windows_native"
+            return
+            ;;
+    esac
+
+    # Check for WSL2 first — sets the global flag, then returns the underlying distro
+    if detect_wsl; then
+        IS_WSL=true
+    fi
+
     if [[ -f /etc/os-release ]]; then
         # shellcheck source=/dev/null
         . /etc/os-release
@@ -194,7 +231,9 @@ install_docker() {
             exit 1
             ;;
     esac
-    sudo systemctl enable --now docker 2>/dev/null || true
+    if ! $IS_WSL; then
+        sudo systemctl enable --now docker 2>/dev/null || true
+    fi
     sudo usermod -aG docker "$USER" 2>/dev/null || true
 }
 
@@ -224,7 +263,12 @@ install_postgres() {
             ;;
     esac
     if [[ "$os" != "macos" ]]; then
-        sudo systemctl enable --now postgresql 2>/dev/null || true
+        if $IS_WSL; then
+            sudo service postgresql start 2>/dev/null || \
+                sudo systemctl start postgresql 2>/dev/null || true
+        else
+            sudo systemctl enable --now postgresql 2>/dev/null || true
+        fi
     fi
 }
 
@@ -417,6 +461,11 @@ wizard_workspace() {
 
     echo "  Choose a directory for your workspace."
     echo "  The bot will have read/write access to this directory."
+    if $IS_WSL; then
+        echo ""
+        echo "  Tip: You can use Windows paths (e.g. C:\\Users\\name\\workspace)"
+        echo "  or Linux paths (e.g. /home/name/workspace). Linux paths are faster."
+    fi
     echo ""
 
     if [[ -z "$WORK_DIR" ]]; then
@@ -507,12 +556,22 @@ wizard_claude_oauth() {
         echo "  Claude Gateway uses your Claude subscription via OAuth — no API key needed."
         echo ""
         echo "  Setup steps:"
-        echo "    1. Install the Claude Code CLI:"
-        echo "       curl -fsSL https://claude.ai/install.sh | bash"
-        echo ""
-        echo "    2. Run 'claude' in your terminal and complete the browser login"
-        echo ""
-        echo "    3. Your credentials are stored in ~/.claude/"
+        if $IS_WSL; then
+            echo "    1. Inside this WSL2 terminal, install the Claude Code CLI:"
+            echo "       curl -fsSL https://claude.ai/install.sh | bash"
+            echo ""
+            echo "    2. Run 'claude' and complete the browser login"
+            echo "       (The browser will open in Windows automatically)"
+            echo ""
+            echo "    3. Your credentials are stored in ~/.claude/"
+        else
+            echo "    1. Install the Claude Code CLI:"
+            echo "       curl -fsSL https://claude.ai/install.sh | bash"
+            echo ""
+            echo "    2. Run 'claude' in your terminal and complete the browser login"
+            echo ""
+            echo "    3. Your credentials are stored in ~/.claude/"
+        fi
         echo "       The installer needs the path to this directory."
         echo ""
     fi
@@ -584,8 +643,15 @@ wizard_timezone() {
     print_header "Settings"
 
     if [[ -z "$TIMEZONE" ]]; then
-        local current_tz
-        current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
+        local current_tz="UTC"
+        # Try multiple methods to detect timezone
+        if check_command timedatectl; then
+            current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
+        elif [[ -f /etc/timezone ]]; then
+            current_tz=$(cat /etc/timezone 2>/dev/null || echo "UTC")
+        elif [[ -L /etc/localtime ]]; then
+            current_tz=$(readlink -f /etc/localtime | sed 's|.*/zoneinfo/||' 2>/dev/null || echo "UTC")
+        fi
         prompt_default "Timezone" "$current_tz" TIMEZONE
     fi
     print_success "Timezone: $TIMEZONE"
@@ -628,7 +694,7 @@ DASHBOARD_TOKEN=
 # PostgreSQL
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
 
-# Ollama
+# Ollama (host.docker.internal works on Docker Desktop, Linux, and WSL2)
 OLLAMA_URL=http://host.docker.internal:11434
 OLLAMA_EMBED_MODEL=nomic-embed-text
 OLLAMA_LLM_MODEL=qwen2.5:7b
@@ -1140,10 +1206,22 @@ setup_postgres_db() {
 
     # Check if PostgreSQL is reachable
     if ! sudo -u postgres psql -c "SELECT 1" &>/dev/null; then
-        print_warning "Cannot connect to PostgreSQL as postgres user."
-        print_info "You may need to configure pg_hba.conf for local peer authentication."
-        print_info "Skipping automatic database setup. You can run db/init.sql manually."
-        return
+        # WSL2 may need the service started first
+        if $IS_WSL; then
+            print_info "Starting PostgreSQL in WSL2..."
+            sudo pg_ctlcluster "$(pg_lsclusters -h 2>/dev/null | head -1 | awk '{print $1}')" main start 2>/dev/null || \
+                sudo service postgresql start 2>/dev/null || true
+            sleep 2
+        fi
+        if ! sudo -u postgres psql -c "SELECT 1" &>/dev/null; then
+            print_warning "Cannot connect to PostgreSQL as postgres user."
+            print_info "You may need to configure pg_hba.conf for local peer authentication."
+            if $IS_WSL; then
+                print_info "In WSL2, try: sudo service postgresql start"
+            fi
+            print_info "Skipping automatic database setup. You can run db/init.sql manually."
+            return
+        fi
     fi
 
     # Create role if it doesn't exist
@@ -1238,15 +1316,42 @@ main() {
     os=$(detect_os)
     print_info "Detected OS: $os"
 
-    if [[ "$os" == "unknown" ]]; then
-        print_error "Unsupported operating system."
-        print_info "Supported: Ubuntu/Debian, Fedora/RHEL/CentOS, Arch/Manjaro, macOS"
+    if [[ "$os" == "windows_native" ]]; then
+        print_error "Direct Windows installation is not supported."
+        echo ""
+        print_info "Claude Gateway requires WSL2 (Windows Subsystem for Linux)."
+        echo ""
+        echo "  Setup steps:"
+        echo "    1. Open PowerShell as Administrator and run:"
+        echo "       wsl --install -d Ubuntu"
+        echo ""
+        echo "    2. Restart your computer when prompted"
+        echo ""
+        echo "    3. Open Ubuntu from the Start menu and create your user"
+        echo ""
+        echo "    4. Inside the Ubuntu terminal, run this installer again:"
+        echo "       bash install.sh"
+        echo ""
         exit 1
     fi
 
-    # Check sudo access (needed for Docker, PostgreSQL, Ollama)
+    if [[ "$os" == "unknown" ]]; then
+        print_error "Unsupported operating system."
+        print_info "Supported: Ubuntu/Debian, Fedora/RHEL/CentOS, Arch/Manjaro, macOS, Windows 11 (via WSL2)"
+        exit 1
+    fi
+
+    if $IS_WSL; then
+        print_info "Running inside WSL2"
+        print_info "Docker Desktop for Windows will be used for containers."
+    fi
+
+    # Check sudo access (needed for PostgreSQL, Ollama, and Docker on Linux)
     if [[ "$os" != "macos" ]] && ! sudo -v 2>/dev/null; then
         print_error "sudo access is required for installing dependencies."
+        if $IS_WSL; then
+            print_info "Try setting your password with: passwd"
+        fi
         exit 1
     fi
 
@@ -1263,17 +1368,46 @@ main() {
     print_header "Docker"
     if check_command docker; then
         print_success "Docker is installed"
+        if $IS_WSL; then
+            # Verify Docker Desktop integration is working
+            if docker info &>/dev/null 2>&1; then
+                print_success "Docker Desktop WSL2 integration is working"
+            else
+                print_error "Docker is found but not responding."
+                echo ""
+                echo "  Ensure Docker Desktop for Windows is running and WSL2 integration is enabled:"
+                echo "    1. Open Docker Desktop"
+                echo "    2. Settings → Resources → WSL Integration"
+                echo "    3. Enable integration with your WSL2 distro"
+                echo "    4. Apply & Restart"
+                echo ""
+                exit 1
+            fi
+        fi
     else
-        print_warning "Docker is not installed"
-        local install_it
-        install_it=$(prompt_yes_no "Install Docker?" "y")
-        if [[ "$install_it" == "y" ]]; then
-            install_docker "$os"
-            print_success "Docker installed"
-            print_warning "You may need to log out and back in for Docker group membership to take effect."
-        else
-            print_error "Docker is required. Exiting."
+        if $IS_WSL; then
+            print_error "Docker is not available in this WSL2 distro."
+            echo ""
+            echo "  Install Docker Desktop for Windows:"
+            echo "    1. Download from https://docker.com/products/docker-desktop"
+            echo "    2. Install and restart your computer"
+            echo "    3. Open Docker Desktop → Settings → Resources → WSL Integration"
+            echo "    4. Enable integration with your WSL2 distro"
+            echo "    5. Apply & Restart, then re-run this installer"
+            echo ""
             exit 1
+        else
+            print_warning "Docker is not installed"
+            local install_it
+            install_it=$(prompt_yes_no "Install Docker?" "y")
+            if [[ "$install_it" == "y" ]]; then
+                install_docker "$os"
+                print_success "Docker installed"
+                print_warning "You may need to log out and back in for Docker group membership to take effect."
+            else
+                print_error "Docker is required. Exiting."
+                exit 1
+            fi
         fi
     fi
 
@@ -1281,7 +1415,11 @@ main() {
         print_success "Docker Compose v2 is available"
     else
         print_error "Docker Compose v2 plugin not found."
-        print_info "It should be bundled with Docker CE. Try reinstalling Docker."
+        if $IS_WSL; then
+            print_info "Ensure Docker Desktop is updated to the latest version."
+        else
+            print_info "It should be bundled with Docker CE. Try reinstalling Docker."
+        fi
         exit 1
     fi
 
@@ -1293,7 +1431,14 @@ main() {
             print_success "PostgreSQL is running"
         else
             print_warning "PostgreSQL is installed but not running"
-            sudo systemctl start postgresql 2>/dev/null || true
+            if $IS_WSL; then
+                # WSL2 doesn't always have systemd; try direct pg_ctlcluster
+                sudo pg_ctlcluster "$(pg_lsclusters -h 2>/dev/null | head -1 | awk '{print $1}')" main start 2>/dev/null || \
+                    sudo service postgresql start 2>/dev/null || \
+                    sudo systemctl start postgresql 2>/dev/null || true
+            else
+                sudo systemctl start postgresql 2>/dev/null || true
+            fi
         fi
         # Check pgvector
         if sudo -u postgres psql -c "SELECT 1 FROM pg_available_extensions WHERE name='vector'" -tA 2>/dev/null | grep -q 1; then
@@ -1320,24 +1465,50 @@ main() {
     # --- Ollama ---
     print_header "Ollama"
     local ollama_available=false
-    if check_command ollama; then
+    local ollama_url="http://localhost:11434"
+
+    if $IS_WSL; then
+        # In WSL2, Ollama might be running on the Windows host
+        if curl -sf http://localhost:11434/api/tags &>/dev/null; then
+            print_success "Ollama is responding on localhost (WSL2)"
+            ollama_available=true
+        else
+            print_info "Ollama not found on localhost. Checking if installed in WSL2..."
+        fi
+    fi
+
+    if ! $ollama_available && check_command ollama; then
         print_success "Ollama is installed"
         if curl -sf http://localhost:11434/api/tags &>/dev/null; then
             print_success "Ollama is running"
             ollama_available=true
         else
             print_warning "Ollama is installed but not responding"
-            sudo systemctl start ollama 2>/dev/null || (ollama serve &>/dev/null &)
+            if $IS_WSL; then
+                # WSL2 may not have systemd
+                ollama serve &>/dev/null &
+            else
+                sudo systemctl start ollama 2>/dev/null || (ollama serve &>/dev/null &)
+            fi
             sleep 3
             if curl -sf http://localhost:11434/api/tags &>/dev/null; then
                 ollama_available=true
                 print_success "Ollama started"
             fi
         fi
-    else
+    fi
+
+    if ! $ollama_available; then
         print_warning "Ollama is not installed"
+        if $IS_WSL; then
+            echo ""
+            echo "  You can install Ollama either:"
+            echo "    a) On Windows: download from https://ollama.com (runs as Windows service)"
+            echo "    b) Inside WSL2: this installer can do it for you"
+            echo ""
+        fi
         local install_it
-        install_it=$(prompt_yes_no "Install Ollama? (recommended for local LLM triage)" "y")
+        install_it=$(prompt_yes_no "Install Ollama inside $(if $IS_WSL; then echo "WSL2"; else echo "this system"; fi)? (recommended for local LLM triage)" "y")
         if [[ "$install_it" == "y" ]]; then
             install_ollama
             ollama_available=true
@@ -1426,6 +1597,19 @@ main() {
     echo ""
     echo "  Dashboard: http://localhost:${DASHBOARD_PORT}"
     echo ""
+
+    if $IS_WSL; then
+        print_header "WSL2 Notes"
+        echo ""
+        echo "  - Docker Desktop must be running for the containers to work."
+        echo "  - PostgreSQL runs inside WSL2 and must be started after each reboot:"
+        echo "      sudo service postgresql start"
+        echo "  - Ollama must be running (either Windows app or WSL2 service) before"
+        echo "    starting the gateway."
+        echo "  - To auto-start services on WSL2 boot, add to ~/.bashrc:"
+        echo "      sudo service postgresql start 2>/dev/null"
+        echo ""
+    fi
 }
 
 main "$@"
