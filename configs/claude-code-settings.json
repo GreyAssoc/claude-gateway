@@ -1,5 +1,22 @@
 {
   "permissions": {
+    "deny": [
+      "Bash(*gog gmail*delete*)",
+      "Bash(*gog gmail*trash*)",
+      "Bash(*gog gmail*batch delete*)",
+      "Bash(*gog gmail*labels delete*)",
+      "Bash(*gog gmail*filters delete*)",
+      "Bash(*gog gmail*drafts delete*)",
+      "Bash(*gog sheets*write*)",
+      "Bash(*gog sheets*update*)",
+      "Bash(*gog sheets*append*)",
+      "Bash(*gog sheets*clear*)",
+      "Bash(*gog sheets*delete*)",
+      "Bash(*gog sheets*create*)",
+      "Bash(*gog drive*delete*)",
+      "Bash(*gog drive*trash*)",
+      "Bash(*gog drive*move*)"
+    ],
     "allow": [
       "Bash(*)",
       "Read(*)",

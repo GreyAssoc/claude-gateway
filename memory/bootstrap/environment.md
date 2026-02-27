@@ -38,6 +38,17 @@ gog gmail send --to a@b.com --subject "Hi" --body "Message"  # Send email
 gog gmail labels list                         # List labels
 ```
 
+**BANNED Gmail commands — NEVER use these under any circumstances:**
+- `gog gmail batch delete` — permanently deletes emails
+- `gog gmail labels delete` — removes labels
+- `gog gmail filters delete` — removes filters
+- `gog gmail drafts delete` — deletes drafts
+- Any command containing `delete` or `trash` in a `gog gmail` context
+
+Archiving emails (via `gog gmail batch modify` to remove the INBOX label) is permitted.
+
+These delete commands are also blocked at the permissions level and will be rejected.
+
 ### Calendar
 ```bash
 gog calendar list                             # Today's events
@@ -46,21 +57,30 @@ gog calendar add --title "Meeting" --start "2026-02-25 14:00" --duration 1h
 gog calendar conflicts --from today --to +7d  # Detect scheduling conflicts
 ```
 
-### Drive
+### Drive (read-only, with one writable folder)
 ```bash
 gog drive ls                                  # Root files
 gog drive ls --parent <folder_id>             # List folder contents
 gog drive search 'name contains "report"'     # Search files
 gog drive download <file_id> --out /workspace/tasks/file.pdf
-gog drive upload /workspace/tasks/doc.pdf --parent <folder_id>
 ```
 
-### Sheets
+**Drive is read-only** — listing, searching, and downloading are permitted. Deleting, trashing, and moving files are blocked.
+
+**One exception:** folder `1MnC-0QWn1P7bxgUuMZtw2DPq7OhuAgjw` is writable. You may upload files and create subfolders **only** in this folder:
+```bash
+gog drive upload /workspace/tasks/doc.pdf --parent 1MnC-0QWn1P7bxgUuMZtw2DPq7OhuAgjw
+gog drive mkdir "New Folder" --parent 1MnC-0QWn1P7bxgUuMZtw2DPq7OhuAgjw
+```
+**Do NOT upload to or create folders in any other location.** If asked to upload somewhere else, explain the restriction and offer to upload to the writable folder instead.
+
+### Sheets (read-only)
 ```bash
 gog sheets get <spreadsheet_id>               # Sheet metadata
 gog sheets read <spreadsheet_id> 'Sheet1!A1:Z100'  # Read cell range
-gog sheets write <spreadsheet_id> 'Sheet1!A1' --values '[[1,2],[3,4]]'
 ```
+
+**Sheets are read-only.** Writing, updating, appending, clearing, deleting, and creating sheets are all blocked.
 
 ### Common Flags
 - `--json` — JSON output (for parsing/scripting)
