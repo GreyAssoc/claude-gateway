@@ -62,6 +62,11 @@ function is429(msg) {
   );
 }
 
+// --- Abort tracking ---
+// Maps sessionId -> { aborted: false } for in-flight requests.
+// The abort flag is checked inside the for-await loop to break early.
+const activeRequests = new Map();
+
 // --- WebSocket Handlers ---
 
 async function handleAsk(msg, send) {
@@ -111,9 +116,16 @@ async function handleAsk(msg, send) {
 
     console.log(`[ws-ask ${sessionId}] query (cwd: ${workDir}, model: ${model || "default"}, resume: ${session?.sdkSessionId || "none"})`);
 
+    const abortState = { aborted: false };
+    activeRequests.set(sessionId, abortState);
+
     const conversation = query({ prompt, options });
 
     for await (const message of conversation) {
+      if (abortState.aborted) {
+        console.log(`[ws-ask ${sessionId}] aborted by user`);
+        break;
+      }
       const type = message.type;
       const sub = message.subtype ? `:${message.subtype}` : "";
       console.log(`[ws-ask ${sessionId}] event: ${type}${sub}`);
@@ -159,6 +171,22 @@ async function handleAsk(msg, send) {
     }
 
     clearInterval(keepalive);
+    activeRequests.delete(sessionId);
+
+    if (abortState.aborted) {
+      send({
+        type: "result",
+        text: "(Stopped by user)",
+        session_id: sessionId,
+        usage: {
+          input_tokens: usage.input_tokens || 0,
+          output_tokens: usage.output_tokens || 0,
+          cache_creation_input_tokens: usage.cache_creation_input_tokens || 0,
+          cache_read_input_tokens: usage.cache_read_input_tokens || 0,
+        },
+      });
+      return;
+    }
 
     if (sdkSessionId) {
       sessions.set(sessionId, { sdkSessionId, lastActive: Date.now() });
@@ -180,6 +208,24 @@ async function handleAsk(msg, send) {
     });
   } catch (err) {
     clearInterval(keepalive);
+    activeRequests.delete(sessionId);
+
+    // If aborted, send a clean result instead of the error
+    if (abortState.aborted) {
+      console.log(`[ws-ask ${sessionId}] aborted by user (caught in error handler)`);
+      send({
+        type: "result",
+        text: "(Stopped by user)",
+        session_id: sessionId,
+        usage: {
+          input_tokens: usage.input_tokens || 0,
+          output_tokens: usage.output_tokens || 0,
+          cache_creation_input_tokens: usage.cache_creation_input_tokens || 0,
+          cache_read_input_tokens: usage.cache_read_input_tokens || 0,
+        },
+      });
+      return;
+    }
 
     // The SDK throws "exit code 1" when the CLI process terminates, even after
     // a successful result:success event. If we already captured a result, send
@@ -344,6 +390,18 @@ wss.on("connection", (ws) => {
           case "run-agent": await handleRunAgent(msg, send); break;
           case "reset": handleReset(msg, send); break;
           case "check-session": handleCheckSession(msg, send); break;
+          case "abort": {
+            const sid = msg.session_id || "default";
+            const target = activeRequests.get(sid);
+            if (target) {
+              target.aborted = true;
+              console.log(`[ws-abort] Abort flag set for session ${sid}`);
+            } else {
+              console.log(`[ws-abort] No active request for session ${sid}`);
+            }
+            send({ type: "ack" });
+            break;
+          }
           default: send({ type: "error", error: `Unknown message type: ${type}` });
         }
       } catch (err) {

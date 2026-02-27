@@ -57,6 +57,11 @@ type Bot struct {
 	sem chan struct{}
 	// handlerWg tracks in-flight handler goroutines for clean shutdown.
 	handlerWg sync.WaitGroup
+
+	// activeReqs maps chat ID → cancel function for the in-flight request,
+	// allowing /stop to interrupt a running Claude session.
+	activeReqs   map[int64]context.CancelFunc
+	activeReqsMu sync.Mutex
 	// bgWg tracks fire-and-forget background goroutines (RecordExchange, fact
 	// extraction, profile update) so shutdown waits for them to finish before
 	// closing the database.
@@ -153,13 +158,14 @@ func New(cfg *config.Config, agentClient *agent.Client, limiter *ratelimiter.Lim
 	log.Printf("Telegram bot authorized as @%s", api.Self.UserName)
 
 	b := &Bot{
-		api:      api,
-		agent:    agentClient,
-		limiter:  limiter,
-		cfg:      cfg,
-		database: database,
-		sessions: make(map[int64]*SessionUsage),
-		sem:      make(chan struct{}, maxConcurrentHandlers),
+		api:        api,
+		agent:      agentClient,
+		limiter:    limiter,
+		cfg:        cfg,
+		database:   database,
+		sessions:   make(map[int64]*SessionUsage),
+		sem:        make(chan struct{}, maxConcurrentHandlers),
+		activeReqs: make(map[int64]context.CancelFunc),
 	}
 	for _, opt := range opts {
 		opt(b)
@@ -267,6 +273,7 @@ func (b *Bot) handleUpdate(ctx context.Context, msg *tgbotapi.Message) {
 func (b *Bot) registerTelegramCommands() {
 	commands := []tgbotapi.BotCommand{
 		{Command: "start", Description: "Show available commands"},
+		{Command: "stop", Description: "Stop the current request"},
 		{Command: "status", Description: "Gateway health & rate limits"},
 		{Command: "reset", Description: "Clear conversation session"},
 		{Command: "cost", Description: "Token usage this session"},

@@ -25,6 +25,7 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		text := "Claude Gateway v2 is ready.\n\n" +
 			"Send me any message and I'll process it with Claude Code.\n\n" +
 			"Commands:\n" +
+			"/stop — stop the current request\n" +
 			"/status — gateway health & rate limits\n" +
 			"/reset — clear conversation session\n" +
 			"/cost — token usage this session\n" +
@@ -169,6 +170,9 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 	case "crondisable":
 		b.handleCronDisable(msg)
 
+	case "stop":
+		b.handleStop(msg)
+
 	case "dbcheck":
 		b.handleDBCheck(ctx, msg)
 
@@ -250,6 +254,17 @@ func containsAny(s string, substrs ...string) bool {
 func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 	if msg.Text == "" {
 		return
+	}
+
+	// Intercept "stop" as plain text while a request is active.
+	if strings.EqualFold(strings.TrimSpace(msg.Text), "stop") {
+		b.activeReqsMu.Lock()
+		_, active := b.activeReqs[msg.Chat.ID]
+		b.activeReqsMu.Unlock()
+		if active {
+			b.handleStop(msg)
+			return
+		}
 	}
 
 	// Step 0: Intercept natural language requests about gateway features.
@@ -409,6 +424,16 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	// against semaphore slot exhaustion from stuck requests.
 	reqCtx, reqCancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer reqCancel()
+
+	// Register cancel so /stop can interrupt this request.
+	b.activeReqsMu.Lock()
+	b.activeReqs[msg.Chat.ID] = reqCancel
+	b.activeReqsMu.Unlock()
+	defer func() {
+		b.activeReqsMu.Lock()
+		delete(b.activeReqs, msg.Chat.ID)
+		b.activeReqsMu.Unlock()
+	}()
 
 	// Rolling progress state — mutex-protected for concurrent access
 	// between the onProgress callback and the flush goroutine.
@@ -688,6 +713,26 @@ func (b *Bot) handleReset(ctx context.Context, msg *tgbotapi.Message) {
 	b.sessionsMu.Unlock()
 
 	b.sendMessage(msg.Chat.ID, "Session cleared. Fresh start.")
+}
+
+func (b *Bot) handleStop(msg *tgbotapi.Message) {
+	b.activeReqsMu.Lock()
+	cancel, ok := b.activeReqs[msg.Chat.ID]
+	b.activeReqsMu.Unlock()
+
+	if !ok {
+		b.sendMessage(msg.Chat.ID, "Nothing running to stop.")
+		return
+	}
+
+	// Cancel the context — AskStreaming will return ctx.Err()
+	cancel()
+
+	// Also tell the sidecar to abort the SDK session
+	sessionID := fmt.Sprintf("tg-%d", msg.Chat.ID)
+	b.agent.AbortSession(sessionID)
+
+	b.sendMessage(msg.Chat.ID, "Stopped.")
 }
 
 func (b *Bot) handleCost(msg *tgbotapi.Message) {

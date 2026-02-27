@@ -368,6 +368,20 @@ func (c *Client) RunIsolatedAgent(ctx context.Context, opts RunAgentOptions) (*R
 	}
 }
 
+// AbortSession sends a fire-and-forget abort message to the sidecar, asking it
+// to interrupt the in-progress request for the given session. No response is
+// expected — the sidecar sets an abort flag that breaks the for-await loop.
+func (c *Client) AbortSession(sessionID string) {
+	req := wsRequest{
+		ID:        c.genID(),
+		Type:      "abort",
+		SessionID: sessionID,
+	}
+	if err := c.writeJSONRetry(req); err != nil {
+		log.Printf("AbortSession(%s): send failed: %v", sessionID, err)
+	}
+}
+
 // ResetSession clears conversation history for a session.
 func (c *Client) ResetSession(ctx context.Context, sessionID string) error {
 	id := c.genID()
