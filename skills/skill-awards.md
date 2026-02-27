@@ -106,9 +106,11 @@ Read the DATA spreadsheet and identify which AOs are active. An AO is active if 
 
 **Critical:** Awards require both **Architect's drawings** AND **Structural/Engineer's drawings** to be populated in the DATA spreadsheet.
 
-**Automatic Drawing Check Process:**
+**IMPORTANT:** This step MUST call the **extract-drawing-numbers skill** to handle drawing extraction and population.
 
-1. **Check Form sheet drawing cells** for the specified AO:
+**Automatic Drawing Check and Population Process:**
+
+1. **Check if drawings are already populated** in Form sheet for the specified AO:
 
    For **AO 1**, check these ranges:
    - **Architect Existing:** B328:B352 (25 slots)
@@ -118,67 +120,78 @@ Read the DATA spreadsheet and identify which AOs are active. An AO is active if 
 
    **Column offset:** +8 columns per AO (AO2 at J, AO3 at R, etc.)
 
+   ```python
+   # Quick check for populated drawings
+   import openpyxl
+   wb = openpyxl.load_workbook("00.0 - DATA*.xlsx", data_only=True)
+   ws_form = wb['Form']
+
+   base_col = 2 + (ao_number - 1) * 8  # B=2, J=10, R=18, etc.
+
+   # Check architect columns (base_col, base_col+2, base_col+4)
+   arch_populated = any(ws_form.cell(row=r, column=base_col).value for r in range(328, 353))
+
+   # Check engineer column (base_col+6)
+   eng_populated = any(ws_form.cell(row=r, column=base_col+6).value for r in range(328, 353))
+   ```
+
 2. **Determine What's Missing:**
-   - ✅ **Both populated:** Proceed directly to award generation
-   - ⚠️ **Architect missing:** Need to extract from `Plans (Architect) - Combined` directory
-   - ⚠️ **Engineer missing:** Need to extract from `Plans (Structural) - Combined` directory
-   - ⚠️ **Both missing:** Need to extract from both directories
+   - ✅ **Both populated:** Proceed directly to Step 5 (award generation)
+   - ⚠️ **Architect missing OR Engineer missing OR Both missing:** **Call extract-drawing-numbers skill**
 
-3. **Automatic Population if Missing:**
+3. **Call extract-drawing-numbers Skill (if drawings missing):**
 
-   **If Architect drawings are missing:**
-   ```bash
-   # Find architect plans PDF
-   ARCH_PDF=$(find "/clients/current/<project>/" -path "*/Plans (Architect) - Combined/*.pdf" -type f | head -1)
+   **CRITICAL:** You MUST invoke the extract-drawing-numbers skill using the Skill tool:
 
-   # Extract latest revision drawings
-   python3 00-engine/populate_drawings.py "$ARCH_PDF" "00.0 - DATA*.xlsx" <ao_number>
+   ```
+   Use Skill tool: skill="extract-drawing-numbers", args="<project_path> <ao_number>"
    ```
 
-   **If Engineer drawings are missing:**
-   ```bash
-   # Find structural plans PDF
-   STRUCT_PDF=$(find "/clients/current/<project>/" -path "*/Plans (Structural) - Combined/*.pdf" -type f | head -1)
+   **What the skill does:**
+   - Automatically searches for PDFs in `Plans (Architect) - Combined/` and `Plans (Structural) - Combined/`
+   - Extracts latest revision drawing numbers from both architect and structural plans
+   - Populates the DATA spreadsheet Form sheet for the specified AO
+   - Copies updated DATA file back to project directory
+   - Returns extraction summary (drawing counts)
 
-   # Extract latest revision drawings
-   python3 00-engine/populate_drawings.py "$STRUCT_PDF" "00.0 - DATA*.xlsx" <ao_number>
+   **Example:**
+   ```
+   Skill(skill="extract-drawing-numbers", args="/clients/current/SPE - Degiel.Abdelmuniem - 13 Milnthorpe Rd - 2270 2")
    ```
 
-4. **If PDFs Not Found:**
+4. **After Skill Completes:**
 
-   Alert Steve and ask what to do:
-   ```
-   ⚠️ Drawing numbers are not populated for AO [n] in the DATA spreadsheet.
-
-   I looked for:
-   - Plans (Architect) - Combined/*.pdf: [✅ Found / ❌ Not found]
-   - Plans (Structural) - Combined/*.pdf: [✅ Found / ❌ Not found]
-
-   Would you like me to:
-   1. Use a different PDF path (provide path manually)
-   2. Continue anyway (award will have empty drawing lists)
-   3. Abort
-   ```
-
-5. **Report Extraction Results:**
+   The extract-drawing-numbers skill will report:
    ```
    ✅ Drawing extraction completed:
    - Architect: [count] Existing, [count] Demolition, [count] Proposed
    - Engineer: [count] Structural drawings
-   - Populated to: AO [n] (Form sheet columns [letter]-[letter])
+   - Populated to: AO [n] (Form sheet)
+   - DATA file updated in project directory
    ```
 
-6. **Copy Updated DATA Back:**
-   ```bash
-   # After successful population, update project DATA file
-   cp "00.0 - DATA*.xlsx" "/clients/current/<project>/"
+5. **If Skill Fails:**
+
+   The skill will alert you if PDFs are not found or extraction fails. In that case, ask Steve:
+   ```
+   ⚠️ Drawing extraction failed for AO [n].
+
+   The extract-drawing-numbers skill reported:
+   - Plans (Architect) - Combined/*.pdf: [✅ Found / ❌ Not found]
+   - Plans (Structural) - Combined/*.pdf: [✅ Found / ❌ Not found]
+
+   Would you like me to:
+   1. Try a different directory path (provide manually)
+   2. Continue anyway (award will have empty drawing lists)
+   3. Abort award generation
    ```
 
 **Key Points:**
-- **Always check BOTH architect and engineer drawings**
-- **Automatically search in `Plans (Architect) - Combined` and `Plans (Structural) - Combined` directories**
-- **Extract latest revisions only** (populate_drawings.py handles this)
-- **Only ask Steve if automatic extraction fails**
+- **ALWAYS call extract-drawing-numbers skill if ANY drawings are missing**
+- **Never call populate_drawings.py directly** - use the skill instead
+- **The skill handles both architect AND engineer drawings automatically**
+- **The skill updates both working directory AND project directory DATA files**
+- **Only proceed to Step 5 after drawings are confirmed populated OR Steve approves empty drawings**
 
 ---
 

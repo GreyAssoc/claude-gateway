@@ -66,6 +66,10 @@ Add new jobs from Telegram at any time — no restart, no config file editing:
 /cronadd ticket_check "*/30 9-17 * * 1-5" Check for new support tickets and summarise
 ```
 
+### Instant Cancellation
+
+Changed your mind? Sent the wrong instruction? Type `/stop` or just "stop" — the gateway cancels the in-progress Claude session immediately and you can start over. No waiting for a 30-minute timeout. No wasted tokens on the wrong task.
+
 ### Real-Time Gmail & Calendar Monitoring
 
 - **Gmail**: Checked every 2 minutes. New emails trigger a notification with sender and subject.
@@ -73,14 +77,26 @@ Add new jobs from Telegram at any time — no restart, no config file editing:
 
 Both respect your rate limits. If the API budget is tight, checks are silently skipped until the next window.
 
-### Google Workspace — Fully Integrated
+### Google Workspace — Fully Integrated, Safety-First
 
 Claude can directly access your Gmail, Calendar, Google Drive, and Sheets through authenticated CLI tools. Not through plugins or third-party connectors — through your own OAuth credentials on your own infrastructure.
 
-- Search and read emails
+- Search, read, and send emails (delete/trash blocked at permissions level)
 - Check calendar conflicts before scheduling
-- Download files from Drive
-- Read and write spreadsheet data
+- Download files from Drive (read-only; one designated upload folder)
+- Read spreadsheet data (read-only)
+
+**Two-layer permission enforcement** protects your data: technical deny rules in the settings block dangerous operations at the tool level, while bootstrap instructions teach Claude why they're blocked. Archiving is allowed; deletion is not. Drive is read-only except for one writable folder. Sheets are fully read-only.
+
+### Web Browsing
+
+Claude has full internet access for research and information gathering:
+
+- **WebSearch** for quick lookups and current information
+- **WebFetch** for reading specific URLs and documentation
+- **Playwright browser automation** for JavaScript-heavy pages and interactive workflows
+
+No proxies, no wrappers — direct access to the web from inside the container.
 
 ### Multi-Agent Code Review
 
@@ -94,7 +110,7 @@ One command triggers a team of specialised AI reviewers, each with a distinct pe
 | **Security** | How can this be exploited? (VETO power — cannot be overruled) |
 | **Hacker** | Can I find an actual exploit? |
 
-Available for Go, Python, Frontend, Kotlin, and cross-language integration reviews. Security agents have absolute veto power — if they find a vulnerability, the review fails regardless of what other agents say.
+Available for Go, Python, Frontend, Kotlin, and cross-language integration reviews. Each language has both a dev team (quality) and a sec team (security). Security agents have absolute veto power — if they find a vulnerability, the review fails regardless of what other agents say. `/autoreview` auto-detects the primary language and selects the right team.
 
 ```
 /review_go Review the authentication middleware for session handling vulnerabilities
@@ -106,7 +122,7 @@ The `/autofix` command goes further: review, fix, build, verify, repeat — auto
 
 Skills are markdown files that teach Claude domain-specific workflows. Drop a file in the `skills/` directory and it's live immediately — no restart needed.
 
-Current skills include YouTube research, legal document generation, audio survey transcription, and spreadsheet analysis. Creating your own takes minutes: write the instructions in markdown, add YAML frontmatter, save.
+Current skills include YouTube research, legal document generation (notices and awards), audio survey transcription, spreadsheet analysis, and PDF drawing register extraction. Skills can chain together — the awards skill automatically invokes drawing extraction to populate documents. Creating your own takes minutes: write the instructions in markdown, add YAML frontmatter, save.
 
 ### Local LLM Triage
 
@@ -142,7 +158,8 @@ Go Gateway
     |
 Node.js Sidecar
 ├── Claude Agent SDK         — Multi-turn with tool use
-└── Google Workspace         — Gmail, Calendar, Drive, Sheets
+├── Google Workspace         — Gmail, Calendar, Drive, Sheets
+└── Web Browsing             — WebSearch, WebFetch, Playwright
     |
 PostgreSQL + pgvector        — Conversations, memory, people, journal
 Ollama (host)                — Embeddings + local LLM triage
@@ -160,12 +177,16 @@ Ollama (host)                — Embeddings + local LLM triage
 | **Auto-learning** | Extracts facts, learns preferences, builds profile over time | Manual setup or none |
 | **Contact awareness** | Fuzzy + semantic people search, auto-injected on mention | No contact integration |
 | **Email in your voice** | Profile documents with condensed aspects + full doc injection | Generic tone |
+| **Instant cancellation** | `/stop` cancels in-progress work immediately, no wasted tokens | Wait for timeout or refresh page |
 | **Code review** | Multi-agent consensus with VETO security agents | Single-pass or none |
-| **Workspace integration** | Gmail, Calendar, Drive, Sheets via authenticated CLI | Plugin marketplace (privacy concerns) |
+| **Workspace integration** | Gmail, Calendar, Drive, Sheets with two-layer permission controls | Plugin marketplace (privacy concerns) |
+| **Web browsing** | WebSearch, WebFetch, and Playwright browser automation | Limited or plugin-based |
 | **Local LLM triage** | 7B model reduces API costs, runs on your hardware | All tokens go to provider |
 | **Self-hosted** | Your infrastructure, your data, your control | Cloud-only, data shared |
+| **Data safety** | Deny rules block destructive operations; read-only defaults | Trust the AI not to delete things |
 | **Rate limit management** | Three-dimension tracking with queuing and safety margins | Hard failures on limit |
-| **Hot-reload skills** | Drop a markdown file, instantly available | Requires deployment |
+| **Hot-reload skills** | Drop a markdown file, instantly available; skills can chain together | Requires deployment |
+| **Cross-platform install** | Interactive wizard for Linux, macOS, Windows 11 (WSL2) | Manual config or cloud-only |
 
 ---
 
@@ -184,13 +205,17 @@ Claude Gateway v2 is in daily production use. It:
 
 - Processes messages through a 5-stage pipeline (triage → context → Claude → post-process → respond)
 - Maintains persistent memory across all sessions with automatic recovery
+- Lets you cancel any in-progress request instantly with `/stop`
 - Monitors Gmail every 2 minutes and calendar every 5 minutes
 - Runs morning briefings, end-of-day summaries, and weekly reviews on schedule
 - Auto-extracts facts, learns communication preferences, and generates daily journals
 - Reviews Go, Python, and frontend code through multi-agent consensus teams
 - Manages contacts with fuzzy search and automatic context injection
+- Browses the web for research, documentation, and current information
+- Enforces data safety with two-layer permission controls on Google Workspace
 - Serves a monitoring dashboard with health, rate limits, and session data
 - Handles graceful degradation when any component goes down
+- Installs on Linux, macOS, or Windows 11 (WSL2) via interactive wizard
 
 All on a single machine, using a standard Claude subscription. No additional API costs for the orchestrator — it uses the same subscription.
 
@@ -204,6 +229,7 @@ All on a single machine, using a standard Claude subscription. No additional API
 | Context assembly | < 100ms per message |
 | Local triage | 1-3 seconds (saves Claude tokens) |
 | Embedding latency | ~50ms per call |
+| Request cancellation | Instant via `/stop` |
 | Memory categories | 5 (bootstrap, self, preference, profile_doc, fact) |
 | Auto-fact extraction | Up to 3 per conversation |
 | Max auto-facts | 200 (lowest-importance pruned) |
@@ -211,7 +237,9 @@ All on a single machine, using a standard Claude subscription. No additional API
 | Semantic search | Top 5 similar past conversations |
 | Rate limit safety | 90% of plan limits (configurable) |
 | Queue capacity | 100 requests |
-| Code review teams | 8 teams, 20+ agents |
+| Code review teams | 10 teams, 20+ agents |
+| Skills | 6 built-in, hot-reloadable, chainable |
+| Platforms | Linux, macOS, Windows 11 (WSL2) |
 
 ---
 
@@ -220,12 +248,20 @@ All on a single machine, using a standard Claude subscription. No additional API
 ```bash
 git clone <repo>
 cd claude-gateway
+bash install.sh   # Interactive wizard — configures everything
+```
+
+The installer walks you through bot personality, Telegram credentials, Google Workspace setup, PostgreSQL, workspace paths, and more. It generates all config files, initialises the database, builds the containers, and starts the services.
+
+Or do it manually:
+
+```bash
 make setup        # Create .env from template
 make build        # Build containers
 make up           # Start everything
 ```
 
-Configure your Telegram bot token, pull two Ollama models, initialise the PostgreSQL schema. Send `/start` in Telegram. You're live.
+Either way: pull two Ollama models, send `/start` in Telegram, and you're live.
 
 ---
 

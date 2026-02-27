@@ -17,12 +17,14 @@ A personal AI gateway that connects Claude to Telegram with persistent memory, s
 9. [Skills](#9-skills)
 10. [Scheduled Jobs (Cron)](#10-scheduled-jobs-cron)
 11. [Watchers (Gmail & Calendar)](#11-watchers-gmail--calendar)
-12. [Code Review Orchestrator](#12-code-review-orchestrator)
-13. [Dashboard](#13-dashboard)
-14. [Rate Limiting](#14-rate-limiting)
-15. [Configuration Reference](#15-configuration-reference)
-16. [Deployment & Operations](#16-deployment--operations)
-17. [Troubleshooting](#17-troubleshooting)
+12. [Google Workspace](#12-google-workspace)
+13. [Web Browsing](#13-web-browsing)
+14. [Code Review Orchestrator](#14-code-review-orchestrator)
+15. [Dashboard](#15-dashboard)
+16. [Rate Limiting](#16-rate-limiting)
+17. [Configuration Reference](#17-configuration-reference)
+18. [Deployment & Operations](#18-deployment--operations)
+19. [Troubleshooting](#19-troubleshooting)
 
 ---
 
@@ -38,6 +40,30 @@ A personal AI gateway that connects Claude to Telegram with persistent memory, s
 - Ollama installed on the host machine (for local LLM; optional but recommended)
 
 ### Setup
+
+#### Option A: Interactive Installer (Recommended)
+
+The interactive installer walks you through every configuration step with a wizard-style interface:
+
+```bash
+cd /workspace/projects/claude-gateway
+bash install.sh
+```
+
+The installer configures:
+- Owner identity (name, role)
+- Bot personality (professional, casual, dry wit, or custom)
+- Verbosity level (terse, concise, detailed)
+- Telegram bot token and allowed user IDs
+- Workspace and Claude config directories
+- Google Workspace integration (Gmail, Calendar, Drive)
+- PostgreSQL and Dashboard settings
+- Custom mount paths for client directories
+- Timezone
+
+It generates `.env`, `docker-compose.yml`, bootstrap files, and initialises the database. Supports Linux (native), macOS, and Windows 11 via WSL2.
+
+#### Option B: Manual Setup
 
 ```bash
 cd /workspace/projects/claude-gateway
@@ -180,6 +206,23 @@ Working... (45s)
 
 This updates every 3 seconds and is deleted once the full response arrives.
 
+### Stopping a Request
+
+If Claude misunderstands your instruction or heads in the wrong direction, you can cancel the in-progress request immediately:
+
+```
+/stop
+```
+
+Or just type `stop` as a plain message — the gateway detects it and cancels without needing the slash prefix.
+
+**What happens:**
+1. The gateway cancels the Go context (stops waiting for Claude)
+2. An abort signal is sent to the sidecar, which breaks the SDK loop
+3. You see "Stopped." and can immediately send a new message with corrected instructions
+
+If nothing is running, `/stop` replies "Nothing running to stop."
+
 ### Long Responses
 
 Responses over 4,000 characters are automatically split into multiple Telegram messages at natural line breaks.
@@ -193,6 +236,7 @@ Responses over 4,000 characters are automatically split into multiple Telegram m
 | Command | Description |
 |---------|-------------|
 | `/start` | Show all available commands |
+| `/stop` | Stop the current in-progress request (also works as plain text "stop") |
 | `/status` | Gateway health, rate limits, queue depth |
 | `/cost` | Token usage for current session (requests, input/output tokens) |
 | `/reset` | Clear Claude session and start fresh |
@@ -582,6 +626,8 @@ Skills are prompt templates that teach Claude specialized workflows. They're aut
 | **Notices** | `/notices <project>` | Generate party wall legal notice documents |
 | **Schedule of Condition** | `/soc <project>` | Transcribe recorded surveys into standardized documents |
 | **Data Spreadsheet** | `/data <file>` | Read and validate Excel DATA spreadsheet structure |
+| **Awards** | `/awards <project>` | Generate Party Wall Award documents (D1/D2 and Addendum variants) |
+| **Extract Drawing Numbers** | `/extract-drawings <pdf>` | Extract drawing registers from architectural/structural PDFs |
 
 ### Using Skills
 
@@ -755,7 +801,99 @@ Watchers respect the global rate limits. If the limit is hit, the check is silen
 
 ---
 
-## 12. Code Review Orchestrator
+## 12. Google Workspace
+
+Claude has authenticated access to Gmail, Calendar, Google Drive, and Google Sheets via the `gog` CLI tool. All commands run through the sidecar using your own OAuth credentials.
+
+### Gmail
+
+Claude can search, read, and send emails. Archive operations are permitted.
+
+```
+gog gmail search 'newer_than:1d'              # Emails from last 24 hours
+gog gmail search 'is:unread newer_than:7d'    # Unread from last week
+gog gmail thread <thread_id>                  # Read full thread
+gog gmail send --to a@b.com --subject "Hi" --body "Message"
+```
+
+**Banned operations:** All delete and trash commands are blocked at both the permissions level (`claude-code-settings.json` deny rules) and via bootstrap instructions. Claude cannot delete emails, labels, filters, or drafts. Archiving (removing the INBOX label) is allowed.
+
+### Calendar
+
+Claude can view events, check for conflicts, and add new events.
+
+```
+gog calendar list                             # Today's events
+gog calendar list --from tomorrow --to +7d    # Next 7 days
+gog calendar add --title "Meeting" --start "2026-02-25 14:00" --duration 1h
+gog calendar conflicts --from today --to +7d  # Detect scheduling conflicts
+```
+
+### Google Drive (Read-Only)
+
+Claude can list, search, and download files from Drive. Delete, trash, and move operations are blocked.
+
+One folder is writable for uploads: `1MnC-0QWn1P7bxgUuMZtw2DPq7OhuAgjw`. Claude can upload files and create subfolders only in this specific directory.
+
+```
+gog drive ls                                  # Root files
+gog drive search 'name contains "report"'     # Search files
+gog drive download <file_id> --out /workspace/tasks/file.pdf
+gog drive upload /workspace/tasks/doc.pdf --parent 1MnC-0QWn1P7bxgUuMZtw2DPq7OhuAgjw
+```
+
+### Google Sheets (Read-Only)
+
+Claude can read spreadsheet data but cannot write, update, append, clear, delete, or create sheets.
+
+```
+gog sheets get <spreadsheet_id>               # Sheet metadata
+gog sheets read <spreadsheet_id> 'Sheet1!A1:Z100'  # Read cell range
+```
+
+### Permission Enforcement
+
+Restrictions are enforced at two layers:
+
+1. **Technical** — `claude-code-settings.json` contains `deny` rules that block commands at the tool level. These cannot be bypassed.
+2. **Instructional** — `memory/bootstrap/environment.md` documents the restrictions in the system prompt, so Claude understands why commands are blocked and can explain alternatives.
+
+---
+
+## 13. Web Browsing
+
+Claude has full internet access via three tools, ordered by preference:
+
+### WebSearch
+
+Search the web for information. Returns titles, snippets, and URLs. Best for quick lookups and finding current information.
+
+### WebFetch
+
+Fetch and read any web page. Converts HTML to markdown. Best for reading specific URLs, documentation pages, or articles.
+
+### Playwright (Browser Automation)
+
+For JavaScript-heavy pages, login flows, or complex multi-step interactions, Claude can use a headless Chromium browser via the Playwright MCP server. This supports navigation, screenshots, clicking, and typing.
+
+The Playwright MCP server is configured in `claude-code-settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest", "--headless"]
+    }
+  }
+}
+```
+
+**Preference order:** Always use WebFetch/WebSearch first (faster, lighter). Use Playwright only when pages require JavaScript rendering or interactive workflows.
+
+---
+
+## 14. Code Review Orchestrator
 
 The orchestrator spawns isolated Claude CLI processes, each with a specialized agent persona, and applies weighted consensus for code review.
 
@@ -775,6 +913,8 @@ The orchestrator spawns isolated Claude CLI processes, each with a specialized a
 | `go-sec-team` | GoSecurity [VETO], GoHacker | Go security vulnerabilities |
 | `fe-dev-team` | FEPurist, FEPragmatist, FEPessimist | Frontend code quality |
 | `fe-sec-team` | FESecurity [VETO], FEHacker | Frontend security |
+| `python-dev-team` | PythonPurist, PythonPragmatist, PythonPessimist | Python code quality |
+| `python-sec-team` | PythonSecurity [VETO], PythonHacker | Python security |
 | `python-dev-team` | PythonPurist, PythonPragmatist, PythonPessimist | Python code quality |
 | `python-sec-team` | PythonSecurity [VETO], PythonHacker | Python security |
 | `design` | Security, Compliance, DataIntegrity, Performance, ErrorHandling | Architecture review |
@@ -821,7 +961,7 @@ This is invoked via the `/autofix` skill command and documented in detail in `au
 
 ---
 
-## 13. Dashboard
+## 15. Dashboard
 
 The web dashboard provides monitoring and management at `http://localhost:8080`.
 
@@ -851,7 +991,7 @@ Dashboard API endpoints are rate-limited to 60 requests/minute per IP with burst
 
 ---
 
-## 14. Rate Limiting
+## 16. Rate Limiting
 
 The gateway tracks API usage across three dimensions to stay within your Claude subscription limits.
 
@@ -893,7 +1033,7 @@ Shows current usage, headroom percentage, and queue depth.
 
 ---
 
-## 15. Configuration Reference
+## 17. Configuration Reference
 
 All configuration lives in `configs/gateway.yaml` with environment variable overrides.
 
@@ -997,7 +1137,7 @@ heartbeat:
 
 ---
 
-## 16. Deployment & Operations
+## 18. Deployment & Operations
 
 ### Docker Compose Services
 
@@ -1113,7 +1253,7 @@ The gateway Docker container connects to Ollama on the host via `http://host.doc
 
 ---
 
-## 17. Troubleshooting
+## 19. Troubleshooting
 
 ### Common Issues
 
@@ -1235,4 +1375,4 @@ psql -U gateway -d gateway -c "SELECT aspect, confidence, LEFT(content, 80) FROM
 ---
 
 **Version:** Claude Gateway v2
-**Last Updated:** 2026-02-26
+**Last Updated:** 2026-02-25
