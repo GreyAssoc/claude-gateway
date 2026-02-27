@@ -49,6 +49,20 @@ cp "/clients/current/<project-dir>/00.0 - DATA - ....xlsx" /workspace/projects/g
 
 **Important:** Only one DATA file should exist in the grey-docs-generation directory at a time.
 
+### Step 2b: Recalculate Formulas
+
+The AO sheets contain formulas that reference the Form sheet. openpyxl cannot evaluate these formulas, so they must be recalculated using LibreOffice headless before docs.py reads the file.
+
+**Always run this after copying a DATA file:**
+
+```bash
+cd /workspace/projects/grey-docs
+libreoffice --headless --calc --convert-to xlsx --outdir /tmp "00.0 - DATA"*.xlsx
+cp /tmp/"00.0 - DATA"*.xlsx .
+```
+
+This opens the file headlessly, recalculates every formula, and saves the result.
+
 ### Step 3: Read & Validate the DATA Spreadsheet
 Load the `data-spreadsheet` skill for reference. Then read the Form sheet and check:
 
@@ -207,6 +221,6 @@ Run docs.py directly with `python3`:
 ## Important Notes
 - **Read-only on /clients/current/** — always copy DATA file, never modify the original
 - **One DATA file at a time** — remove old DATA files from /workspace/projects/grey-docs/ before copying new one
-- **Formula cache** — docs.py reads description of works from Form sheet directly (bypasses stale AO sheet formula cache)
+- **Formula cache** — Step 2b recalculates all formulas via LibreOffice headless. docs.py reads description of works from Form sheet directly, but AO sheet fields (names, addresses) still need fresh formula values
 - **If Steve doesn't specify AO** — generate notices for ALL active AOs
 - **If Steve specifies an AO** — generate notices only for that AO

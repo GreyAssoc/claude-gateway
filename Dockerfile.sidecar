@@ -1,9 +1,13 @@
 FROM node:20-slim
 
 # Install system dependencies
+# libreoffice-calc: headless formula recalculation for Excel files
+# (openpyxl can write cell values but cannot evaluate formulas;
+#  awards/notices workflows need formulas recalculated before docs.py)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3 python3-pip git ca-certificates curl && \
+      python3 python3-pip git ca-certificates curl \
+      libreoffice-calc && \
     rm -rf /var/lib/apt/lists/*
 
 # Python packages for grey-docs skills (awards, notices, schedule of condition)

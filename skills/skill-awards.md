@@ -47,10 +47,13 @@ This skill activates when you ask for:
 
 ```
 1. Identify Project → 2. Copy DATA → 3. Identify Active AOs →
-4. CHECK & AUTO-POPULATE DRAWINGS → 5. Determine Award Type → 6. Generate Award
+4. CHECK & AUTO-POPULATE DRAWINGS → 5. RECALCULATE FORMULAS →
+6. Determine Award Type → 7. Generate Award
 ```
 
-**Key Change:** Step 4 now **automatically checks and populates missing drawings** from standard project directories.
+**Key Points:**
+- Step 4 **automatically checks and populates missing drawings** from standard project directories.
+- Step 5 **recalculates Excel formulas** using LibreOffice headless — this is MANDATORY after any drawing population because the AO sheets contain formulas that reference the Form sheet, and openpyxl cannot evaluate them.
 
 ---
 
@@ -195,7 +198,42 @@ Read the DATA spreadsheet and identify which AOs are active. An AO is active if 
 
 ---
 
-### Step 5: Determine Award Type
+### Step 5: Recalculate Formulas (MANDATORY)
+
+**Why:** The AO sheets contain Excel formulas that pull drawing numbers, descriptions, and other data from the Form sheet. openpyxl can write cell values but **cannot evaluate formulas**. If you skip this step, docs.py will read empty cells from the AO sheet and the award will have missing data.
+
+**When to run:** ALWAYS run this step after populating drawings (Step 4), and also when the DATA file was freshly copied from the project directory (formula cache may be stale).
+
+**Command:**
+
+```bash
+cd /workspace/projects/grey-docs
+libreoffice --headless --calc --convert-to xlsx --outdir /tmp "00.0 - DATA*.xlsx"
+cp /tmp/"00.0 - DATA"*.xlsx .
+```
+
+**What this does:**
+1. Opens the DATA file in LibreOffice Calc (no GUI — fully headless)
+2. Recalculates every formula in every sheet
+3. Saves as .xlsx to `/tmp`
+4. Copies the recalculated file back, overwriting the original
+
+**Verification:** After recalculation, spot-check that AO sheet formulas resolved:
+
+```python
+import openpyxl
+wb = openpyxl.load_workbook("00.0 - DATA*.xlsx", data_only=True)
+ws_ao = wb[f'AO {ao_number}']
+# These should now have values (not None):
+print(f"EB2 = {ws_ao['EB2'].value}")  # Drawing list field
+print(f"EC2 = {ws_ao['EC2'].value}")  # Drawing list field
+```
+
+If values are still `None` after recalculation, the formulas may reference missing data — report to Steve.
+
+---
+
+### Step 6: Determine Award Type
 
 Based on Steve's trigger phrase:
 
@@ -217,7 +255,7 @@ Which award type should I generate?
 
 ---
 
-### Step 6: Generate Award Document
+### Step 7: Generate Award Document
 
 Run docs.py with the appropriate document name:
 
@@ -238,7 +276,7 @@ python3 docs.py --ao <ao_number> --doc "<award_template_name>" --docx --no-pdf
 
 ---
 
-### Step 7: Verify Award Data
+### Step 8: Verify Award Data
 
 Awards pull data from multiple sections of the DATA spreadsheet. Key fields include:
 
@@ -266,7 +304,7 @@ Awards pull data from multiple sections of the DATA spreadsheet. Key fields incl
   - Drawing lists are empty
 
 This usually means the Excel file formula cache is stale.
-FIX: Open the DATA file in Excel/LibreOffice, then SAVE it
+FIX: Run headless recalculation (Step 5) then re-run docs.py
 ```
 
 **Action:**
@@ -275,7 +313,7 @@ FIX: Open the DATA file in Excel/LibreOffice, then SAVE it
 
 ---
 
-### Step 8: Report Results
+### Step 9: Report Results
 
 After generation, report to Steve:
 
@@ -306,7 +344,7 @@ AO 1 — Pedro Trebbau (1 St. Luke's Street, London, SW3 3RS)
 
 ---
 
-### Step 9: Copy Award to Project Directory (Optional)
+### Step 10: Copy Award to Project Directory (Optional)
 
 If Steve requests, copy the generated award back to the project directory:
 
@@ -415,13 +453,15 @@ Shares workflow patterns:
 
 ### "Key values are EMPTY" Warning
 
-**Cause:** Excel formula cache is stale in AO sheets.
+**Cause:** Excel formula cache is stale in AO sheets (formulas not recalculated).
 
-**Solution:**
-1. Open DATA file in Excel/LibreOffice
-2. Save the file (even without changes)
-3. This updates the formula cache
-4. Re-run docs.py
+**Solution:** Run headless LibreOffice recalculation (Step 5):
+```bash
+cd /workspace/projects/grey-docs
+libreoffice --headless --calc --convert-to xlsx --outdir /tmp "00.0 - DATA*.xlsx"
+cp /tmp/"00.0 - DATA"*.xlsx .
+```
+Then re-run docs.py.
 
 ### No Drawing Numbers Found
 
