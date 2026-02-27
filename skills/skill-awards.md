@@ -43,7 +43,16 @@ This skill activates when you ask for:
 
 ---
 
-## Workflow
+## Workflow Overview
+
+```
+1. Identify Project → 2. Copy DATA → 3. Identify Active AOs →
+4. CHECK & AUTO-POPULATE DRAWINGS → 5. Determine Award Type → 6. Generate Award
+```
+
+**Key Change:** Step 4 now **automatically checks and populates missing drawings** from standard project directories.
+
+---
 
 ### Step 1: Identify the Project
 
@@ -93,44 +102,83 @@ Read the DATA spreadsheet and identify which AOs are active. An AO is active if 
 
 ---
 
-### Step 4: Verify Drawing Numbers are Populated
+### Step 4: Verify and Populate Drawing Numbers (AUTOMATIC)
 
-**Critical:** Awards require drawing numbers to be populated in the DATA spreadsheet.
+**Critical:** Awards require both **Architect's drawings** AND **Structural/Engineer's drawings** to be populated in the DATA spreadsheet.
 
-**Check Form sheet drawing cells** for the specified AO:
+**Automatic Drawing Check Process:**
 
-For **AO 1**, check these ranges:
-- **Architect Existing:** B328:B352 (25 slots)
-- **Architect Demolition:** D328:D352 (25 slots)
-- **Architect Proposed:** F328:F352 (25 slots)
-- **Engineer:** H328:H352 (25 slots)
+1. **Check Form sheet drawing cells** for the specified AO:
 
-**Column offset:** +8 columns per AO (AO2 at J, AO3 at R, etc.)
+   For **AO 1**, check these ranges:
+   - **Architect Existing:** B328:B352 (25 slots)
+   - **Architect Demolition:** D328:D352 (25 slots)
+   - **Architect Proposed:** F328:F352 (25 slots)
+   - **Engineer:** H328:H352 (25 slots)
 
-**If drawing numbers are MISSING:**
+   **Column offset:** +8 columns per AO (AO2 at J, AO3 at R, etc.)
 
-1. **Alert Steve:**
+2. **Determine What's Missing:**
+   - ✅ **Both populated:** Proceed directly to award generation
+   - ⚠️ **Architect missing:** Need to extract from `Plans (Architect) - Combined` directory
+   - ⚠️ **Engineer missing:** Need to extract from `Plans (Structural) - Combined` directory
+   - ⚠️ **Both missing:** Need to extract from both directories
+
+3. **Automatic Population if Missing:**
+
+   **If Architect drawings are missing:**
+   ```bash
+   # Find architect plans PDF
+   ARCH_PDF=$(find "/clients/current/<project>/" -path "*/Plans (Architect) - Combined/*.pdf" -type f | head -1)
+
+   # Extract latest revision drawings
+   python3 00-engine/populate_drawings.py "$ARCH_PDF" "00.0 - DATA*.xlsx" <ao_number>
+   ```
+
+   **If Engineer drawings are missing:**
+   ```bash
+   # Find structural plans PDF
+   STRUCT_PDF=$(find "/clients/current/<project>/" -path "*/Plans (Structural) - Combined/*.pdf" -type f | head -1)
+
+   # Extract latest revision drawings
+   python3 00-engine/populate_drawings.py "$STRUCT_PDF" "00.0 - DATA*.xlsx" <ao_number>
+   ```
+
+4. **If PDFs Not Found:**
+
+   Alert Steve and ask what to do:
    ```
    ⚠️ Drawing numbers are not populated for AO [n] in the DATA spreadsheet.
 
+   I looked for:
+   - Plans (Architect) - Combined/*.pdf: [✅ Found / ❌ Not found]
+   - Plans (Structural) - Combined/*.pdf: [✅ Found / ❌ Not found]
+
    Would you like me to:
-   1. Extract and populate drawings from plans PDF (provide PDF path)
+   1. Use a different PDF path (provide path manually)
    2. Continue anyway (award will have empty drawing lists)
    3. Abort
    ```
 
-2. **If Steve provides PDF path:**
-   - Use `extract-drawing-numbers` skill workflow
-   - Run: `python3 00-engine/populate_drawings.py "plans.pdf" "DATA.xlsx" <ao_number>`
-   - Verify population succeeded
-   - Copy updated DATA file back to project directory
-   - Continue with award generation
+5. **Report Extraction Results:**
+   ```
+   ✅ Drawing extraction completed:
+   - Architect: [count] Existing, [count] Demolition, [count] Proposed
+   - Engineer: [count] Structural drawings
+   - Populated to: AO [n] (Form sheet columns [letter]-[letter])
+   ```
 
-3. **If Steve says continue anyway:**
-   - Proceed with warning that drawing lists will be empty
+6. **Copy Updated DATA Back:**
+   ```bash
+   # After successful population, update project DATA file
+   cp "00.0 - DATA*.xlsx" "/clients/current/<project>/"
+   ```
 
-4. **If Steve says abort:**
-   - Stop workflow
+**Key Points:**
+- **Always check BOTH architect and engineer drawings**
+- **Automatically search in `Plans (Architect) - Combined` and `Plans (Structural) - Combined` directories**
+- **Extract latest revisions only** (populate_drawings.py handles this)
+- **Only ask Steve if automatic extraction fails**
 
 ---
 
@@ -426,7 +474,7 @@ Shares workflow patterns:
    📄 Award saved as .docx for manual editing.
    ```
 
-### Example 2: D2 Award with Missing Drawings
+### Example 2: D2 Award with Missing Drawings (Automatic Extraction)
 
 **Steve:** "Create D2 Award for Lancaster Road AO 2"
 
@@ -435,21 +483,38 @@ Shares workflow patterns:
 2. Copies DATA file
 3. Checks AO 2 is active: ✅
 4. Checks drawing numbers in Form sheet J328:P352: ❌ Empty
-5. Alerts Steve:
+5. **Automatically searches for plans:**
+   ```bash
+   # Searches for architect plans
+   find "/clients/current/15 Lancaster Road/" -path "*/Plans (Architect) - Combined/*.pdf"
+   # Found: Plans (Architect) - Combined/Notice Plans - Architect.pdf
+
+   # Searches for structural plans
+   find "/clients/current/15 Lancaster Road/" -path "*/Plans (Structural) - Combined/*.pdf"
+   # Found: Plans (Structural) - Combined/Notice Plans - Structural.pdf
    ```
-   ⚠️ Drawing numbers are not populated for AO 2 in the DATA spreadsheet.
+6. **Automatically extracts and populates:**
+   ```bash
+   python3 00-engine/populate_drawings.py "Plans (Architect) - Combined/Notice Plans - Architect.pdf" "DATA.xlsx" 2
+   python3 00-engine/populate_drawings.py "Plans (Structural) - Combined/Notice Plans - Structural.pdf" "DATA.xlsx" 2
+   ```
+7. Reports: ✅ Populated 8 Existing, 6 Demolition, 7 Proposed, 3 Structural
+8. Copies updated DATA back to project
+9. Generates award: `python3 00-engine/docs.py --ao 2 --doc "12.1 - Award D2" --docx --no-pdf`
+10. Reports success with drawing counts
+
+**If PDFs Not Found:**
+If the automatic search fails, agent alerts Steve:
+   ```
+   ⚠️ Drawing numbers missing for AO 2. Automatic search results:
+   - Plans (Architect) - Combined/*.pdf: ❌ Not found
+   - Plans (Structural) - Combined/*.pdf: ❌ Not found
 
    Would you like me to:
-   1. Extract and populate drawings from plans PDF (provide PDF path)
+   1. Use a different PDF path (provide path manually)
    2. Continue anyway (award will have empty drawing lists)
    3. Abort
    ```
-6. Steve provides: `/clients/current/15 Lancaster Road/00-plans/Notice Plans.pdf`
-7. Runs: `python3 00-engine/populate_drawings.py "Notice Plans.pdf" "DATA.xlsx" 2`
-8. Reports: ✅ Populated 8 Existing, 6 Demolition, 7 Proposed, 3 Structural
-9. Copies updated DATA back to project
-10. Generates award: `python3 00-engine/docs.py --ao 2 --doc "12.1 - Award D2" --docx --no-pdf`
-11. Reports success with drawing counts
 
 ### Example 3: D1 Addendum Award
 
@@ -492,14 +557,16 @@ Shares workflow patterns:
 
 ## Key Rules
 
-1. **Always check drawings first** — Awards require drawing numbers
-2. **Use extract-drawing-numbers skill** — If drawings missing, populate from PDF
-3. **Output format** — .docx only (use `--no-pdf` flag to skip PDF generation)
-4. **Validate AO is active** — Check A2/B2 on AO sheet
-5. **Use --docx --no-pdf flags** — Essential for docs.py to generate .docx only
-6. **One DATA file at a time** — Remove old DATA before copying new
-7. **Report drawing counts** — Include in success message
-8. **Copy DATA back** — If drawings were populated, update project file
+1. **Always check drawings first** — Awards require BOTH architect and engineer drawing numbers
+2. **Automatic drawing extraction** — Search `Plans (Architect) - Combined` and `Plans (Structural) - Combined` directories
+3. **Extract latest revisions only** — populate_drawings.py automatically filters for latest revisions
+4. **Output format** — .docx only (use `--no-pdf` flag to skip PDF generation)
+5. **Validate AO is active** — Check A2/B2 on AO sheet
+6. **Use --docx --no-pdf flags** — Essential for docs.py to generate .docx only
+7. **One DATA file at a time** — Remove old DATA before copying new
+8. **Report drawing counts** — Include in success message (breakdown by category)
+9. **Copy DATA back** — If drawings were populated, update project file
+10. **Only ask Steve if auto-search fails** — Try automatic extraction first, manual path as fallback
 
 ---
 
