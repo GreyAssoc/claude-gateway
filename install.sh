@@ -748,6 +748,7 @@ GATEWAY_TOP
       - ./skills:/app/skills
       - ./memory:/app/memory
       - ./configs:/app/configs
+      - \${WORK_DIR}/.claude/agents:/app/agents:ro
     ports:
       - "\${DASHBOARD_PORT:-8080}:8080"
     depends_on:
@@ -978,37 +979,87 @@ EOF
 
 ## Google Workspace (gog CLI)
 
-Use the **Bash tool** to run \`gog\` commands for Google Workspace access. Auth is pre-configured for \`${GOG_ACCOUNT}\`.
+Use the **Bash tool** to run \`gog\` commands for Google Workspace access (Gmail, Calendar, Drive, Sheets). Auth is pre-configured for \`${GOG_ACCOUNT}\` — no setup needed, just run the commands.
 
 ### Gmail
 \`\`\`bash
 gog gmail search 'newer_than:1d'              # Emails from last 24h
 gog gmail search 'is:unread newer_than:7d'    # Unread from last week
+gog gmail search 'from:someone@example.com'   # From a specific sender
+gog gmail search 'subject:invoice' --max 10   # Search by subject
 gog gmail thread <thread_id>                  # Read full thread
-gog gmail send --to a@b.com --subject "Hi" --body "Message"
+gog gmail send --to a@b.com --subject "Hi" --body "Message"  # Send email
+gog gmail labels list                         # List labels
 \`\`\`
+
+**BANNED Gmail commands — NEVER use these under any circumstances:**
+- \`gog gmail batch delete\` — permanently deletes emails
+- \`gog gmail labels delete\` — removes labels
+- \`gog gmail filters delete\` — removes filters
+- \`gog gmail drafts delete\` — deletes drafts
+- Any command containing \`delete\` or \`trash\` in a \`gog gmail\` context
+
+Archiving emails (via \`gog gmail batch modify\` to remove the INBOX label) is permitted.
+
+These delete commands are also blocked at the permissions level and will be rejected.
 
 ### Calendar
 \`\`\`bash
 gog calendar list                             # Today's events
 gog calendar list --from tomorrow --to +7d    # Next 7 days
 gog calendar add --title "Meeting" --start "2026-03-01 14:00" --duration 1h
+gog calendar conflicts --from today --to +7d  # Detect scheduling conflicts
 \`\`\`
 
-### Drive
+### Drive (read-only)
 \`\`\`bash
 gog drive ls                                  # Root files
+gog drive ls --parent <folder_id>             # List folder contents
 gog drive search 'name contains "report"'     # Search files
-gog drive download <file_id> --out /workspace/file.pdf
+gog drive download <file_id> --out /workspace/tasks/file.pdf
 \`\`\`
 
-### Sheets
+**Drive is read-only** — listing, searching, and downloading are permitted. Deleting, trashing, and moving files are blocked.
+
+### Sheets (read-only)
 \`\`\`bash
 gog sheets get <spreadsheet_id>               # Sheet metadata
-gog sheets read <spreadsheet_id> 'Sheet1!A1:Z100'
+gog sheets read <spreadsheet_id> 'Sheet1!A1:Z100'  # Read cell range
 \`\`\`
+
+**Sheets are read-only.** Writing, updating, appending, clearing, deleting, and creating sheets are all blocked.
+
+### Common Flags
+- \`--json\` — JSON output (for parsing/scripting)
+- \`--plain\` — Tab-separated output
+- \`--max N\` — Limit results
 EOF
     fi
+
+    # Skill detection section
+    cat >> "$file" << 'EOF'
+
+## Skill Detection
+
+Skills are loaded into your context below (in `<skills>` tags). When the user sends a natural language message, detect whether it matches a skill and follow that skill's full workflow.
+
+**Detection rules:**
+- Match by intent, not exact phrasing. "produce notices for Redan" = "generate notices for the Redan project" = "notices for Redan"
+- When a skill is detected, follow its workflow steps exactly — don't improvise or skip steps
+- If unsure which skill applies, ask the user to clarify
+- If no skill matches, handle the message normally
+
+**Keyword patterns:**
+
+| Keywords | Skill |
+|----------|-------|
+| notices, serve notices, generate notices, produce notices | **notices** |
+| award, D1 award, D2 award, addendum award, generate award | **awards** |
+| schedule of condition, SoC, transcribe survey, process audio, process recordings | **schedule-of-condition** |
+| DATA spreadsheet, DATA file, read the DATA, check the DATA | **data-spreadsheet** |
+| extract drawings, drawing numbers, populate drawings, drawing register | **extract-drawing-numbers** |
+| youtube, transcript, video transcript, watch video | **youtube** |
+EOF
 
     # Web browsing section (always present)
     cat >> "$file" << 'EOF'
@@ -1073,6 +1124,7 @@ memory:
   max_daily_days: 7
   claude_md_paths:
     - "/workspace/CLAUDE.md"
+    - "/workspace/projects/CLAUDE.md"
 
 orchestrator:
   agent_dna_dir: "/app/agents"
