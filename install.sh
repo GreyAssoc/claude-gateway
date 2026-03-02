@@ -806,6 +806,12 @@ EOF
 EOF
     fi
 
+    # SSH keys mount
+    cat >> "$file" << 'EOF'
+      # SSH keys (read-only, copied to writable /root/.ssh at startup)
+      - ${HOME}/.ssh:/root/.ssh-ro:ro
+EOF
+
     # Sidecar bottom
     cat >> "$file" << 'EOF'
     expose:

@@ -7,7 +7,7 @@ FROM node:20-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       python3 python3-pip git ca-certificates curl \
-      libreoffice-calc && \
+      libreoffice-calc openssh-client rsync && \
     rm -rf /var/lib/apt/lists/*
 
 # Python packages for grey-docs skills (awards, notices, schedule of condition)
@@ -62,4 +62,5 @@ CMD ["sh", "-c", "\
   mkdir -p /root/.claude && cp -a /root/.claude-ro/. /root/.claude/ && echo 'Claude OAuth creds copied OK' && \
   cp /root/.config/claude-code/settings.json /root/.claude/settings.json && echo 'Claude Code settings applied' && \
   if [ -d /root/.config/gogcli-ro ]; then mkdir -p /root/.config/gogcli && cp -a /root/.config/gogcli-ro/. /root/.config/gogcli/ && echo 'gog config copied OK'; fi && \
+  if [ -d /root/.ssh-ro ]; then mkdir -p /root/.ssh && cp -a /root/.ssh-ro/. /root/.ssh/ && chmod 700 /root/.ssh && chmod 600 /root/.ssh/id_* 2>/dev/null; chmod 644 /root/.ssh/*.pub 2>/dev/null; echo 'SSH keys copied OK'; fi && \
   exec node index.js"]

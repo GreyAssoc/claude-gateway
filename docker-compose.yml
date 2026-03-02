@@ -60,6 +60,8 @@ services:
       - ${CLAUDE_CONFIG_DIR}:/root/.claude-ro:ro
       # gog CLI config & keyring (read-only, copied to writable dir at startup)
       - ${HOME}/.config/gogcli:/root/.config/gogcli-ro:ro
+      # SSH keys (read-only, copied to writable /root/.ssh at startup)
+      - ${HOME}/.ssh:/root/.ssh-ro:ro
     expose:
       - "3001"
     healthcheck:
