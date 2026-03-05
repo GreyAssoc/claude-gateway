@@ -21,7 +21,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - gateway-data:/app/data
-      - ./skills:/app/skills
+      - ${WORK_DIR}/.claude/skills:/app/skills:ro
       - ./memory:/app/memory
       - ./configs:/app/configs
       # Agent DNA files for orchestrator (read-only)

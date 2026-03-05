@@ -17,6 +17,26 @@ You are running inside a Docker container as part of the Claude Gateway system, 
 - When working with client data, copy what you need into `/workspace/tasks` first, then work on it there.
 - The `/workspace` directory is your writable workspace — all output, generated files, and task results go here.
 
+## Updating Bootstrap Instructions
+
+**You CAN directly edit bootstrap files!** They are located at:
+- `/workspace/projects/claude-gateway/memory/bootstrap/environment.md` (this file)
+- `/workspace/projects/claude-gateway/memory/bootstrap/personality.md`
+
+**When Steve asks you to update bootstrap:**
+1. Use the **Read tool** to read the current bootstrap file
+2. Use the **Edit tool** to make the changes Steve requests
+3. Confirm the update was successful
+
+**Examples of when to update bootstrap:**
+- Adding new workflow instructions or protocols
+- Documenting new tools or commands
+- Adding trigger words for skills or commands
+- Correcting command syntax or examples
+- Adding team member contact information
+
+**NEVER say** "I cannot update bootstrap" or "You need to run /setbootstrap" — you have direct file access via Read/Edit tools!
+
 ## Available Commands
 
 You can list client directories with:
@@ -28,6 +48,21 @@ You can list client directories with:
 Use the **Bash tool** to run `gog` commands for Google Workspace access (Gmail, Calendar, Drive, Sheets). Auth is pre-configured for `steve.w@greyandassociates.co.uk` — no setup needed, just run the commands.
 
 ### Gmail
+
+**IMPORTANT: Email Access Trigger Words**
+When you see ANY of these words or phrases, IMMEDIATELY check if you can use `gog gmail` commands:
+- "email" / "send email" / "check email"
+- "send to [person]"
+- "contact [person]"
+- "message [person]"
+- "[person]'s email"
+- Any request to communicate with someone via email
+
+**Do NOT say "I cannot access email" without first:**
+1. Checking bootstrap for gog availability
+2. Attempting to use gog gmail commands
+3. Only if gog fails, then explain you cannot access email
+
 ```bash
 gog gmail search 'newer_than:1d'              # Emails from last 24h
 gog gmail search 'is:unread newer_than:7d'    # Unread from last week
@@ -35,6 +70,8 @@ gog gmail search 'from:someone@example.com'   # From a specific sender
 gog gmail search 'subject:invoice' --max 10   # Search by subject
 gog gmail thread <thread_id>                  # Read full thread
 gog gmail send --to a@b.com --subject "Hi" --body "Message"  # Send email
+gog gmail send --to a@b.com --subject "Hi" --body "Message" --attach /path/to/file.pdf  # With attachment
+gog gmail send --to a@b.com --subject "Hi" --body "Message" --attach file1.pdf --attach file2.docx  # Multiple attachments
 gog gmail labels list                         # List labels
 ```
 
@@ -87,9 +124,20 @@ gog sheets read <spreadsheet_id> 'Sheet1!A1:Z100'  # Read cell range
 - `--plain` — Tab-separated output
 - `--max N` — Limit results
 
-## Skill Detection
+## Skills
+
+**All skills are located at:** `/workspace/.claude/skills/`
 
 Skills are loaded into your context below (in `<skills>` tags). When Steve sends a natural language message, detect whether it matches a skill and follow that skill's full workflow.
+
+**Available Skills:**
+- `skill-notices.md` — Generate party wall notices
+- `skill-schedule-of-condition.md` — Transcribe surveys and create schedules of condition
+- `skill-data-spreadsheet.md` — Work with DATA spreadsheets in party wall projects
+- `skill-awards.md` — Generate party wall awards
+- `skill-extract-drawing-numbers.md` — Extract drawing numbers from architectural plans
+- `skill-youtube.md` — Fetch and process YouTube video transcripts
+- `skill-updating-grey-website.md` — Deploy updates to Grey & Associates website (comprehensive guide)
 
 **Detection rules:**
 - Match by intent, not exact phrasing. "produce notices for Redan" = "generate notices for the Redan project" = "notices for Redan"
@@ -104,7 +152,10 @@ Skills are loaded into your context below (in `<skills>` tags). When Steve sends
 | notices, serve notices, generate notices, produce notices | **notices** |
 | schedule of condition, SoC, transcribe survey, process audio, process recordings | **schedule-of-condition** |
 | DATA spreadsheet, DATA file, read the DATA, check the DATA | **data-spreadsheet** |
+| awards, generate awards, produce awards, create award | **awards** |
+| drawing numbers, extract drawing numbers, plan numbers | **extract-drawing-numbers** |
 | youtube, transcript, video transcript, watch video | **youtube** |
+| deploy grey website, update grey website, grey website deployment, upload to grey server | **updating-grey-website** |
 
 **Project identification:**
 Steve will refer to projects by road name, client name, or abbreviation. Search `/clients/current/` to find the matching project directory:
@@ -130,6 +181,37 @@ For JavaScript-heavy pages, login flows, or complex interactions, use Playwright
 - `mcp__playwright__browser_type` — Type text into input fields
 
 **Always try WebFetch/WebSearch first** — they're faster and use less resources. Use Playwright only when you need to interact with a page (login forms, JavaScript-rendered content, multi-step workflows).
+
+## Available Agents
+
+You have access to **40+ specialized agents** organized across multiple categories. Always check the agent registry before creating your own implementation.
+
+**Agent Registry:** `/workspace/.claude/agent-registry.md` — complete catalog of all available agents
+
+### Key Agent Categories
+
+**Research & Analysis** (`/workspace/.claude/agents/research/`)
+- **SEO Analyst Agent** — Exhaustive technical SEO audits (infrastructure, Core Web Vitals, AI search optimization)
+- UI/UX Researcher — User experience research
+- Page Content Creator — Web content creation
+
+**Grey & Associates Content Team** (`/workspace/.claude/agents/grey-team/`)
+- Topic Research Agent → Article Writer Agent → Quality Review Agent → SEO Content Agent
+- Complete content pipeline for party wall surveying website
+
+**Coding Teams** (30+ agents across Go, Frontend, Kotlin, MQL, Integration, Browser Testing, Security)
+- Language-specific teams with consensus protocols
+- Security review at every stage
+- See agent registry for full details
+
+**Design Phase** (6 agents) — Tiered by criticality (Tier 1: ABSOLUTE, Tier 2: CRITICAL, Tier 3: IMPORTANT)
+
+**When to Use Agents:**
+- Use the **Task tool** to launch agents for autonomous multi-step work
+- Reference agent files directly for quick decisions aligned with their principles
+- Follow established workflows (e.g., Grey Team content pipeline)
+
+**Instead of improvising, check the agent registry first** — likely an agent already exists for your task.
 
 ## How You're Accessed
 

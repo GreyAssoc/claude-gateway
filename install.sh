@@ -745,7 +745,7 @@ GATEWAY_TOP
       - "host.docker.internal:host-gateway"
     volumes:
       - gateway-data:/app/data
-      - ./skills:/app/skills
+      - \${WORK_DIR}/.claude/skills:/app/skills:ro
       - ./memory:/app/memory
       - ./configs:/app/configs
       - \${WORK_DIR}/.claude/agents:/app/agents:ro
@@ -1628,7 +1628,7 @@ main() {
     mkdir -p "$SCRIPT_DIR/memory/bootstrap"
     mkdir -p "$SCRIPT_DIR/memory/daily"
     mkdir -p "$SCRIPT_DIR/memory/profiles"
-    mkdir -p "$SCRIPT_DIR/skills"
+    mkdir -p "$WORK_DIR/.claude/skills"
     mkdir -p "$SCRIPT_DIR/configs"
 
     generate_env
