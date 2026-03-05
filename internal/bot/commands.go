@@ -406,9 +406,10 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		}
 	}
 
-	// Enrich user prompt with per-message context (recent turns, semantic hits, people, facts)
-	// Skip for skill commands which have their own focused context.
-	// Use a dedicated timeout so a hanging DB doesn't block indefinitely.
+	// Enrich user prompt with per-message context (recent turns, semantic hits, people, facts,
+	// bootstrap instructions). Skip for skill commands which have their own focused context.
+	// Bootstrap is included in the enriched prompt so Claude doesn't forget commands and skills
+	// as the conversation grows and the original system prompt gets pushed out of context.
 	if b.contextBuilder != nil && systemPrompt == "" {
 		enrichCtx, enrichCancel := context.WithTimeout(ctx, 10*time.Second)
 		enriched, enrichErr := b.contextBuilder.BuildEnrichedPrompt(enrichCtx, sessionID, prompt, peopleNames)
@@ -416,6 +417,13 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		if enrichErr != nil {
 			log.Printf("Enriched prompt build failed: %v", enrichErr)
 		} else if enriched != "" {
+			// Append skills to enriched prompt so they're visible on every message,
+			// not just when the session is new/dead.
+			if b.skillsManager != nil {
+				if skillSection := b.skillsManager.BuildSystemPromptSection(); skillSection != "" {
+					enriched += "\n\n" + skillSection
+				}
+			}
 			opts.Prompt = enriched + "\n\n---\n\n" + prompt
 		}
 	}

@@ -131,6 +131,19 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 		return true
 	}
 
+	// 0. Bootstrap instructions — always injected so Claude doesn't forget
+	// commands, skills, and environment rules as the conversation grows.
+	// When the session is alive, the original system prompt gets pushed out
+	// of the context window, so we re-inject bootstrap here.
+	bootstrapEntries, err := b.db.GetMemoryByCategory(ctx, "bootstrap")
+	if err != nil {
+		log.Printf("Context builder: failed to load bootstrap entries: %v", err)
+	} else if len(bootstrapEntries) > 0 {
+		if section := formatMemorySection("bootstrap_instructions", bootstrapEntries); section != "" {
+			addSection(section)
+		}
+	}
+
 	// 1. Recent conversation turns (current session)
 	recentConvs, err := b.db.RecentConversations(ctx, sessionID, b.recentTurns)
 	if err != nil {
