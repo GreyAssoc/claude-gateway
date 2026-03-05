@@ -776,6 +776,7 @@ SIDECAR_TOP
       - GOG_ACCOUNT=${GOG_ACCOUNT}
       - GOG_KEYRING_BACKEND=file
       - GOG_KEYRING_PASSWORD=\${GOG_KEYRING_PASSWORD}
+      - GEMINI_API_KEY=\${GEMINI_API_KEY}
 EOF
     fi
 
@@ -968,6 +969,23 @@ EOF
 ## Important Rules
 
 - The `/workspace` directory is your writable workspace — all output, generated files, and task results go here.
+
+## Updating Bootstrap Instructions
+
+**You CAN directly edit bootstrap files!** They are located in the `memory/bootstrap/` directory of your gateway project.
+
+**When the user asks you to update bootstrap:**
+1. Use the **Read tool** to read the current bootstrap file
+2. Use the **Edit tool** to make the changes requested
+3. Confirm the update was successful
+
+**Examples of when to update bootstrap:**
+- Adding new workflow instructions or protocols
+- Documenting new tools or commands
+- Adding trigger words for skills or commands
+- Correcting command syntax or examples
+
+**NEVER say** "I cannot update bootstrap" — you have direct file access via Read/Edit tools!
 EOF
 
     # Check for any read-only mounts
@@ -995,6 +1013,8 @@ gog gmail search 'from:someone@example.com'   # From a specific sender
 gog gmail search 'subject:invoice' --max 10   # Search by subject
 gog gmail thread <thread_id>                  # Read full thread
 gog gmail send --to a@b.com --subject "Hi" --body "Message"  # Send email
+gog gmail send --to a@b.com --subject "Hi" --body "Message" --attach /path/to/file.pdf  # With attachment
+gog gmail send --to a@b.com --subject "Hi" --body "Message" --attach file1.pdf --attach file2.docx  # Multiple
 gog gmail labels list                         # List labels
 \`\`\`
 
@@ -1087,6 +1107,23 @@ For JavaScript-heavy pages, login flows, or complex interactions, use Playwright
 
 **Always try WebFetch/WebSearch first** — they're faster and use less resources.
 
+## Available Agents
+
+You have access to specialized agents organized across multiple categories. Check the agent registry before creating your own implementation.
+
+**Agent Registry:** `/workspace/.claude/agent-registry.md` — complete catalog of all available agents
+
+### Key Agent Categories
+
+- **Coding Teams** — Go, Frontend, Kotlin, MQL teams with consensus protocols and security review
+- **Research & Analysis** — SEO, UI/UX, content creation
+- **Design Phase** — Tiered agents (Security [VETO], Compliance [VETO], Performance, Error Handling)
+
+**When to Use Agents:**
+- Use the **Task tool** to launch agents for autonomous multi-step work
+- Reference agent files directly for quick decisions aligned with their principles
+- **Instead of improvising, check the agent registry first** — an agent likely exists for your task
+
 ## How You're Accessed
 
 - **Telegram**: Users message you via the bot
@@ -1159,8 +1196,9 @@ cron:
   weekly_review:
     schedule: "0 9 * * 1"
     prompt: >
-      Review the past week: summarize key conversations, decisions made,
-      and pending action items. Flag anything that needs attention this week.
+      Check my Google Drive for files modified in the last week in my
+      Projects folder. Summarize key changes and flag anything that
+      needs attention this week.
     enabled: ${cron_enabled}
 
   memory_compaction:
