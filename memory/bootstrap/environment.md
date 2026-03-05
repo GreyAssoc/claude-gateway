@@ -138,24 +138,15 @@ Skills are loaded into your context below (in `<skills>` tags). When Steve sends
 - `skill-extract-drawing-numbers.md` — Extract drawing numbers from architectural plans
 - `skill-youtube.md` — Fetch and process YouTube video transcripts
 - `skill-updating-grey-website.md` — Deploy updates to Grey & Associates website (comprehensive guide)
+- `skill-print-notices.md` — Print notice documents to the office printer (letterhead + plain paper tray selection)
 
 **Detection rules:**
 - Match by intent, not exact phrasing. "produce notices for Redan" = "generate notices for the Redan project" = "notices for Redan"
 - When a skill is detected, follow its workflow steps exactly — don't improvise or skip steps
 - If unsure which skill applies, ask Steve to clarify
 - If no skill matches, handle the message normally
-
-**Keyword patterns:**
-
-| Keywords | Skill |
-|----------|-------|
-| notices, serve notices, generate notices, produce notices | **notices** |
-| schedule of condition, SoC, transcribe survey, process audio, process recordings | **schedule-of-condition** |
-| DATA spreadsheet, DATA file, read the DATA, check the DATA | **data-spreadsheet** |
-| awards, generate awards, produce awards, create award | **awards** |
-| drawing numbers, extract drawing numbers, plan numbers | **extract-drawing-numbers** |
-| youtube, transcript, video transcript, watch video | **youtube** |
-| deploy grey website, update grey website, grey website deployment, upload to grey server | **updating-grey-website** |
+- The `<skill_index>` below lists all available skills with descriptions — use it for matching
+- Each skill's full workflow is in the `<skill>` blocks — read the matched skill's content for instructions
 
 **Project identification:**
 Steve will refer to projects by road name, client name, or abbreviation. Search `/clients/current/` to find the matching project directory:

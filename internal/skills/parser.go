@@ -85,6 +85,8 @@ func ParseSkillMD(content, sourcePath string, precedence int) (*Skill, error) {
 }
 
 // FormatSkillsXML formats a slice of skills into a compact XML block for injection.
+// Includes an auto-generated index so Claude can quickly match skills by name/description
+// without scanning through all the CDATA content blocks.
 // Uses CDATA sections to prevent XML injection from skill content.
 func FormatSkillsXML(skills []Skill) string {
 	if len(skills) == 0 {
@@ -93,6 +95,20 @@ func FormatSkillsXML(skills []Skill) string {
 
 	var sb strings.Builder
 	sb.WriteString("<skills>\n")
+
+	// Auto-generated index for quick skill detection
+	sb.WriteString("<skill_index>\n")
+	sb.WriteString("<!-- Auto-generated from loaded skill files. Match by intent, not exact phrasing. -->\n")
+	for _, s := range skills {
+		desc := s.Description
+		if desc == "" {
+			desc = s.Name
+		}
+		name := format.XMLEscapeAttr(s.Name)
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", name, desc))
+	}
+	sb.WriteString("</skill_index>\n\n")
+
 	for _, s := range skills {
 		// Escape name attribute value and wrap content in CDATA
 		name := format.XMLEscapeAttr(s.Name)

@@ -62,6 +62,8 @@ services:
       - ${HOME}/.config/gogcli:/root/.config/gogcli-ro:ro
       # SSH keys (read-only, copied to writable /root/.ssh at startup)
       - ${HOME}/.ssh:/root/.ssh-ro:ro
+      # CUPS printing (host printer access via socket)
+      - /var/run/cups/cups.sock:/var/run/cups/cups.sock
     expose:
       - "3001"
     healthcheck:

@@ -811,6 +811,8 @@ EOF
     cat >> "$file" << 'EOF'
       # SSH keys (read-only, copied to writable /root/.ssh at startup)
       - ${HOME}/.ssh:/root/.ssh-ro:ro
+      # CUPS printing (host printer access via socket)
+      - /var/run/cups/cups.sock:/var/run/cups/cups.sock
 EOF
 
     # Sidecar bottom
@@ -1065,26 +1067,17 @@ EOF
     # Skill detection section
     cat >> "$file" << 'EOF'
 
-## Skill Detection
+## Skills
 
-Skills are loaded into your context below (in `<skills>` tags). When the user sends a natural language message, detect whether it matches a skill and follow that skill's full workflow.
+Skills are auto-loaded from the skills directory and injected into your context below (in `<skills>` tags). When the user sends a natural language message, detect whether it matches a skill and follow that skill's full workflow.
 
 **Detection rules:**
 - Match by intent, not exact phrasing. "produce notices for Redan" = "generate notices for the Redan project" = "notices for Redan"
 - When a skill is detected, follow its workflow steps exactly — don't improvise or skip steps
 - If unsure which skill applies, ask the user to clarify
 - If no skill matches, handle the message normally
-
-**Keyword patterns:**
-
-| Keywords | Skill |
-|----------|-------|
-| notices, serve notices, generate notices, produce notices | **notices** |
-| award, D1 award, D2 award, addendum award, generate award | **awards** |
-| schedule of condition, SoC, transcribe survey, process audio, process recordings | **schedule-of-condition** |
-| DATA spreadsheet, DATA file, read the DATA, check the DATA | **data-spreadsheet** |
-| extract drawings, drawing numbers, populate drawings, drawing register | **extract-drawing-numbers** |
-| youtube, transcript, video transcript, watch video | **youtube** |
+- The `<skill_index>` below lists all available skills with descriptions — use it for matching
+- Each skill's full workflow is in the `<skill>` blocks — read the matched skill's content for instructions
 EOF
 
     # Web browsing section (always present)
