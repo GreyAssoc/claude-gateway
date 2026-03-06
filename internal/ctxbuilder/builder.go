@@ -138,11 +138,12 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 		return true
 	}
 
-	// 0. Bootstrap instructions — only injected when the session is NEW.
-	// When the session is alive, bootstrap is already in the system prompt
-	// and the SDK manages its own context window. Skipping this on alive
-	// sessions saves ~13KB of redundant context per message.
-	if !sessionAlive {
+	// 0. Bootstrap instructions — only injected when the session is ALIVE.
+	// On NEW sessions, BuildSystemPrompt already includes the full bootstrap
+	// in the system prompt, so injecting it here would duplicate ~13KB.
+	// On ALIVE sessions, the original system prompt may have been pushed out
+	// of Claude's context window by long conversations, so we re-inject it.
+	if sessionAlive {
 		bootstrapEntries, err := b.db.GetMemoryByCategory(ctx, "bootstrap")
 		if err != nil {
 			log.Printf("Context builder: failed to load bootstrap entries: %v", err)
