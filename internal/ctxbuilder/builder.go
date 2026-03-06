@@ -344,6 +344,10 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 
 // RecordExchange persists a user/assistant exchange with embeddings.
 // Called from a background goroutine — errors are returned so the caller can log them.
+//
+// Deprecated: Use RecordExchangeSync + EnrichWithEmbeddings for the
+// "save now, embed later" pattern that avoids the race condition where
+// a quick follow-up message arrives before the DB write completes.
 func (b *Builder) RecordExchange(ctx context.Context, sessionID, userMessage, assistantResponse string) error {
 	// Embed and save user message
 	var userEmb []float32
@@ -374,6 +378,62 @@ func (b *Builder) RecordExchange(ctx context.Context, sessionID, userMessage, as
 	log.Printf("Context builder: recorded exchange for session %s (user=%d chars, assistant=%d chars, embeddings=%v/%v)",
 		sessionID, len(userMessage), len(assistantResponse), userEmb != nil, assistEmb != nil)
 	return nil
+}
+
+// ExchangeIDs holds the database row IDs from RecordExchangeSync so the
+// caller can pass them to EnrichWithEmbeddings.
+type ExchangeIDs struct {
+	UserID      int64
+	AssistantID int64
+}
+
+// RecordExchangeSync saves user and assistant messages to PostgreSQL
+// WITHOUT generating embeddings. This is fast (just two DB inserts) and
+// ensures the conversation turns are visible to BuildEnrichedPrompt
+// immediately, even if the user sends a follow-up within seconds.
+//
+// Call EnrichWithEmbeddings in a background goroutine afterward to
+// generate and attach embeddings for semantic search.
+func (b *Builder) RecordExchangeSync(ctx context.Context, sessionID, userMessage, assistantResponse string) (ExchangeIDs, error) {
+	userTokens := len(userMessage) / 4
+	userID, err := b.db.SaveConversationReturningID(ctx, sessionID, "user", userMessage, userTokens)
+	if err != nil {
+		return ExchangeIDs{}, fmt.Errorf("save user message: %w", err)
+	}
+
+	assistTokens := len(assistantResponse) / 4
+	assistID, err := b.db.SaveConversationReturningID(ctx, sessionID, "assistant", assistantResponse, assistTokens)
+	if err != nil {
+		return ExchangeIDs{}, fmt.Errorf("save assistant message: %w", err)
+	}
+
+	log.Printf("Context builder: saved exchange for session %s (user=%d chars id=%d, assistant=%d chars id=%d)",
+		sessionID, len(userMessage), userID, len(assistantResponse), assistID)
+	return ExchangeIDs{UserID: userID, AssistantID: assistID}, nil
+}
+
+// EnrichWithEmbeddings generates embeddings via Ollama and updates the
+// conversation rows saved by RecordExchangeSync. Safe to call from a
+// background goroutine — failures are logged but non-fatal (the
+// conversation text is already persisted).
+func (b *Builder) EnrichWithEmbeddings(ctx context.Context, ids ExchangeIDs, userMessage, assistantResponse string) {
+	if b.embedder == nil {
+		return
+	}
+
+	if emb, err := b.embedder.Embed(ctx, userMessage); err != nil {
+		log.Printf("Context builder: embed user message (id=%d) failed: %v", ids.UserID, err)
+	} else if err := b.db.UpdateConversationEmbedding(ctx, ids.UserID, emb); err != nil {
+		log.Printf("Context builder: update user embedding (id=%d) failed: %v", ids.UserID, err)
+	}
+
+	if emb, err := b.embedder.Embed(ctx, assistantResponse); err != nil {
+		log.Printf("Context builder: embed assistant message (id=%d) failed: %v", ids.AssistantID, err)
+	} else if err := b.db.UpdateConversationEmbedding(ctx, ids.AssistantID, emb); err != nil {
+		log.Printf("Context builder: update assistant embedding (id=%d) failed: %v", ids.AssistantID, err)
+	}
+
+	log.Printf("Context builder: enriched embeddings for ids %d, %d", ids.UserID, ids.AssistantID)
 }
 
 // ================================================================

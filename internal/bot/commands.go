@@ -289,15 +289,22 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 
 			if analysis.CanHandleLocally && analysis.LocalResponse != "" {
 				b.sendLongMessage(msg.Chat.ID, analysis.LocalResponse)
-				// Record for memory continuity
+				// Record for memory continuity — save synchronously, embed in background
 				if b.contextBuilder != nil {
-					b.bgWg.Add(1)
-					go func() {
-						defer b.bgWg.Done()
-						bgCtx, bgCancel := context.WithTimeout(context.Background(), 30*time.Second)
-						defer bgCancel()
-						b.contextBuilder.RecordExchange(bgCtx, sessionID, msg.Text, analysis.LocalResponse)
-					}()
+					saveCtx, saveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					ids, saveErr := b.contextBuilder.RecordExchangeSync(saveCtx, sessionID, msg.Text, analysis.LocalResponse)
+					saveCancel()
+					if saveErr != nil {
+						log.Printf("Failed to save local exchange: %v", saveErr)
+					} else {
+						b.bgWg.Add(1)
+						go func() {
+							defer b.bgWg.Done()
+							bgCtx, bgCancel := context.WithTimeout(context.Background(), 30*time.Second)
+							defer bgCancel()
+							b.contextBuilder.EnrichWithEmbeddings(bgCtx, ids, msg.Text, analysis.LocalResponse)
+						}()
+					}
 				}
 				return
 			}
@@ -603,15 +610,26 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 
 	b.sendLongMessage(msg.Chat.ID, text)
 
-	// Post-process: record exchange to PostgreSQL for persistent memory
+	// Post-process: record exchange to PostgreSQL for persistent memory.
+	// Save synchronously (fast DB inserts, no embedding) so the next
+	// message's BuildEnrichedPrompt always sees these turns. Embedding
+	// generation (slow, Ollama) runs in the background afterward.
 	if b.contextBuilder != nil {
-		b.bgWg.Add(1)
-		go func() {
-			defer b.bgWg.Done()
-			bgCtx, bgCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer bgCancel()
-			b.contextBuilder.RecordExchange(bgCtx, sessionID, prompt, resp.Text)
-		}()
+		saveCtx, saveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ids, saveErr := b.contextBuilder.RecordExchangeSync(saveCtx, sessionID, prompt, resp.Text)
+		saveCancel()
+		if saveErr != nil {
+			log.Printf("Failed to save exchange: %v", saveErr)
+		} else {
+			// Enrich with embeddings in background — non-blocking
+			b.bgWg.Add(1)
+			go func() {
+				defer b.bgWg.Done()
+				bgCtx, bgCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer bgCancel()
+				b.contextBuilder.EnrichWithEmbeddings(bgCtx, ids, prompt, resp.Text)
+			}()
+		}
 	}
 
 	// Post-process: extract facts + update user profile

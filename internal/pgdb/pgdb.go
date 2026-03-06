@@ -179,6 +179,41 @@ func (d *DB) SaveConversation(ctx context.Context, sessionID, role, content stri
 	return nil
 }
 
+// SaveConversationReturningID persists a message without an embedding and
+// returns the row ID. Used for the "save now, embed later" pattern so that
+// the next message's enriched prompt always sees the latest conversation
+// turns even when embedding generation is still in-flight.
+func (d *DB) SaveConversationReturningID(ctx context.Context, sessionID, role, content string, tokenEstimate int) (int64, error) {
+	var id int64
+	err := d.db.QueryRowContext(ctx,
+		`INSERT INTO conversations (session_id, role, content, token_estimate)
+		 VALUES ($1, $2, $3, $4)
+		 RETURNING id`,
+		sessionID, role, content, tokenEstimate,
+	).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("save conversation returning id: %w", err)
+	}
+	return id, nil
+}
+
+// UpdateConversationEmbedding sets the embedding for an existing conversation
+// row. Called asynchronously after SaveConversationReturningID.
+func (d *DB) UpdateConversationEmbedding(ctx context.Context, id int64, embedding []float32) error {
+	if len(embedding) == 0 {
+		return nil
+	}
+	s := vectorToString(embedding)
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE conversations SET embedding = $1::vector WHERE id = $2`,
+		s, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update conversation embedding: %w", err)
+	}
+	return nil
+}
+
 // RecentConversations returns the last N messages for a specific session.
 func (d *DB) RecentConversations(ctx context.Context, sessionID string, limit int) ([]Conversation, error) {
 	if limit <= 0 {
