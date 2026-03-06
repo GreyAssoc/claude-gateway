@@ -389,9 +389,10 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 					log.Printf("Built system prompt from PostgreSQL (%d chars)", len(sp))
 				}
 			}
-			// Append skills section
+			// Append skill index (lightweight — names + descriptions only).
+			// Full skill content is injected per-message via BuildMatchedSkillsSection.
 			if b.skillsManager != nil {
-				if skillSection := b.skillsManager.BuildSystemPromptSection(); skillSection != "" {
+				if skillSection := b.skillsManager.BuildSkillIndex(); skillSection != "" {
 					if opts.SystemPrompt != "" {
 						opts.SystemPrompt += "\n\n" + skillSection
 					} else {
@@ -417,10 +418,10 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		if enrichErr != nil {
 			log.Printf("Enriched prompt build failed: %v", enrichErr)
 		} else if enriched != "" {
-			// Append skills to enriched prompt so they're visible on every message,
-			// not just when the session is new/dead.
+			// Append matched skills to enriched prompt — only skills relevant
+			// to this message get their full content injected.
 			if b.skillsManager != nil {
-				if skillSection := b.skillsManager.BuildSystemPromptSection(); skillSection != "" {
+				if skillSection := b.skillsManager.BuildMatchedSkillsSection(prompt); skillSection != "" {
 					enriched += "\n\n" + skillSection
 				}
 			}

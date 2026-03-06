@@ -84,21 +84,18 @@ func ParseSkillMD(content, sourcePath string, precedence int) (*Skill, error) {
 	}, nil
 }
 
-// FormatSkillsXML formats a slice of skills into a compact XML block for injection.
-// Includes an auto-generated index so Claude can quickly match skills by name/description
-// without scanning through all the CDATA content blocks.
-// Uses CDATA sections to prevent XML injection from skill content.
-func FormatSkillsXML(skills []Skill) string {
+// FormatSkillIndex returns a lightweight index of skill names and descriptions.
+// Always injected so Claude knows what skills exist and can request them.
+func FormatSkillIndex(skills []Skill) string {
 	if len(skills) == 0 {
 		return ""
 	}
 
 	var sb strings.Builder
 	sb.WriteString("<skills>\n")
-
-	// Auto-generated index for quick skill detection
 	sb.WriteString("<skill_index>\n")
 	sb.WriteString("<!-- Auto-generated from loaded skill files. Match by intent, not exact phrasing. -->\n")
+	sb.WriteString("<!-- Full skill content is injected only when a skill matches the user's message. -->\n")
 	for _, s := range skills {
 		desc := s.Description
 		if desc == "" {
@@ -107,10 +104,22 @@ func FormatSkillsXML(skills []Skill) string {
 		name := format.XMLEscapeAttr(s.Name)
 		sb.WriteString(fmt.Sprintf("- %s: %s\n", name, desc))
 	}
-	sb.WriteString("</skill_index>\n\n")
+	sb.WriteString("</skill_index>\n")
+	sb.WriteString("</skills>")
+	return sb.String()
+}
 
+// FormatSkillsXML formats a slice of skills into a compact XML block for injection.
+// Includes the full CDATA content for each skill.
+// Uses CDATA sections to prevent XML injection from skill content.
+func FormatSkillsXML(skills []Skill) string {
+	if len(skills) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("<skills>\n")
 	for _, s := range skills {
-		// Escape name attribute value and wrap content in CDATA
 		name := format.XMLEscapeAttr(s.Name)
 		sb.WriteString(fmt.Sprintf(`<skill name="%s">`, name))
 		sb.WriteString("\n<![CDATA[")
@@ -119,6 +128,49 @@ func FormatSkillsXML(skills []Skill) string {
 	}
 	sb.WriteString("</skills>")
 	return sb.String()
+}
+
+// maxMatchedSkills caps the number of full skill contents injected per message.
+const maxMatchedSkills = 3
+
+// MatchSkills returns skills whose name or description matches the user message.
+// Uses simple keyword matching: direct name containment or 2+ word overlap
+// with the description.
+func MatchSkills(skills []Skill, message string) []Skill {
+	msgLower := strings.ToLower(message)
+	var matched []Skill
+	for _, s := range skills {
+		nameLower := strings.ToLower(s.Name)
+		// Direct name match: "notices" in message matches skill "notices"
+		if strings.Contains(msgLower, nameLower) {
+			matched = append(matched, s)
+			continue
+		}
+		// Description word overlap (2+ words of 4+ chars)
+		if containsAnyWord(msgLower, strings.ToLower(s.Description)) {
+			matched = append(matched, s)
+		}
+	}
+	if len(matched) > maxMatchedSkills {
+		matched = matched[:maxMatchedSkills]
+	}
+	return matched
+}
+
+// containsAnyWord returns true if 2+ words (4+ chars each) from content
+// appear in message. Both must be pre-lowercased by the caller.
+func containsAnyWord(message, content string) bool {
+	words := strings.Fields(content)
+	matches := 0
+	for _, w := range words {
+		if len(w) >= 4 && strings.Contains(message, w) {
+			matches++
+			if matches >= 2 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hashContent(content string) string {

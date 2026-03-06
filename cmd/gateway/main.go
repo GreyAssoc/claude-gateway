@@ -154,7 +154,7 @@ func main() {
 			if section := memMgr.BuildSystemPromptSection(ctx); section != "" {
 				parts = append(parts, section)
 			}
-			if section := skillsMgr.BuildSystemPromptSection(); section != "" {
+			if section := skillsMgr.BuildSkillIndex(); section != "" {
 				parts = append(parts, section)
 			}
 			if len(parts) == 0 {

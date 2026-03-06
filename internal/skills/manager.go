@@ -195,6 +195,35 @@ func (m *Manager) BuildSystemPromptSection() string {
 	return FormatSkillsXML(active)
 }
 
+// BuildSkillIndex returns a lightweight index of skill names and descriptions.
+// Always injected so Claude knows what skills exist without the full content.
+func (m *Manager) BuildSkillIndex() string {
+	active := m.GetActiveSkills()
+	if len(active) == 0 {
+		return ""
+	}
+	return FormatSkillIndex(active)
+}
+
+// BuildMatchedSkillsSection returns the skill index plus full content for
+// any skills whose name or description matches the user message.
+// This keeps prompt size small (~200 tokens) when no skills match,
+// and only injects full content for relevant skills (0-3 matches).
+func (m *Manager) BuildMatchedSkillsSection(message string) string {
+	active := m.GetActiveSkills()
+	if len(active) == 0 {
+		return ""
+	}
+
+	index := FormatSkillIndex(active)
+	matched := MatchSkills(active, message)
+	if len(matched) == 0 {
+		return index
+	}
+
+	return index + "\n\n" + FormatSkillsXML(matched)
+}
+
 func (m *Manager) loadFromDB(ctx context.Context) error {
 	rows, err := m.db.QueryContext(ctx, "SELECT name, source_path, content, content_hash, precedence, enabled FROM skills")
 	if err != nil {
