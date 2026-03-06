@@ -32,34 +32,65 @@ func NewTriager(llm *ollama.Client) *Triager {
 
 // greetingResponses maps common greeting patterns to local responses.
 // These bypass the LLM entirely for instant, zero-cost handling.
+//
+// IMPORTANT: Do NOT add acknowledgements or affirmatives here (ok, sure,
+// yes, cool, nice, etc.). These are almost always follow-ups to a previous
+// bot question ("Shall I do X?" → "ok") and MUST reach Claude with context.
 var greetingResponses = map[string]string{
-	"hi":            "Hi! How can I help you today?",
-	"hey":           "Hey! What can I do for you?",
-	"hello":         "Hello! How can I help?",
-	"good morning":  "Good morning! How can I help you today?",
+	"hi":             "Hi! How can I help you today?",
+	"hey":            "Hey! What can I do for you?",
+	"hello":          "Hello! How can I help?",
+	"good morning":   "Good morning! How can I help you today?",
 	"good afternoon": "Good afternoon! What can I do for you?",
-	"good evening":  "Good evening! How can I help?",
-	"morning":       "Good morning! How can I help you today?",
-	"thanks":        "You're welcome! Let me know if you need anything else.",
-	"thank you":     "You're welcome! Let me know if there's anything else I can help with.",
-	"cheers":        "Cheers! Let me know if you need anything.",
-	"bye":           "Goodbye! Have a great day.",
-	"goodbye":       "Goodbye! Feel free to come back anytime.",
-	"ok":            "Got it! Let me know if you need anything.",
-	"okay":          "Alright! Let me know if there's anything else.",
-	"cool":          "Great! Let me know if you need anything else.",
-	"nice":          "Glad to hear it! What else can I help with?",
-	"yo":            "Hey! What can I do for you?",
-	"howdy":         "Howdy! How can I help?",
+	"good evening":   "Good evening! How can I help?",
+	"morning":        "Good morning! How can I help you today?",
+	"thanks":         "You're welcome! Let me know if you need anything else.",
+	"thank you":      "You're welcome! Let me know if there's anything else I can help with.",
+	"cheers":         "Cheers! Let me know if you need anything.",
+	"bye":            "Goodbye! Have a great day.",
+	"goodbye":        "Goodbye! Feel free to come back anytime.",
+	"yo":             "Hey! What can I do for you?",
+	"howdy":          "Howdy! How can I help?",
 }
 
-// matchGreeting checks if the message is a simple greeting/acknowledgement.
+// isAffirmative returns true for short confirmations/affirmatives that are
+// almost certainly follow-ups to a previous bot question. These MUST reach
+// Claude so it can see the conversational context and continue the task.
+func isAffirmative(normalized string) bool {
+	affirmatives := []string{
+		"yes", "yep", "yeah", "yea", "ya", "yup",
+		"yes pls", "yes please", "yes do it", "yes go ahead",
+		"sure", "sure thing",
+		"do it", "go ahead", "go for it", "crack on", "yes crack on",
+		"proceed", "continue", "carry on",
+		"ok", "okay", "k", "kk",
+		"cool", "nice", "great", "perfect", "sounds good",
+		"go on", "get on with it", "just do it",
+		"please do", "pls do", "please", "pls",
+		"absolutely", "definitely", "of course",
+	}
+	for _, a := range affirmatives {
+		if normalized == a {
+			return true
+		}
+	}
+	return false
+}
+
+// matchGreeting checks if the message is a simple greeting.
 // Returns the response and true if matched, empty string and false otherwise.
+// Affirmatives (yes, ok, sure, do it) are explicitly excluded — they are
+// follow-ups to the bot's previous question and must reach Claude.
 func matchGreeting(message string) (string, bool) {
 	normalized := strings.TrimSpace(strings.ToLower(message))
 	// Strip common punctuation from end
 	normalized = strings.TrimRight(normalized, "!?.,")
 	normalized = strings.TrimSpace(normalized)
+
+	// Never intercept affirmatives — they're task continuations
+	if isAffirmative(normalized) {
+		return "", false
+	}
 
 	if resp, ok := greetingResponses[normalized]; ok {
 		return resp, true
@@ -87,8 +118,9 @@ User says: "Draft an email to Sarah about the invoice"
 {"can_handle_locally": false, "local_response": "", "people_names": ["Sarah"], "topics": ["email", "invoice"]}
 
 RULES:
-- can_handle_locally=true ONLY for: greetings, thanks, small talk, brief acknowledgements
-- can_handle_locally=false for: questions, requests, code, analysis, anything requiring thought
+- can_handle_locally=true ONLY for: greetings (hi, hello, good morning) and thanks (thanks, thank you, cheers)
+- can_handle_locally=false for: EVERYTHING ELSE — questions, requests, code, analysis, anything requiring thought
+- CRITICAL: short affirmatives (yes, ok, sure, do it, go ahead, carry on, crack on, please, pls) are NEVER locally handleable — they are follow-up instructions to a previous conversation and MUST reach the main assistant
 - When can_handle_locally=true, ALWAYS provide a friendly local_response
 - When can_handle_locally=false, set local_response to empty string ""
 - Extract people_names: any person names mentioned
@@ -150,6 +182,21 @@ func (t *Triager) Analyze(ctx context.Context, message string) (*Analysis, error
 	if analysis.CanHandleLocally && analysis.LocalResponse == "" {
 		log.Printf("Triage: flipped to CLAUDE — local handling claimed but no response provided")
 		analysis.CanHandleLocally = false
+	}
+
+	// Safety: never locally handle affirmatives, even if the LLM says so.
+	// These are task continuations ("yes", "do it", "go ahead") responding
+	// to a previous bot question. The 7B model has no conversation context
+	// and cannot distinguish "ok" (greeting) from "ok" (proceed with task).
+	if analysis.CanHandleLocally {
+		normalized := strings.TrimSpace(strings.ToLower(message))
+		normalized = strings.TrimRight(normalized, "!?.,")
+		normalized = strings.TrimSpace(normalized)
+		if isAffirmative(normalized) {
+			log.Printf("Triage: flipped to CLAUDE — affirmative %q is a task continuation, not a greeting", message)
+			analysis.CanHandleLocally = false
+			analysis.LocalResponse = ""
+		}
 	}
 
 	return analysis, nil

@@ -49,14 +49,35 @@ func TestTriagerIsAvailable(t *testing.T) {
 }
 
 // TestAnalyzeNilLLM verifies that Analyze returns safe fallback when LLM is nil.
-// Fix #6/#21: removed dead DB()/LLM() getters, this tests the core Analyze path.
+// "hello" hits the hardcoded greeting map, so it IS locally handleable.
+// Non-greeting messages with nil LLM fall through to the safe fallback.
 func TestAnalyzeNilLLM(t *testing.T) {
 	tr := NewTriager(nil)
+
+	// Greeting: handled locally via hardcoded map (no LLM needed)
 	a, err := tr.Analyze(context.Background(), "hello")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	if !a.CanHandleLocally {
+		t.Error("expected CanHandleLocally = true for hardcoded greeting 'hello'")
+	}
+
+	// Non-greeting with nil LLM: safe fallback to Claude
+	a, err = tr.Analyze(context.Background(), "review the auth code")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if a.CanHandleLocally {
-		t.Error("expected CanHandleLocally = false with nil LLM")
+		t.Error("expected CanHandleLocally = false for non-greeting with nil LLM")
+	}
+
+	// Affirmative: must NEVER be handled locally, even though it's short
+	a, err = tr.Analyze(context.Background(), "yes pls")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if a.CanHandleLocally {
+		t.Error("expected CanHandleLocally = false for affirmative 'yes pls'")
 	}
 }
