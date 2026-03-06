@@ -88,6 +88,8 @@ async function handleAsk(msg, send) {
   let resultText = "";
   let sdkSessionId = null;
   let usage = {};
+  const abortState = { aborted: false };
+  activeRequests.set(sessionId, abortState);
 
   try {
     const options = {
@@ -115,9 +117,6 @@ async function handleAsk(msg, send) {
     };
 
     console.log(`[ws-ask ${sessionId}] query (cwd: ${workDir}, model: ${model || "default"}, resume: ${session?.sdkSessionId || "none"})`);
-
-    const abortState = { aborted: false };
-    activeRequests.set(sessionId, abortState);
 
     const conversation = query({ prompt, options });
 
