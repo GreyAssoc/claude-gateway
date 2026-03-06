@@ -104,8 +104,7 @@ async function handleAsk(msg, send) {
       "WebFetch", "WebSearch",
     ];
     if (system_prompt) options.systemPrompt = system_prompt;
-    // model is only passed to CLI (run-agent), not the SDK — the SDK does not
-    // support the model option with subscription auth.
+    if (model) options.model = model;
     if (session && session.sdkSessionId) options.resume = session.sdkSessionId;
 
     options.stderr = (data) => {

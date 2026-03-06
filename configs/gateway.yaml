@@ -81,7 +81,7 @@ sidecar:
   url: "${SIDECAR_URL:-http://sidecar:3001}"
   timeout_seconds: 3600
   health_path: "/health"
-  default_model: "claude-opus-4-5-20251101"
+  default_model: "claude-sonnet-4-5-20241022"
 
 ratelimiter:
   rpm: ${RATE_LIMIT_RPM:-100}

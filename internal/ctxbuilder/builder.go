@@ -116,14 +116,21 @@ func (b *Builder) BuildSystemPrompt(ctx context.Context) (string, error) {
 // Prevents unbounded growth from concatenating many sections.
 const maxEnrichedPromptChars = 32000
 
-func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessage string, peopleNames []string) (string, error) {
+func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessage string, peopleNames []string, sessionAlive bool) (string, error) {
+	// Short follow-ups (yes, ok, do it) need minimal context — just recent
+	// turns so Claude can see what it asked. Saves significant latency.
+	budget := maxEnrichedPromptChars
+	if len(userMessage) < 50 {
+		budget = 8000
+	}
+
 	var parts []string
 	totalLen := 0
 
 	// addSection appends a section if within the character budget.
 	// Returns false when the budget is exhausted.
 	addSection := func(section string) bool {
-		if totalLen+len(section) > maxEnrichedPromptChars {
+		if totalLen+len(section) > budget {
 			return false
 		}
 		parts = append(parts, section)
@@ -131,16 +138,18 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 		return true
 	}
 
-	// 0. Bootstrap instructions — always injected so Claude doesn't forget
-	// commands, skills, and environment rules as the conversation grows.
-	// When the session is alive, the original system prompt gets pushed out
-	// of the context window, so we re-inject bootstrap here.
-	bootstrapEntries, err := b.db.GetMemoryByCategory(ctx, "bootstrap")
-	if err != nil {
-		log.Printf("Context builder: failed to load bootstrap entries: %v", err)
-	} else if len(bootstrapEntries) > 0 {
-		if section := formatMemorySection("bootstrap_instructions", bootstrapEntries); section != "" {
-			addSection(section)
+	// 0. Bootstrap instructions — only injected when the session is NEW.
+	// When the session is alive, bootstrap is already in the system prompt
+	// and the SDK manages its own context window. Skipping this on alive
+	// sessions saves ~13KB of redundant context per message.
+	if !sessionAlive {
+		bootstrapEntries, err := b.db.GetMemoryByCategory(ctx, "bootstrap")
+		if err != nil {
+			log.Printf("Context builder: failed to load bootstrap entries: %v", err)
+		} else if len(bootstrapEntries) > 0 {
+			if section := formatMemorySection("bootstrap_instructions", bootstrapEntries); section != "" {
+				addSection(section)
+			}
 		}
 	}
 

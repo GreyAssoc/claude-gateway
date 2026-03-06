@@ -360,10 +360,11 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	// - If an explicit override is provided (skill commands), always use it.
 	// - Otherwise, check if the SDK session is alive in the sidecar.
 	//   If dead/new, build system prompt from PostgreSQL (or legacy memory manager).
+	needsSystemPrompt := true // tracks whether session is new (used for enriched prompt)
 	if systemPrompt != "" {
 		opts.SystemPrompt = systemPrompt
+		// Explicit system prompt = fresh session context
 	} else {
-		needsSystemPrompt := true
 		status, checkErr := b.agent.CheckSession(ctx, sessionID)
 		if checkErr == nil && status.Alive && status.IdleSeconds < 1800 {
 			needsSystemPrompt = false
@@ -414,13 +415,14 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		}
 	}
 
-	// Enrich user prompt with per-message context (recent turns, semantic hits, people, facts,
-	// bootstrap instructions). Skip for skill commands which have their own focused context.
-	// Bootstrap is included in the enriched prompt so Claude doesn't forget commands and skills
-	// as the conversation grows and the original system prompt gets pushed out of context.
+	// Enrich user prompt with per-message context (recent turns, semantic hits, people, facts).
+	// Skip for skill commands which have their own focused context.
+	// Bootstrap is only injected on new sessions — alive sessions already have it
+	// in the system prompt and the SDK manages context retention.
+	sessionAlive := !needsSystemPrompt
 	if b.contextBuilder != nil && systemPrompt == "" {
 		enrichCtx, enrichCancel := context.WithTimeout(ctx, 10*time.Second)
-		enriched, enrichErr := b.contextBuilder.BuildEnrichedPrompt(enrichCtx, sessionID, prompt, peopleNames)
+		enriched, enrichErr := b.contextBuilder.BuildEnrichedPrompt(enrichCtx, sessionID, prompt, peopleNames, sessionAlive)
 		enrichCancel()
 		if enrichErr != nil {
 			log.Printf("Enriched prompt build failed: %v", enrichErr)
