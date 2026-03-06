@@ -156,11 +156,13 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 			// Keep the most recent 4 turns at 3000 chars so short follow-ups
 			// ("yes", "do it", "send them") retain enough context from
 			// the previous exchange. Older turns stay at 500 chars.
+			// TruncateTail keeps the END of the message — questions,
+			// action items, and "shall I do X?" are always at the end.
 			limit := 500
 			if i >= len(recentConvs)-4 {
 				limit = 3000
 			}
-			content := format.Truncate(c.Content, limit)
+			content := format.TruncateTail(c.Content, limit)
 			fmt.Fprintf(&convBuf, "<turn role=\"%s\" time=\"%s\">%s</turn>\n",
 				c.Role, timestamp, format.CDATAEscape(content))
 		}

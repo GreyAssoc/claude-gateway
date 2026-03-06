@@ -49,6 +49,34 @@ func Truncate(s string, maxLen int) string {
 	return s[:end] + "..."
 }
 
+// TruncateTail shortens a string to at most maxLen bytes, keeping the END
+// of the string (most recent content). Prepends "..." if truncation occurs.
+// Returns s unchanged if maxLen <= 0 or s fits.
+func TruncateTail(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	if maxLen < 4 {
+		start := len(s) - maxLen
+		for start < len(s) && !utf8.RuneStart(s[start]) {
+			start++
+		}
+		if start >= len(s) {
+			return ""
+		}
+		return s[start:]
+	}
+	// Reserve 3 bytes for "..."
+	start := len(s) - (maxLen - 3)
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	if start >= len(s) {
+		start = len(s) - (maxLen - 3)
+	}
+	return "..." + s[start:]
+}
+
 // CDATAEscape escapes CDATA end markers ("]]>") in s so the string
 // can be safely embedded inside a <![CDATA[...]]> section.
 func CDATAEscape(s string) string {
