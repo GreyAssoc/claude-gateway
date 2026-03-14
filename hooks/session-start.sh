@@ -5,6 +5,7 @@
 
 CONTEXT_DIR="/app/hooks/context"
 PROJECTS_DIR="/workspace/projects"
+REGISTRY_PATH="$CONTEXT_DIR/project-registry.json"
 
 # --- Static Context ---
 for f in "$CONTEXT_DIR"/environment.md "$CONTEXT_DIR"/personality.md; do
@@ -30,11 +31,39 @@ echo ""
 echo "# Active State (auto-injected)"
 echo ""
 
-# 1. Active project (if set by isolation enforcer)
+# 1. Active project — enriched with registry data (server, URL, deploy path)
 ACTIVE_FILE="/tmp/claude-active-project"
 if [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ]; then
     ACTIVE_PROJECT=$(cat "$ACTIVE_FILE")
-    echo "**Active project:** ${ACTIVE_PROJECT}"
+    echo "## Active Project"
+    echo ""
+    if [ -f "$REGISTRY_PATH" ] && command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import json, sys
+try:
+    reg = json.load(open('$REGISTRY_PATH'))
+    proj = reg.get('projects', {}).get('$ACTIVE_PROJECT')
+    if not proj:
+        print('**Active project:** $ACTIVE_PROJECT')
+        sys.exit(0)
+    print('**Active project:** $ACTIVE_PROJECT')
+    print('**Path:** ' + proj.get('path', ''))
+    if proj.get('tech'): print('**Tech:** ' + proj['tech'])
+    if proj.get('status'): print('**Status:** ' + proj['status'])
+    for env, info in (proj.get('server') or {}).items():
+        parts = [env + ': ' + (info.get('ip') or 'local')]
+        if info.get('url'): parts.append(info['url'])
+        if info.get('deploy_path'): parts.append('deploy: ' + info['deploy_path'])
+        if info.get('ssh_key'): parts.append('key: ' + info['ssh_key'])
+        print('**Server (' + env + '):** ' + ' | '.join(parts))
+    if proj.get('git', {}).get('remote'): print('**Git:** ' + proj['git']['remote'])
+    if proj.get('database', {}).get('type'): print('**Database:** ' + proj['database']['type'])
+except Exception:
+    print('**Active project:** $ACTIVE_PROJECT')
+" 2>/dev/null
+    else
+        echo "**Active project:** ${ACTIVE_PROJECT}"
+    fi
     echo ""
 fi
 

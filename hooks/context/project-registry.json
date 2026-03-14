@@ -1,0 +1,213 @@
+{
+  "_comment": "Project registry — single source of truth for both Claude Code and OpenCode hooks. Both frameworks read this file to resolve project names, aliases, servers, URLs, and deployment details. Update this file when adding new projects or changing infrastructure.",
+  "projects": {
+    "ptp-dev": {
+      "path": "/workspace/projects/ptp-dev",
+      "aliases": ["ptp-dev", "ptp dev", "platform", "pro trader", "protrader", "trade platform", "trading platform", "tradebytext", "trade by text"],
+      "status": "primary",
+      "tech": "Go + HTML5/Vanilla JS",
+      "server": {
+        "dev": { "ip": "209.38.168.80", "user": "claude_code", "deploy_path": "~/projects/platform/", "url": "http://209.38.168.80:8080", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" },
+        "prod": { "ip": "68.183.252.237", "user": "claude_code", "deploy_path": "~/projects/platform/", "url": "http://68.183.252.237:8080", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" }
+      },
+      "database": { "type": "postgresql", "host": "db-postgresql-lon1-84981-do-user-8222989-0.f.db.ondigitalocean.com", "port": 25060, "name": "tvc", "user": "claude_code" },
+      "git": null
+    },
+    "ptp": {
+      "path": "/workspace/projects/ptp",
+      "aliases": ["ptp", "ptp production", "ptp prod"],
+      "status": "production",
+      "tech": "Go + HTML5/Vanilla JS",
+      "server": {
+        "prod": { "ip": "68.183.252.237", "user": "claude_code", "deploy_path": "~/projects/platform/", "url": "http://68.183.252.237:8080", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" }
+      },
+      "database": { "type": "postgresql", "host": "db-postgresql-lon1-84981-do-user-8222989-0.f.db.ondigitalocean.com", "port": 25060, "name": "tvc", "user": "claude_code" },
+      "git": null
+    },
+    "claude-gateway": {
+      "path": "/workspace/projects/claude-gateway",
+      "aliases": ["claude-gateway", "gateway", "claude gateway", "telegram bot", "bot"],
+      "status": "active",
+      "tech": "Go + Node.js (Docker Compose)",
+      "server": {
+        "local": { "ip": "localhost", "url": "http://localhost:8080", "deploy_path": null }
+      },
+      "database": { "type": "sqlite+postgresql", "sqlite_path": "gateway.db" },
+      "git": { "remote": "https://github.com/GreyAssoc/claude-gateway.git", "branch": "main" }
+    },
+    "grey": {
+      "path": "/workspace/projects/grey",
+      "aliases": ["grey", "grey website", "grey and associates", "greyandassociates", "grey & associates", "party wall", "surveyor", "surveying"],
+      "status": "production",
+      "tech": "Go + HTML5/Vanilla JS + nginx",
+      "server": {
+        "prod": { "ip": "129.212.162.77", "user": "claude_code", "deploy_path": "~/projects/grey/", "url": "https://www.greyandassociates.co.uk", "ssh_key": "/workspace/.ssh/grey_deploy_key" }
+      },
+      "database": { "type": "postgresql", "host": "db-postgresql-lon1-84981-do-user-8222989-0.f.db.ondigitalocean.com", "port": 25060, "name": "tvc", "user": "claude_code" },
+      "git": null
+    },
+    "grey-docs": {
+      "path": "/workspace/projects/grey-docs",
+      "aliases": ["grey-docs", "grey docs", "grey documents", "grey templates"],
+      "status": "production",
+      "tech": "Python + Jinja2",
+      "server": null,
+      "git": null
+    },
+    "calendar": {
+      "path": "/workspace/projects/calendar",
+      "aliases": ["calendar", "ifc", "fixed calendar", "13 month", "thirteen month"],
+      "status": "development",
+      "tech": "Go + HTML5/Vanilla JS",
+      "server": {
+        "dev": { "ip": "129.212.162.77", "user": "claude_code", "deploy_path": "~/projects/calendar/", "url": "http://129.212.162.77:8092", "ssh_key": "/workspace/.ssh/grey_deploy_key" }
+      },
+      "database": null,
+      "git": null
+    },
+    "gann": {
+      "path": "/workspace/projects/gann",
+      "aliases": ["gann", "square of 9", "gann tools", "trading tools"],
+      "status": "development",
+      "tech": "Go + HTML5/Vanilla JS",
+      "server": {
+        "dev": { "ip": "129.212.162.77", "user": "claude_code", "deploy_path": "~/projects/gann/", "url": "http://129.212.162.77:8093", "ssh_key": "/workspace/.ssh/grey_deploy_key" }
+      },
+      "database": null,
+      "git": null
+    },
+    "android_dns_filter": {
+      "path": "/workspace/projects/android_dns_filter",
+      "aliases": ["android dns", "dns filter", "privateguard", "private guard", "dns app", "android app", "vpn app"],
+      "status": "production",
+      "tech": "Kotlin + Jetpack Compose",
+      "server": null,
+      "git": null
+    },
+    "boundary_calculator": {
+      "path": "/workspace/projects/boundary_calculator",
+      "aliases": ["boundary calculator", "boundary calc", "party wall calculator"],
+      "status": "production",
+      "tech": "Vanilla JS + SVG",
+      "server": {
+        "prod": { "ip": "129.212.162.77", "user": "claude_code", "url": "https://www.greyandassociates.co.uk/boundary-calculator" }
+      },
+      "git": null
+    },
+    "ptp-charts": {
+      "path": "/workspace/projects/ptp-charts",
+      "aliases": ["ptp-charts", "ptp charts", "charting"],
+      "status": "development",
+      "tech": "Go + HTML5/Vanilla JS + TwelveData",
+      "server": {
+        "dev": { "ip": "129.212.162.77", "user": "claude_code", "deploy_path": "~/projects/ptp-charts/", "url": "http://129.212.162.77:8090", "ssh_key": "/workspace/.ssh/grey_deploy_key" }
+      },
+      "database": { "type": "postgresql", "host": "db-postgresql-lon1-84981-do-user-8222989-0.f.db.ondigitalocean.com", "port": 25060, "name": "tvc", "user": "claude_code" },
+      "git": null
+    },
+    "trade-by-text": {
+      "path": "/workspace/projects/trade-by-text",
+      "aliases": ["trade-by-text", "tbt", "whatsapp", "whatsapp trading"],
+      "status": "development",
+      "tech": "Go + WhatsApp API + Stripe",
+      "server": null,
+      "database": null,
+      "git": null
+    },
+    "dropbox": {
+      "path": "/workspace/projects/dropbox",
+      "aliases": ["dropbox", "dropbox sync", "backup"],
+      "status": "utility",
+      "tech": "Go + Dropbox SDK v6",
+      "server": null,
+      "git": null
+    },
+    "trading-ml": {
+      "path": "/workspace/projects/trading-ml",
+      "aliases": ["trading-ml", "trading ml", "machine learning", "ml", "forex ml"],
+      "status": "utility",
+      "tech": "Python + XGBoost",
+      "server": null,
+      "git": null
+    },
+    "speech-to-text": {
+      "path": "/workspace/projects/speech-to-text",
+      "aliases": ["speech-to-text", "speech", "dictation", "stt"],
+      "status": "utility",
+      "tech": "Go + whisper.cpp",
+      "server": null,
+      "git": null
+    },
+    "telegram": {
+      "path": "/workspace/projects/telegram",
+      "aliases": ["telegram bridge", "telegram project"],
+      "status": "utility",
+      "tech": "Go + Telegram API",
+      "server": null,
+      "git": null
+    },
+    "Charts": {
+      "path": "/workspace/projects/Charts",
+      "aliases": ["charts legacy"],
+      "status": "legacy",
+      "tech": "Go + TwelveData + WebSocket",
+      "server": null,
+      "git": null
+    },
+    "MetaTrader5": {
+      "path": "/workspace/projects/MetaTrader5",
+      "aliases": ["metatrader", "mt5", "metatrader5", "metatrader 5"],
+      "status": "legacy",
+      "tech": "Go (hub) + MQL5 (EA)",
+      "server": null,
+      "git": null
+    },
+    "cTrader": {
+      "path": "/workspace/projects/cTrader",
+      "aliases": ["ctrader", "c trader"],
+      "status": "legacy",
+      "tech": "Go + Protobuf + WebSocket",
+      "server": null,
+      "git": null
+    },
+    "tvc": {
+      "path": "/workspace/projects/tvc",
+      "aliases": ["tvc", "tradingview connection"],
+      "status": "legacy",
+      "tech": "Go",
+      "server": {
+        "legacy": { "ip": "129.212.162.77" }
+      },
+      "git": null
+    },
+    "vpn_dns_manager": {
+      "path": "/workspace/projects/vpn_dns_manager",
+      "aliases": ["vpn dns", "vpn manager", "wireguard app"],
+      "status": "planning",
+      "tech": "Kotlin + WireGuard",
+      "server": null,
+      "git": null
+    },
+    "google": {
+      "path": "/workspace/projects/google",
+      "aliases": ["google", "google workspace", "google integration"],
+      "status": "utility",
+      "tech": "Python + Google Workspace",
+      "server": null,
+      "git": null
+    }
+  },
+  "servers": {
+    "209.38.168.80": { "name": "dev-server", "purpose": "PTP development", "user": "claude_code", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" },
+    "68.183.252.237": { "name": "prod-server", "purpose": "PTP production", "user": "claude_code", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" },
+    "129.212.162.77": { "name": "personal-server", "purpose": "grey, calendar, gann, ptp-charts, tvc", "user": "claude_code", "ssh_key": "/workspace/.ssh/grey_deploy_key" }
+  },
+  "database": {
+    "host": "db-postgresql-lon1-84981-do-user-8222989-0.f.db.ondigitalocean.com",
+    "port": 25060,
+    "name": "tvc",
+    "user": "claude_code",
+    "ssl": "require",
+    "projects": ["ptp-dev", "ptp", "grey", "cTrader", "MetaTrader5", "Charts", "ptp-charts"]
+  }
+}

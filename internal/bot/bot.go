@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -160,6 +161,19 @@ func New(cfg *config.Config, agentClient agent.Backend, limiter *ratelimiter.Lim
 	api.Client = &http.Client{Timeout: 30 * time.Second}
 
 	log.Printf("Telegram bot authorized as @%s", api.Self.UserName)
+
+	// Initialize the project registry for project detection from user messages.
+	// Try Docker path first (configs/ is mounted), then local dev path.
+	for _, p := range []string{
+		"/app/configs/project-registry.json",
+		"configs/project-registry.json",
+		"hooks/context/project-registry.json",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			setRegistryPath(p)
+			break
+		}
+	}
 
 	b := &Bot{
 		api:        api,

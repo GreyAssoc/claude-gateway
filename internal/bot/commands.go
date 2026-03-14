@@ -334,6 +334,13 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		return
 	}
 
+	// Project detection: resolve project from user text and set active project.
+	// This doesn't intercept the message — it just sets the active project file
+	// so hooks inject the right context (server, URL, deploy path, etc.).
+	if projName, _ := resolveProject(msg.Text); projName != "" {
+		setActiveProjectFile(projName)
+	}
+
 	// People detection: extract known names from message text for context enrichment.
 	// This replaces the triage LLM layer with a fast in-process lookup.
 	var peopleNames []string

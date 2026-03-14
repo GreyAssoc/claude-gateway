@@ -37,5 +37,6 @@ WORKDIR /app
 
 COPY --from=builder /build/gateway .
 COPY configs/ ./configs/
+COPY hooks/context/project-registry.json ./configs/project-registry.json
 
 ENTRYPOINT ["./gateway"]
