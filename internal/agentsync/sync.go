@@ -103,19 +103,42 @@ func (s *Syncer) Stop() {
 	})
 }
 
-// fullSync syncs all agents and commands in both directions.
-// For conflicts (same logical file in both), newer modification time wins.
-func (s *Syncer) fullSync() {
-	// Sync Claude agents → OpenCode.
-	s.syncClaudeAgentsToOpenCode()
-	// Sync OpenCode agents → Claude (only if Claude doesn't have a newer version).
-	s.syncOpenCodeAgentsToClaude()
-	// Sync commands both directions.
-	s.syncClaudeCmdsToOpenCode()
-	s.syncOpenCodeCmdsToClaude()
+// SyncStats holds counters from a sync run.
+type SyncStats struct {
+	ClaudeToOpenCodeAgents int
+	OpenCodeToClaudeAgents int
+	ClaudeToOpenCodeCmds   int
+	OpenCodeToClaudeCmds   int
+	ClaudeAgentsTotal      int
+	OpenCodeAgentsTotal    int
 }
 
-func (s *Syncer) syncClaudeAgentsToOpenCode() {
+// FullSync performs a complete bidirectional sync and returns stats.
+// Safe to call at any time (from a Telegram command, cron job, etc.).
+func (s *Syncer) FullSync() SyncStats {
+	return s.fullSync()
+}
+
+// fullSync syncs all agents and commands in both directions.
+// For conflicts (same logical file in both), newer modification time wins.
+func (s *Syncer) fullSync() SyncStats {
+	var stats SyncStats
+	// Sync Claude agents → OpenCode.
+	stats.ClaudeToOpenCodeAgents = s.syncClaudeAgentsToOpenCode()
+	// Sync OpenCode agents → Claude (only if Claude doesn't have a newer version).
+	stats.OpenCodeToClaudeAgents = s.syncOpenCodeAgentsToClaude()
+	// Sync commands both directions.
+	stats.ClaudeToOpenCodeCmds = s.syncClaudeCmdsToOpenCode()
+	stats.OpenCodeToClaudeCmds = s.syncOpenCodeCmdsToClaude()
+
+	// Count totals.
+	stats.ClaudeAgentsTotal = countMDFiles(s.claudeAgentDir)
+	stats.OpenCodeAgentsTotal = countMDFilesFlat(s.opencodeAgentDir)
+	return stats
+}
+
+func (s *Syncer) syncClaudeAgentsToOpenCode() int {
+	synced := 0
 	err := filepath.Walk(s.claudeAgentDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".md") {
 			return nil
@@ -137,6 +160,7 @@ func (s *Syncer) syncClaudeAgentsToOpenCode() {
 				log.Printf("agentsync: write %s: %v", ocPath, err)
 			} else {
 				log.Printf("agentsync: synced claude→opencode agent %s", ocName)
+				synced++
 			}
 		}
 		return nil
@@ -144,13 +168,15 @@ func (s *Syncer) syncClaudeAgentsToOpenCode() {
 	if err != nil {
 		log.Printf("agentsync: walk claude agents: %v", err)
 	}
+	return synced
 }
 
-func (s *Syncer) syncOpenCodeAgentsToClaude() {
+func (s *Syncer) syncOpenCodeAgentsToClaude() int {
+	synced := 0
 	entries, err := os.ReadDir(s.opencodeAgentDir)
 	if err != nil {
 		log.Printf("agentsync: read opencode agents: %v", err)
-		return
+		return 0
 	}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
@@ -179,15 +205,18 @@ func (s *Syncer) syncOpenCodeAgentsToClaude() {
 				log.Printf("agentsync: write %s: %v", claudeFullPath, err)
 			} else {
 				log.Printf("agentsync: synced opencode→claude agent %s", claudeRelPath)
+				synced++
 			}
 		}
 	}
+	return synced
 }
 
-func (s *Syncer) syncClaudeCmdsToOpenCode() {
+func (s *Syncer) syncClaudeCmdsToOpenCode() int {
+	synced := 0
 	entries, err := os.ReadDir(s.claudeCmdDir)
 	if err != nil {
-		return
+		return 0
 	}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
@@ -212,15 +241,18 @@ func (s *Syncer) syncClaudeCmdsToOpenCode() {
 				log.Printf("agentsync: write %s: %v", ocPath, err)
 			} else {
 				log.Printf("agentsync: synced claude→opencode cmd %s", e.Name())
+				synced++
 			}
 		}
 	}
+	return synced
 }
 
-func (s *Syncer) syncOpenCodeCmdsToClaude() {
+func (s *Syncer) syncOpenCodeCmdsToClaude() int {
+	synced := 0
 	entries, err := os.ReadDir(s.opencodeCmdDir)
 	if err != nil {
-		return
+		return 0
 	}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
@@ -245,9 +277,11 @@ func (s *Syncer) syncOpenCodeCmdsToClaude() {
 				log.Printf("agentsync: write %s: %v", claudePath, err)
 			} else {
 				log.Printf("agentsync: synced opencode→claude cmd %s", e.Name())
+				synced++
 			}
 		}
 	}
+	return synced
 }
 
 // watchLoop processes fsnotify events with debouncing.
@@ -382,4 +416,31 @@ func shouldOverwrite(destPath string, srcModTime time.Time) bool {
 
 func hasSyncMarker(content string) bool {
 	return strings.Contains(content, syncMarker)
+}
+
+// countMDFiles recursively counts .md files in a directory tree.
+func countMDFiles(dir string) int {
+	count := 0
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && strings.HasSuffix(path, ".md") {
+			count++
+		}
+		return nil
+	})
+	return count
+}
+
+// countMDFilesFlat counts .md files in a single directory (no recursion).
+func countMDFilesFlat(dir string) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".md") {
+			count++
+		}
+	}
+	return count
 }

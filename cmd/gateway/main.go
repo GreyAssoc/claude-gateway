@@ -194,6 +194,7 @@ func main() {
 		bot.WithPeopleManager(peopleMgr),
 		bot.WithJournal(journalMgr),
 		bot.WithProfiler(profiler),
+		bot.WithAgentSyncer(agentSyncer),
 		bot.WithSystemPromptBuilder(func(ctx context.Context) string {
 			// Legacy fallback — used only when contextBuilder is nil
 			var parts []string

@@ -54,7 +54,8 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 			"/reviewautosec [dir] — auto-detect with security focus\n" +
 			"/skills — list loaded skills\n" +
 			"/status — gateway health & rate limits\n" +
-			"/stop — stop the current request"
+			"/stop — stop the current request\n" +
+			"/sync — sync agents & commands between Claude ↔ OpenCode"
 
 		if b.skillsManager != nil {
 			var cmds []string
@@ -163,6 +164,8 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		b.handleStatus(ctx, msg)
 	case "stop":
 		b.handleStop(msg)
+	case "sync":
+		b.handleSync(msg)
 	case "today":
 		b.handleToday(ctx, msg)
 
@@ -1042,6 +1045,36 @@ func (b *Bot) handleRunsList(ctx context.Context, msg *tgbotapi.Message) {
 		return
 	}
 	b.sendLongMessage(msg.Chat.ID, b.orchestrator.RecentRunsText(ctx, 10))
+}
+
+func (b *Bot) handleSync(msg *tgbotapi.Message) {
+	if b.agentSyncer == nil {
+		b.sendMessage(msg.Chat.ID, "Agent syncer not initialized.")
+		return
+	}
+
+	b.sendMessage(msg.Chat.ID, "Syncing agents & commands between Claude ↔ OpenCode...")
+
+	stats := b.agentSyncer.FullSync()
+
+	text := fmt.Sprintf(
+		"Sync complete.\n\n"+
+			"Agents:\n"+
+			"  Claude → OpenCode: %d synced\n"+
+			"  OpenCode → Claude: %d synced\n"+
+			"  Claude total: %d\n"+
+			"  OpenCode total: %d\n\n"+
+			"Commands:\n"+
+			"  Claude → OpenCode: %d synced\n"+
+			"  OpenCode → Claude: %d synced",
+		stats.ClaudeToOpenCodeAgents,
+		stats.OpenCodeToClaudeAgents,
+		stats.ClaudeAgentsTotal,
+		stats.OpenCodeAgentsTotal,
+		stats.ClaudeToOpenCodeCmds,
+		stats.OpenCodeToClaudeCmds,
+	)
+	b.sendMessage(msg.Chat.ID, text)
 }
 
 func (b *Bot) handleSkills(msg *tgbotapi.Message) {

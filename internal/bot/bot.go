@@ -14,6 +14,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"github.com/you/claude-gateway/internal/agent"
+	"github.com/you/claude-gateway/internal/agentsync"
 	"github.com/you/claude-gateway/internal/config"
 	"github.com/you/claude-gateway/internal/ctxbuilder"
 	"github.com/you/claude-gateway/internal/db"
@@ -84,6 +85,7 @@ type Bot struct {
 	peopleManager  *people.Manager
 	journal        *journal.Manager
 	profiler       *profile.Profiler
+	agentSyncer    *agentsync.Syncer
 }
 
 // Option configures optional Bot dependencies.
@@ -142,6 +144,11 @@ func WithJournal(j *journal.Manager) Option {
 // WithProfiler sets the user profiler.
 func WithProfiler(p *profile.Profiler) Option {
 	return func(b *Bot) { b.profiler = p }
+}
+
+// WithAgentSyncer sets the agent/command syncer.
+func WithAgentSyncer(s *agentsync.Syncer) Option {
+	return func(b *Bot) { b.agentSyncer = s }
 }
 
 // New creates a new Bot. Optional dependencies are configured via Option functions.
@@ -300,6 +307,7 @@ func (b *Bot) registerTelegramCommands() {
 		{Command: "start", Description: "Show available commands"},
 		{Command: "status", Description: "Gateway health & rate limits"},
 		{Command: "stop", Description: "Stop the current request"},
+		{Command: "sync", Description: "Sync agents/commands Claude ↔ OpenCode"},
 	}
 
 	builtinCount := len(commands)
