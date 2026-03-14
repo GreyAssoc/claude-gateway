@@ -35,9 +35,9 @@
       "database": { "type": "sqlite+postgresql", "sqlite_path": "gateway.db" },
       "git": { "remote": "https://github.com/GreyAssoc/claude-gateway.git", "branch": "main" }
     },
-    "grey": {
-      "path": "/workspace/projects/grey",
-      "aliases": ["grey", "grey website", "grey and associates", "greyandassociates", "grey & associates", "party wall", "surveyor", "surveying"],
+    "grey-website": {
+      "path": "/workspace/projects/grey-website",
+      "aliases": ["grey-website", "grey", "grey website", "grey and associates", "greyandassociates", "grey & associates", "party wall", "surveyor", "surveying"],
       "status": "production",
       "tech": "Go + HTML5/Vanilla JS + nginx",
       "server": {
@@ -200,7 +200,7 @@
   "servers": {
     "209.38.168.80": { "name": "dev-server", "purpose": "PTP development", "user": "claude_code", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" },
     "68.183.252.237": { "name": "prod-server", "purpose": "PTP production", "user": "claude_code", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" },
-    "129.212.162.77": { "name": "personal-server", "purpose": "grey, calendar, gann, ptp-charts, tvc", "user": "claude_code", "ssh_key": "/workspace/.ssh/grey_deploy_key" }
+    "129.212.162.77": { "name": "personal-server", "purpose": "grey-website, calendar, gann, ptp-charts, tvc", "user": "claude_code", "ssh_key": "/workspace/.ssh/grey_deploy_key" }
   },
   "database": {
     "host": "db-postgresql-lon1-84981-do-user-8222989-0.f.db.ondigitalocean.com",
@@ -208,6 +208,6 @@
     "name": "tvc",
     "user": "claude_code",
     "ssl": "require",
-    "projects": ["ptp-dev", "ptp", "grey", "cTrader", "MetaTrader5", "Charts", "ptp-charts"]
+    "projects": ["ptp-dev", "ptp", "grey-website", "cTrader", "MetaTrader5", "Charts", "ptp-charts"]
   }
 }
