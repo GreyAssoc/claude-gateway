@@ -250,10 +250,23 @@ func (b *Bot) matchFrameworkSwitch(_ context.Context, msg *tgbotapi.Message, low
 		return true
 	}
 
-	// Switch: detect intent + target
-	if !containsAny(lower, "switch", "use ", "change to", "swap to", "move to",
+	// Switch: detect intent + target.
+	// Only match if both a switch verb AND a framework name are present.
+	// Bare "use" or "switch" without a framework target must NOT match,
+	// otherwise normal messages like "use the SEO agent" get intercepted.
+	hasFrameworkTarget := containsAny(lower, "opencode", "open code", "open-code", "zen",
+		"claude", "claude code", "sidecar")
+
+	if !hasFrameworkTarget {
+		return false
+	}
+
+	hasSwitchIntent := containsAny(lower, "switch", "change to", "swap to", "move to",
 		"enable opencode", "enable claude", "activate opencode", "activate claude",
-		"switch to opencode", "switch to claude") {
+		"switch to opencode", "switch to claude", "use opencode", "use claude",
+		"use open code", "use claude code")
+
+	if !hasSwitchIntent {
 		return false
 	}
 
@@ -264,12 +277,6 @@ func (b *Bot) matchFrameworkSwitch(_ context.Context, msg *tgbotapi.Message, low
 		target = "opencode"
 	case containsAny(lower, "claude", "claude code", "sidecar"):
 		target = "claude"
-	}
-
-	if target == "" {
-		// They said "switch framework" but didn't specify which — show the menu
-		b.handleFramework(context.Background(), msg)
-		return true
 	}
 
 	// Synthesize a command message with the target as argument
