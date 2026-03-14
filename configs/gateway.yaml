@@ -57,7 +57,7 @@ cron:
 
 watchers:
   gmail:
-    enabled: true
+    enabled: false
     interval_seconds: 120
     prompt: >
       Check Gmail for messages received after {since}. If there are none,
@@ -65,7 +65,7 @@ watchers:
       and subject for each, one per line.
 
   calendar:
-    enabled: true
+    enabled: false
     interval_seconds: 300
     prompt: >
       Check my calendar for events starting in the next 15 minutes.
@@ -81,7 +81,7 @@ sidecar:
   url: "${SIDECAR_URL:-http://sidecar:3001}"
   timeout_seconds: 3600
   health_path: "/health"
-  default_model: ""
+  default_model: "claude-opus-4-6"
 
 ratelimiter:
   rpm: ${RATE_LIMIT_RPM:-100}
@@ -110,3 +110,8 @@ triage:
   auto_learn: true
   max_auto_facts: 200
   min_importance: 4
+
+# Agent/command sync between Claude Code and OpenCode directories
+agent_sync:
+  enabled: true
+  # Directories default to ${WORK_DIR}/.claude/agents etc. if not set

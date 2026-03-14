@@ -37,7 +37,7 @@ func errorVerdict(ag Agent, errMsg string, start time.Time) Verdict {
 
 // RunAgent executes a single agent via the sidecar and returns its verdict.
 // Each agent gets a unique session so they can't see each other's output.
-func RunAgent(ctx context.Context, agentClient *agent.Client, ag Agent, task, agentDNADir, workspaceDir string, timeout time.Duration) Verdict {
+func RunAgent(ctx context.Context, agentClient agent.Backend, ag Agent, task, agentDNADir, workspaceDir string, timeout time.Duration) Verdict {
 	start := time.Now()
 
 	// Load DNA file — read first, then check size to avoid TOCTOU race.

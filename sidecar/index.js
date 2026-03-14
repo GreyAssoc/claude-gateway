@@ -88,6 +88,7 @@ async function handleAsk(msg, send) {
   let resultText = "";
   let sdkSessionId = null;
   let usage = {};
+  let apiModel = "";
   const abortState = { aborted: false };
   activeRequests.set(sessionId, abortState);
 
@@ -135,6 +136,12 @@ async function handleAsk(msg, send) {
       }
 
       if (type === "assistant") {
+        // Capture actual API model from response metadata
+        const msgModel = message.message?.model || message.model;
+        if (msgModel) {
+          apiModel = msgModel;
+          console.log(`[ws-ask ${sessionId}]   api-model: ${apiModel}`);
+        }
         const content = message.content
           || (message.message && message.message.content)
           || [];
@@ -197,6 +204,7 @@ async function handleAsk(msg, send) {
       type: "result",
       text: resultText || "(no output)",
       session_id: sessionId,
+      api_model: apiModel || undefined,
       usage: {
         input_tokens: usage.input_tokens || 0,
         output_tokens: usage.output_tokens || 0,

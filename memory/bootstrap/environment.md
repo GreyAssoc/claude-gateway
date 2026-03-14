@@ -43,6 +43,23 @@ You can list client directories with:
 - `ls /clients/current/` — see current clients
 - `ls /clients/past/` — see past clients
 
+## PostgreSQL (psql)
+
+`psql` is installed in the gateway container. Use it to query the gateway's PostgreSQL database directly:
+
+```bash
+psql "$POSTGRES_URL"
+```
+
+The connection string is pre-configured via the `POSTGRES_URL` environment variable. No manual host/port/password needed.
+
+Common uses:
+```bash
+psql "$POSTGRES_URL" -c "SELECT * FROM some_table LIMIT 10;"
+psql "$POSTGRES_URL" -c "\dt"          # List tables
+psql "$POSTGRES_URL" -c "\d tablename" # Describe table
+```
+
 ## Google Workspace (gog CLI)
 
 Use the **Bash tool** to run `gog` commands for Google Workspace access (Gmail, Calendar, Drive, Sheets). Auth is pre-configured for `steve.w@greyandassociates.co.uk` — no setup needed, just run the commands.
@@ -139,6 +156,7 @@ Skills are loaded into your context below (in `<skills>` tags). When Steve sends
 - `skill-youtube.md` — Fetch and process YouTube video transcripts
 - `skill-updating-grey-website.md` — Deploy updates to Grey & Associates website (comprehensive guide)
 - `skill-print-notices.md` — Print notice documents to the office printer (letterhead + plain paper tray selection)
+- `skill-print-labels.md` — Print address labels to the Brother QL-820NWB label printer (29mm × 90mm DK-11208 labels). Sends raster data **directly via TCP to 192.168.1.95:9100** — no CUPS. Prints two labels per AO: addressee (front of envelope) and sender/Grey & Associates return address (back of envelope). Reads name/address from DATA file.
 
 **Detection rules:**
 - Match by intent, not exact phrasing. "produce notices for Redan" = "generate notices for the Redan project" = "notices for Redan"
@@ -203,6 +221,128 @@ You have access to **40+ specialized agents** organized across multiple categori
 - Follow established workflows (e.g., Grey Team content pipeline)
 
 **Instead of improvising, check the agent registry first** — likely an agent already exists for your task.
+
+## Pro Trader Platform (PTP) Projects
+
+Steve's fintech website. Three environments — keep them straight:
+
+| Project | Role | Notes |
+|---------|------|-------|
+| `ptp` | **Production** — live platform | Code promoted here from ptp-dev when ready |
+| `ptp-dev` | **Development** — where all work happens | Build and test here first |
+| `ptp-charts` | **Future feature** — custom price charts | Integrate into ptp-dev for testing, then ptp for production |
+
+**Key facts:**
+- `ptp-dev` is the active development codebase — this is where you make changes
+- `ptp` (production) runs on the server; the local `ptp` directory may appear empty
+- `ptp-charts` is a substantial standalone feature (TradingView-style charts); keep it isolated until integration is planned
+- Never promote directly from `ptp-charts` to `ptp` — always via `ptp-dev` first
+
+**Stack (ptp-dev):**
+- Go 1.22 monolith, `gorilla/mux`, JWT auth, OAuth (Google/GitHub), `zerolog`, `bcrypt`
+- Frontend: vanilla HTML/CSS/JS, dark theme, no frameworks
+- DB: DigitalOcean managed PostgreSQL (`tvc` = production DB, `development` = dev DB)
+- Server: DigitalOcean droplet at `209.38.168.80`, SSH via `claude_code` user
+- Build: `GOOS=linux GOARCH=amd64 go build -o platform cmd/server/main.go`
+- Deploy: SCP binary + frontend files, restart via systemd
+- **SCP gotcha:** Never use `~/` in SCP remote paths — the local shell expands `~` to `/root` before SCP sees it. Always use the explicit path: `/home/claude_code/projects/platform/`
+
+## TradeByText Project
+
+Steve's WhatsApp-based business admin platform for UK tradespeople. Quotes, invoices, payment chasing, job management — all via WhatsApp.
+
+**Source code:** `/workspace/projects/trade-by-text/`
+
+### Stack
+- Go monolith, `gorilla/mux`, `zerolog`, `lib/pq` (PostgreSQL), `aws-sdk-go` v1 (Spaces), no Stripe SDK (direct API calls)
+- Frontend: vanilla HTML/CSS/JS, dark theme, no frameworks
+- PDF generation via Gotenberg (Docker container on server, port 3000)
+- WhatsApp Business Cloud API for messaging
+- Stripe for subscriptions (Starter £14.99/mo, Pro £29.99/mo) — hosted checkout, 14-day free trial
+- Royal Mail PAF address verification via Ideal Postcodes (licensed PAF data, fuzzy matching)
+- Photo/receipt storage via DigitalOcean Spaces (S3-compatible)
+- WhatsApp OTP login (6-digit code, 5-min expiry, rate-limited)
+- DB: DigitalOcean managed PostgreSQL
+- Scheduler: 10-second tick interval for near-instant WhatsApp message delivery
+
+### Server
+- **IP:** `209.38.163.177`
+- **User:** `claude_code`
+- **SSH key:** `~/.ssh/id_rsa_claude_code` (password auth is disabled — must use this key)
+- **App directory:** `/home/claude_code/trade-by-text/` (NOT in a `projects/` subdirectory)
+- **Binary name:** `trade-by-text` (hyphenated, not `tradebytext` or `platform`)
+- **Process:** systemd service (`trade-by-text.service`) — auto-restarts on crash, starts on boot
+- **Config:** `.env` file in the app directory (loaded via `EnvironmentFile` in the service)
+- **Logs:** `journalctl -u trade-by-text` (structured logs via zerolog)
+- **Port:** 8090 (behind nginx reverse proxy)
+- **Sudo password:** `wULnXdmTXm7uk7ZUJl` (needed for systemctl via `echo 'pass' | sudo -S`)
+
+### Deployment Procedure (single-step)
+
+```bash
+# 1. Build locally (from project root)
+cd /workspace/projects/trade-by-text
+GOOS=linux GOARCH=amd64 go build -o trade-by-text cmd/server/main.go
+
+# 2. Upload binary + assets
+SSH_KEY=~/.ssh/id_rsa_claude_code
+SERVER=claude_code@209.38.163.177
+REMOTE_DIR=/home/claude_code/trade-by-text
+
+scp -i $SSH_KEY -o StrictHostKeyChecking=no trade-by-text $SERVER:$REMOTE_DIR/trade-by-text.new
+scp -i $SSH_KEY -o StrictHostKeyChecking=no -r web/templates/ $SERVER:$REMOTE_DIR/web/templates/
+scp -i $SSH_KEY -o StrictHostKeyChecking=no -r migrations/ $SERVER:$REMOTE_DIR/migrations/
+
+# 3. Upload marketing website to nginx web root (NOT the app directory)
+# Nginx serves static marketing pages from /var/www/tradebytext.com/
+scp -i $SSH_KEY -o StrictHostKeyChecking=no website/*.html $SERVER:~/website-upload/
+scp -i $SSH_KEY -o StrictHostKeyChecking=no -r website/css/ $SERVER:~/website-upload/css/
+scp -i $SSH_KEY -o StrictHostKeyChecking=no -r website/js/ $SERVER:~/website-upload/js/
+ssh -i $SSH_KEY -o StrictHostKeyChecking=no $SERVER "echo 'wULnXdmTXm7uk7ZUJl' | sudo -S cp -r ~/website-upload/* /var/www/tradebytext.com/ 2>/dev/null && echo 'wULnXdmTXm7uk7ZUJl' | sudo -S chown -R www-data:www-data /var/www/tradebytext.com/ 2>/dev/null && rm -rf ~/website-upload"
+
+# 4. Swap binary and restart via systemd
+ssh -i $SSH_KEY -o StrictHostKeyChecking=no $SERVER "cd ~/trade-by-text && cp trade-by-text trade-by-text.bak && mv trade-by-text.new trade-by-text && chmod +x trade-by-text && echo 'wULnXdmTXm7uk7ZUJl' | sudo -S systemctl restart trade-by-text 2>/dev/null && sleep 2 && echo 'wULnXdmTXm7uk7ZUJl' | sudo -S systemctl status trade-by-text 2>/dev/null"
+```
+
+### Key Gotchas
+- **SSH key required:** `~/.ssh/id_rsa_claude_code` — password auth is disabled on the server
+- **sudo needed for systemctl:** Use `echo 'wULnXdmTXm7uk7ZUJl' | sudo -S systemctl restart trade-by-text 2>/dev/null`
+- **Binary naming:** The binary MUST be called `trade-by-text` (hyphenated)
+- **Migrations auto-apply:** The Go binary reads from `migrations/` on startup and applies them automatically
+- **Logs:** Use `journalctl -u trade-by-text -n 50 --no-pager` to check logs (not `app.log`)
+- **Marketing website lives at `/var/www/tradebytext.com/`** — nginx serves it as static files. Do NOT upload to `~/trade-by-text/website/` — those won't be served
+- **Nginx proxy routes:** `/setup`, `/dashboard`, `/checkout`, `/static/`, `/webhook`, `/api/`, `/auth/` all proxy to the Go app on port 8090. Everything else is served as static files from `/var/www/tradebytext.com/`
+
+### External Services & Credentials (all in `.env`)
+- **Database:** `dbaas-db-2225156-do-user-8222989-0.k.db.ondigitalocean.com:25060/trade-by-text` (DigitalOcean managed PostgreSQL)
+- **WhatsApp:** Business Cloud API — phone number ID, access token, verify token, app secret
+- **Stripe:** Live keys (secret + publishable), webhook secret (`whsec_...`), Price IDs for Starter/Pro tiers
+- **Ideal Postcodes:** API key (`ak_...`) — Royal Mail PAF address verification, ~2.5p/lookup. Graceful fallback to postcodes.io if key missing
+- **DigitalOcean Spaces:** Bucket `tradebytext-photos` at `lon1.digitaloceanspaces.com` — S3-compatible photo/receipt storage. Access key + secret key in `.env`
+- **Gotenberg:** `http://localhost:3000` — Docker container for HTML→PDF conversion
+- **Session secret:** HMAC-SHA256 key for signed session cookies
+
+### Directory Structure on Server
+```
+/home/claude_code/trade-by-text/
+├── trade-by-text          # The Go binary
+├── trade-by-text.bak      # Previous binary (rollback)
+├── .env                   # Configuration (DB, WhatsApp, Stripe, Spaces, Ideal Postcodes keys)
+├── migrations/            # SQL migration files (001-008)
+├── web/
+│   ├── templates/         # HTML templates (setup.html, login.html, dashboard.html)
+│   └── static/            # CSS & JS assets
+└── website/               # Marketing website (index, pricing, features, about, terms)
+```
+
+### Key Features Implemented
+- **WhatsApp conversation state machine** — quotes, jobs, invoices, payment chasing, booking all via WhatsApp
+- **Royal Mail PAF address verification** — postcode lookup → fuzzy match → confirm or select from list. Legally valid for debt recovery
+- **WhatsApp OTP login** — `/login` sends 6-digit code via WhatsApp, anti-enumeration, rate-limited, brute-force protected
+- **Stripe checkout** — hosted checkout with 14-day free trial, promo codes enabled, webhook handler for subscription lifecycle
+- **Photo persistence** — WhatsApp photos downloaded from Meta Graph API → uploaded to DO Spaces → permanent URL stored in DB
+- **3-stage payment chasing** — automated chasers + Letter Before Action (LBA) generation via Gotenberg
+- **Subscription tiers** — Starter (20 jobs/mo) and Pro (unlimited) with feature gating
 
 ## How You're Accessed
 

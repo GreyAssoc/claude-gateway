@@ -11,10 +11,27 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o gateway ./cmd/gateway
 
+# OpenCode binary extraction stage — install the musl platform package directly.
+# Retry npm install up to 3 times with backoff to handle registry timeouts.
+FROM alpine:3.20 AS opencode
+RUN apk add --no-cache nodejs npm \
+    && for i in 1 2 3; do \
+         npm install -g opencode-ai opencode-linux-x64-musl opencode-linux-x64-baseline-musl && break; \
+         echo "npm attempt $i failed, retrying in ${i}0s..."; sleep "${i}0"; \
+       done \
+    && rm -f /usr/local/lib/node_modules/opencode-ai/bin/.opencode \
+    && cp /usr/local/lib/node_modules/opencode-linux-x64-baseline-musl/bin/opencode \
+          /usr/local/bin/opencode \
+    && chmod +x /usr/local/bin/opencode \
+    && /usr/local/bin/opencode --version
+
 # Runtime stage
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata postgresql-client libstdc++ libgcc
+
+# Copy the native musl opencode binary (no Node.js needed at runtime)
+COPY --from=opencode /usr/local/bin/opencode /usr/local/bin/opencode
 
 WORKDIR /app
 

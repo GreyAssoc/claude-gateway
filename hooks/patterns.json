@@ -1,0 +1,73 @@
+{
+  "go": [
+    {
+      "pattern": "float(32|64)",
+      "message": "Use decimal/fixed-point for financial math, not float",
+      "severity": "BLOCK"
+    },
+    {
+      "pattern": "import\\s+\"C\"",
+      "message": "CGO is not allowed (CGO_ENABLED=0 required)",
+      "severity": "BLOCK"
+    },
+    {
+      "pattern": "\"github\\.com/(gin-gonic|labstack/echo|gofiber)",
+      "message": "External web frameworks not allowed — use standard library",
+      "severity": "BLOCK"
+    },
+    {
+      "pattern": "fmt\\.Print(ln|f)?\\(",
+      "message": "Use structured logging (zerolog/log), not fmt.Print",
+      "severity": "warning"
+    },
+    {
+      "pattern": "panic\\(",
+      "message": "Avoid panic in library/handler code — return errors instead",
+      "severity": "warning"
+    }
+  ],
+  "frontend": [
+    {
+      "pattern": "(\\$\\(|jQuery)",
+      "message": "jQuery is banned — use vanilla JavaScript",
+      "severity": "BLOCK"
+    },
+    {
+      "pattern": "import.*from\\s+['\"]react",
+      "message": "React is banned — use vanilla JavaScript",
+      "severity": "BLOCK"
+    },
+    {
+      "pattern": "import.*from\\s+['\"]vue",
+      "message": "Vue is banned — use vanilla JavaScript",
+      "severity": "BLOCK"
+    },
+    {
+      "pattern": "import.*from\\s+['\"]@angular",
+      "message": "Angular is banned — use vanilla JavaScript",
+      "severity": "BLOCK"
+    },
+    {
+      "pattern": "cdn\\.jsdelivr|cdnjs\\.cloudflare.*/(react|vue|angular|jquery)",
+      "message": "Framework CDN imports are banned — vanilla JS only",
+      "severity": "BLOCK"
+    },
+    {
+      "pattern": "document\\.write\\(",
+      "message": "document.write is unsafe — use DOM manipulation",
+      "severity": "warning"
+    }
+  ],
+  "general": [
+    {
+      "pattern": "(api[_-]?key|secret[_-]?key|password)\\s*=\\s*['\"][^'\"]{8,}",
+      "message": "Possible hardcoded credential detected — use environment variables",
+      "severity": "BLOCK"
+    },
+    {
+      "pattern": "FIXME|HACK|XXX",
+      "message": "Unresolved FIXME/HACK/XXX marker left in code",
+      "severity": "warning"
+    }
+  ]
+}

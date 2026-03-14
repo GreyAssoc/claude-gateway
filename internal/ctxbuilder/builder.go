@@ -138,21 +138,10 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 		return true
 	}
 
-	// 0. Bootstrap instructions — only injected when the session is ALIVE.
-	// On NEW sessions, BuildSystemPrompt already includes the full bootstrap
-	// in the system prompt, so injecting it here would duplicate ~13KB.
-	// On ALIVE sessions, the original system prompt may have been pushed out
-	// of Claude's context window by long conversations, so we re-inject it.
-	if sessionAlive {
-		bootstrapEntries, err := b.db.GetMemoryByCategory(ctx, "bootstrap")
-		if err != nil {
-			log.Printf("Context builder: failed to load bootstrap entries: %v", err)
-		} else if len(bootstrapEntries) > 0 {
-			if section := formatMemorySection("bootstrap_instructions", bootstrapEntries); section != "" {
-				addSection(section)
-			}
-		}
-	}
+	// 0. Bootstrap instructions — now injected via SessionStart hook.
+	// The hook fires on startup, resume, compact, and clear events,
+	// so bootstrap content survives compaction without per-message re-injection.
+	// This saves ~5,850 tokens per message on alive sessions.
 
 	// 1. Recent conversation turns (current session)
 	recentConvs, err := b.db.RecentConversations(ctx, sessionID, b.recentTurns)

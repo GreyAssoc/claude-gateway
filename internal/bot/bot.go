@@ -26,7 +26,6 @@ import (
 	"github.com/you/claude-gateway/internal/profile"
 	"github.com/you/claude-gateway/internal/ratelimiter"
 	"github.com/you/claude-gateway/internal/skills"
-	"github.com/you/claude-gateway/internal/triage"
 )
 
 const maxTelegramMessage = 4000
@@ -46,7 +45,7 @@ const maxConcurrentHandlers = 10
 // Bot wraps the Telegram bot with gateway integrations.
 type Bot struct {
 	api        *tgbotapi.BotAPI
-	agent      *agent.Client
+	agent      agent.Backend
 	limiter    *ratelimiter.Limiter
 	cfg        *config.Config
 	database   *db.DB
@@ -62,6 +61,10 @@ type Bot struct {
 	// allowing /stop to interrupt a running Claude session.
 	activeReqs   map[int64]context.CancelFunc
 	activeReqsMu sync.Mutex
+
+	// lastAPIModel tracks the most recent API-reported model per chat.
+	lastAPIModel   map[int64]string
+	lastAPIModelMu sync.RWMutex
 	// bgWg tracks fire-and-forget background goroutines (RecordExchange, fact
 	// extraction, profile update) so shutdown waits for them to finish before
 	// closing the database.
@@ -75,11 +78,10 @@ type Bot struct {
 	memoryCompactor     *memory.Compactor
 	orchestrator        *orchestrator.Engine
 
-	// v2: PostgreSQL-backed memory, context, triage, journal, profile
+	// v2: PostgreSQL-backed memory, context, journal, profile
 	pgDB           *pgdb.DB
 	contextBuilder *ctxbuilder.Builder
 	peopleManager  *people.Manager
-	triager        *triage.Triager
 	journal        *journal.Manager
 	profiler       *profile.Profiler
 }
@@ -132,11 +134,6 @@ func WithPeopleManager(pm *people.Manager) Option {
 	return func(b *Bot) { b.peopleManager = pm }
 }
 
-// WithTriager sets the local LLM triager.
-func WithTriager(t *triage.Triager) Option {
-	return func(b *Bot) { b.triager = t }
-}
-
 // WithJournal sets the daily journal manager.
 func WithJournal(j *journal.Manager) Option {
 	return func(b *Bot) { b.journal = j }
@@ -148,7 +145,7 @@ func WithProfiler(p *profile.Profiler) Option {
 }
 
 // New creates a new Bot. Optional dependencies are configured via Option functions.
-func New(cfg *config.Config, agentClient *agent.Client, limiter *ratelimiter.Limiter, database *db.DB, opts ...Option) (*Bot, error) {
+func New(cfg *config.Config, agentClient agent.Backend, limiter *ratelimiter.Limiter, database *db.DB, opts ...Option) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(cfg.Telegram.BotToken)
 	if err != nil {
 		return nil, fmt.Errorf("creating telegram bot: %w", err)
@@ -163,9 +160,10 @@ func New(cfg *config.Config, agentClient *agent.Client, limiter *ratelimiter.Lim
 		limiter:    limiter,
 		cfg:        cfg,
 		database:   database,
-		sessions:   make(map[int64]*SessionUsage),
-		sem:        make(chan struct{}, maxConcurrentHandlers),
-		activeReqs: make(map[int64]context.CancelFunc),
+		sessions:     make(map[int64]*SessionUsage),
+		sem:          make(chan struct{}, maxConcurrentHandlers),
+		activeReqs:   make(map[int64]context.CancelFunc),
+		lastAPIModel: make(map[int64]string),
 	}
 	for _, opt := range opts {
 		opt(b)
@@ -272,34 +270,36 @@ func (b *Bot) handleUpdate(ctx context.Context, msg *tgbotapi.Message) {
 // and skill commands (skills with a non-empty Command field).
 func (b *Bot) registerTelegramCommands() {
 	commands := []tgbotapi.BotCommand{
-		{Command: "start", Description: "Show available commands"},
-		{Command: "stop", Description: "Stop the current request"},
-		{Command: "status", Description: "Gateway health & rate limits"},
-		{Command: "reset", Description: "Clear conversation session"},
-		{Command: "cost", Description: "Token usage this session"},
-		{Command: "skills", Description: "List loaded skills"},
-		{Command: "memories", Description: "List curated memories"},
+		{Command: "bootstrapset", Description: "Add/update bootstrap instruction"},
+		{Command: "contactadd", Description: "Add contact detail to person"},
 		{Command: "context", Description: "Current context layers"},
-		{Command: "addperson", Description: "Add person to contacts"},
-		{Command: "people", Description: "List all people"},
-		{Command: "person", Description: "Find person by name"},
-		{Command: "addcontact", Description: "Add contact detail to person"},
-		{Command: "delperson", Description: "Remove a person"},
-		{Command: "setbootstrap", Description: "Add/update bootstrap instruction"},
-		{Command: "listmemory", Description: "List memories by category"},
-		{Command: "journal", Description: "View daily journal"},
-		{Command: "journal_search", Description: "Search journal entries"},
-		{Command: "profile", Description: "View user profile"},
-		{Command: "setprofile", Description: "Set profile aspect"},
-		{Command: "delprofile", Description: "Delete profile aspect"},
-		{Command: "cron", Description: "List scheduled jobs"},
+		{Command: "cost", Description: "Token usage this session"},
 		{Command: "cronadd", Description: "Add cron job: name \"schedule\" prompt"},
 		{Command: "crondel", Description: "Remove a cron job"},
-		{Command: "cronenable", Description: "Enable a cron job"},
 		{Command: "crondisable", Description: "Disable a cron job"},
-		{Command: "remember", Description: "Save a memory"},
-		{Command: "forget", Description: "Remove a memory by text match"},
+		{Command: "cronenable", Description: "Enable a cron job"},
+		{Command: "cronlist", Description: "List scheduled jobs"},
 		{Command: "dbcheck", Description: "Check PostgreSQL conversations"},
+		{Command: "framework", Description: "Show/switch AI framework"},
+		{Command: "journal", Description: "View daily journal"},
+		{Command: "journalsearch", Description: "Search journal entries"},
+		{Command: "memorieslist", Description: "List curated memories"},
+		{Command: "model", Description: "Show actual API model in use"},
+		{Command: "memoryforget", Description: "Remove a memory by text match"},
+		{Command: "memorylist", Description: "List memories by category"},
+		{Command: "memoryremember", Description: "Save a memory"},
+		{Command: "peoplelist", Description: "List all people"},
+		{Command: "personadd", Description: "Add person to contacts"},
+		{Command: "persondel", Description: "Remove a person"},
+		{Command: "personfind", Description: "Find person by name"},
+		{Command: "profile", Description: "View user profile"},
+		{Command: "profiledel", Description: "Delete profile aspect"},
+		{Command: "profileset", Description: "Set profile aspect"},
+		{Command: "reset", Description: "Clear conversation session"},
+		{Command: "skills", Description: "List loaded skills"},
+		{Command: "start", Description: "Show available commands"},
+		{Command: "status", Description: "Gateway health & rate limits"},
+		{Command: "stop", Description: "Stop the current request"},
 	}
 
 	builtinCount := len(commands)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/you/claude-gateway/internal/agent"
+	"github.com/you/claude-gateway/internal/agentsync"
 	"github.com/you/claude-gateway/internal/bot"
 	"github.com/you/claude-gateway/internal/config"
 	"github.com/you/claude-gateway/internal/cron"
@@ -28,7 +29,6 @@ import (
 	"github.com/you/claude-gateway/internal/profile"
 	"github.com/you/claude-gateway/internal/ratelimiter"
 	"github.com/you/claude-gateway/internal/skills"
-	"github.com/you/claude-gateway/internal/triage"
 	"github.com/you/claude-gateway/internal/watcher"
 )
 
@@ -66,27 +66,61 @@ func main() {
 	ollamaHealthCtx, ollamaHealthCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer ollamaHealthCancel()
 	if err := ollamaClient.Health(ollamaHealthCtx); err != nil {
-		log.Printf("WARNING: Ollama unavailable: %v (triage + embeddings disabled)", err)
+		log.Printf("WARNING: Ollama unavailable: %v (embeddings disabled)", err)
 	} else {
 		log.Println("Ollama is healthy.")
 	}
 
-	// --- Sidecar Client ---
-	// HTTP timeout must accommodate both normal requests and long-running agent runs.
-	// Use the longer of sidecar timeout and orchestrator timeout (+ buffer).
-	const orchTimeoutBuffer = 30 // extra seconds for network/startup overhead
+	// --- AI Backends ---
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer startupCancel()
+
+	// Initialize all available backends. The switcher holds them all;
+	// cfg.Framework determines which is active at startup.
+	var backends []agent.Backend
+	var sidecarReady bool
+
+	// Claude Code backend (sidecar) — always initialized if sidecar URL is configured.
+	const orchTimeoutBuffer = 30
 	timeout := time.Duration(cfg.Sidecar.TimeoutSeconds) * time.Second
 	orchTimeout := time.Duration(cfg.Orchestrator.Timeout+orchTimeoutBuffer) * time.Second
 	if orchTimeout > timeout {
 		timeout = orchTimeout
 	}
-	agentClient := agent.NewClient(cfg.Sidecar.URL, timeout)
+	claudeBackend := agent.NewClient(cfg.Sidecar.URL, timeout)
+	backends = append(backends, claudeBackend)
 
-	// Wait for sidecar to be ready (use a temporary context for startup)
-	log.Println("Waiting for sidecar...")
-	startupCtx, startupCancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer startupCancel()
-	sidecarReady := waitForSidecar(startupCtx, agentClient)
+	// OpenCode backend — always initialized if binary is available.
+	opencodeBackend := agent.NewOpenCodeClient(agent.OpenCodeConfig{
+		Binary:   cfg.OpenCode.Binary,
+		Model:    cfg.OpenCode.Model,
+		WorkDir:  cfg.WorkDir,
+		Timeout:  time.Duration(cfg.OpenCode.TimeoutSeconds) * time.Second,
+		AgentDir: cfg.OpenCode.AgentDir,
+	})
+	backends = append(backends, opencodeBackend)
+
+	// Create the switcher with all backends.
+	agentClient, err := agent.NewSwitcher(cfg.Framework, backends...)
+	if err != nil {
+		log.Fatalf("Failed to create backend switcher: %v", err)
+	}
+
+	// Health-check the active backend at startup.
+	switch cfg.Framework {
+	case "opencode":
+		log.Println("Framework: OpenCode")
+		if err := opencodeBackend.Health(startupCtx); err != nil {
+			log.Printf("WARNING: OpenCode backend not ready: %v", err)
+		} else {
+			sidecarReady = true
+			log.Println("OpenCode backend is ready.")
+		}
+	default:
+		log.Println("Framework: Claude Code (sidecar)")
+		log.Println("Waiting for sidecar...")
+		sidecarReady = waitForSidecar(startupCtx, claudeBackend)
+	}
 
 	// --- Rate Limiter ---
 	limiter := ratelimiter.New(
@@ -103,6 +137,22 @@ func main() {
 		log.Printf("Warning: skills manager: %v", err)
 	}
 	defer skillsMgr.Stop()
+
+	// --- Agent Sync ---
+	var agentSyncer *agentsync.Syncer
+	if cfg.AgentSync.Enabled {
+		agentSyncer = agentsync.New(agentsync.Config{
+			ClaudeAgentDir:   cfg.AgentSync.ClaudeAgentDir,
+			ClaudeCmdDir:     cfg.AgentSync.ClaudeCmdDir,
+			OpencodeAgentDir: cfg.AgentSync.OpencodeAgentDir,
+			OpencodeCmdDir:   cfg.AgentSync.OpencodeCmdDir,
+		})
+		if err := agentSyncer.Start(); err != nil {
+			log.Printf("Warning: agent sync: %v", err)
+		} else {
+			defer agentSyncer.Stop()
+		}
+	}
 
 	// --- Memory Manager ---
 	memMgr := memory.NewManager(database, cfg.Memory.BootstrapDir, cfg.Memory.DailyDir, cfg.Memory.MaxCuratedInject, cfg.Memory.MaxDailyDays, cfg.Memory.ClaudeMDPaths...)
@@ -130,9 +180,6 @@ func main() {
 	// --- Context Builder ---
 	ctxBuilder := ctxbuilder.NewBuilder(pgDB, ollamaClient, peopleMgr, profiler, journalMgr, cfg.Context)
 
-	// --- Triager ---
-	triager := triage.NewTriager(ollamaClient)
-
 	// --- Orchestrator Engine ---
 	orchEngine := orchestrator.NewEngine(database, agentClient, cfg.Orchestrator.AgentDNADir, cfg.WorkDir, cfg.Orchestrator.Timeout)
 
@@ -145,7 +192,6 @@ func main() {
 		bot.WithPgDB(pgDB),
 		bot.WithContextBuilder(ctxBuilder),
 		bot.WithPeopleManager(peopleMgr),
-		bot.WithTriager(triager),
 		bot.WithJournal(journalMgr),
 		bot.WithProfiler(profiler),
 		bot.WithSystemPromptBuilder(func(ctx context.Context) string {
@@ -228,9 +274,9 @@ func main() {
 	log.Println("Gateway is running. Ctrl+C to stop.")
 
 	if cfg.Telegram.NotifyChatID != 0 {
-		tgBot.SendNotification("Claude Gateway v2 started.")
+		tgBot.SendNotification(fmt.Sprintf("Claude Gateway v2 started (framework: %s).", cfg.Framework))
 		if !sidecarReady {
-			tgBot.SendNotification("WARNING: Gateway started in degraded mode — sidecar was not ready at startup. Claude interactions may fail.")
+			tgBot.SendNotification(fmt.Sprintf("WARNING: Gateway started in degraded mode — %s backend was not ready at startup.", cfg.Framework))
 		}
 	}
 
@@ -278,7 +324,7 @@ func main() {
 	log.Println("Goodbye.")
 }
 
-func waitForSidecar(ctx context.Context, client *agent.Client) bool {
+func waitForSidecar(ctx context.Context, client agent.Backend) bool {
 	for {
 		if err := client.Health(ctx); err == nil {
 			log.Println("Sidecar is ready.")
@@ -329,7 +375,7 @@ func runDailyCompaction(ctx context.Context, compactor *memory.Compactor, journa
 	}
 }
 
-func runHeartbeat(ctx context.Context, client *agent.Client, tgBot *bot.Bot, cfg config.Heartbeat) {
+func runHeartbeat(ctx context.Context, client agent.Backend, tgBot *bot.Bot, cfg config.Heartbeat) {
 	interval := time.Duration(cfg.IntervalSeconds) * time.Second
 	failures := 0
 

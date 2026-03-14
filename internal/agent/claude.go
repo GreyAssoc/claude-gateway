@@ -1,4 +1,3 @@
-// Package agent provides a WebSocket client for communicating with the Claude CLI sidecar.
 package agent
 
 import (
@@ -17,6 +16,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Compile-time check: *Client implements Backend.
+var _ Backend = (*Client)(nil)
+
 // Usage holds token consumption data from a Claude interaction.
 type Usage struct {
 	InputTokens              int `json:"input_tokens"`
@@ -29,6 +31,7 @@ type Usage struct {
 type Response struct {
 	Text          string `json:"text"`
 	SessionID     string `json:"session_id"`
+	Model         string `json:"api_model,omitempty"`
 	Usage         *Usage `json:"usage,omitempty"`
 	Error         string `json:"error,omitempty"`
 	IsRateLimited bool   `json:"is_rate_limited,omitempty"`
@@ -91,6 +94,7 @@ type wsResponse struct {
 	Input         string `json:"input,omitempty"`
 	Text          string `json:"text,omitempty"`
 	SessionID     string `json:"session_id,omitempty"`
+	APIModel      string `json:"api_model,omitempty"`
 	Usage         *Usage `json:"usage,omitempty"`
 	Error         string `json:"error,omitempty"`
 	IsRateLimited bool   `json:"is_rate_limited,omitempty"`
@@ -241,6 +245,7 @@ func (c *Client) AskWithOptions(ctx context.Context, opts AskOptions) (*Response
 				r := &Response{
 					Text:      resp.Text,
 					SessionID: resp.SessionID,
+					Model:     resp.APIModel,
 					Usage:     resp.Usage,
 				}
 				if resp.Error != "" {
@@ -306,6 +311,7 @@ func (c *Client) AskStreaming(ctx context.Context, opts AskOptions, onProgress f
 				return &Response{
 					Text:      resp.Text,
 					SessionID: resp.SessionID,
+					Model:     resp.APIModel,
 					Usage:     resp.Usage,
 				}, nil
 			case "error":
@@ -732,4 +738,9 @@ func (c *Client) failAllPending(err error) {
 		}
 		delete(c.pending, id)
 	}
+}
+
+// Name returns "claude" — the backend identifier for the Claude Code sidecar.
+func (c *Client) Name() string {
+	return "claude"
 }

@@ -13,8 +13,10 @@ import (
 )
 
 type Config struct {
+	Framework       string // "claude" or "opencode" (default: "claude")
 	Telegram        Telegram
 	Sidecar         Sidecar
+	OpenCode        OpenCode
 	RateLimiter     RateLimiter
 	Cron            map[string]CronJob
 	Watchers        WatchersConfig
@@ -31,6 +33,25 @@ type Config struct {
 	OllamaLLMModel  string
 	Context         ContextConfig
 	Triage          TriageConfig
+	AgentSync       AgentSync
+}
+
+// OpenCode holds configuration for the OpenCode backend.
+type OpenCode struct {
+	Binary         string `yaml:"binary"`
+	Model          string `yaml:"model"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
+	AgentDir       string `yaml:"agent_dir"`
+}
+
+// AgentSync holds configuration for bidirectional agent/command syncing
+// between Claude Code and OpenCode framework directories.
+type AgentSync struct {
+	Enabled          bool   `yaml:"enabled"`
+	ClaudeAgentDir   string `yaml:"claude_agent_dir"`
+	ClaudeCmdDir     string `yaml:"claude_cmd_dir"`
+	OpencodeAgentDir string `yaml:"opencode_agent_dir"`
+	OpencodeCmdDir   string `yaml:"opencode_cmd_dir"`
 }
 
 type ContextConfig struct {
@@ -120,9 +141,11 @@ type Dashboard struct {
 
 // rawConfig mirrors the YAML structure before env var resolution
 type rawConfig struct {
+	Framework string             `yaml:"framework"`
 	Cron      map[string]CronJob `yaml:"cron"`
 	Watchers  WatchersConfig     `yaml:"watchers"`
 	Heartbeat Heartbeat    `yaml:"heartbeat"`
+	OpenCode  OpenCode     `yaml:"opencode"`
 	Sidecar   struct {
 		URL            string `yaml:"url"`
 		TimeoutSeconds int    `yaml:"timeout_seconds"`
@@ -147,6 +170,7 @@ type rawConfig struct {
 	OllamaLLMModel  string        `yaml:"ollama_llm_model"`
 	Context         ContextConfig `yaml:"context"`
 	Triage          TriageConfig  `yaml:"triage"`
+	AgentSync       AgentSync     `yaml:"agent_sync"`
 }
 
 func Load(yamlPath string) (*Config, error) {
@@ -179,6 +203,19 @@ func Load(yamlPath string) (*Config, error) {
 	}
 	if cfg.RateLimiter.OTPM <= 0 {
 		cfg.RateLimiter.OTPM = 8000
+	}
+
+	// Framework defaults
+	if cfg.Framework == "" {
+		cfg.Framework = "claude"
+	}
+
+	// OpenCode defaults
+	if cfg.OpenCode.Binary == "" {
+		cfg.OpenCode.Binary = "opencode"
+	}
+	if cfg.OpenCode.TimeoutSeconds <= 0 {
+		cfg.OpenCode.TimeoutSeconds = 600
 	}
 
 	// Defaults
@@ -270,6 +307,20 @@ func Load(yamlPath string) (*Config, error) {
 		cfg.Triage.MinImportance = 4
 	}
 
+	// AgentSync defaults — directories relative to WorkDir parent (.claude/ and .opencode/ at workspace root)
+	if cfg.AgentSync.ClaudeAgentDir == "" {
+		cfg.AgentSync.ClaudeAgentDir = cfg.WorkDir + "/.claude/agents"
+	}
+	if cfg.AgentSync.ClaudeCmdDir == "" {
+		cfg.AgentSync.ClaudeCmdDir = cfg.WorkDir + "/.claude/commands"
+	}
+	if cfg.AgentSync.OpencodeAgentDir == "" {
+		cfg.AgentSync.OpencodeAgentDir = cfg.WorkDir + "/.opencode/agents"
+	}
+	if cfg.AgentSync.OpencodeCmdDir == "" {
+		cfg.AgentSync.OpencodeCmdDir = cfg.WorkDir + "/.opencode/commands"
+	}
+
 	return cfg, nil
 }
 
@@ -284,6 +335,8 @@ func loadYAML(path string, cfg *Config) error {
 		return fmt.Errorf("parsing config file %s: %w", path, err)
 	}
 
+	cfg.Framework = raw.Framework
+	cfg.OpenCode = raw.OpenCode
 	cfg.Cron = raw.Cron
 	cfg.Watchers = raw.Watchers
 	cfg.Heartbeat = raw.Heartbeat
@@ -312,6 +365,7 @@ func loadYAML(path string, cfg *Config) error {
 	cfg.OllamaLLMModel = raw.OllamaLLMModel
 	cfg.Context = raw.Context
 	cfg.Triage = raw.Triage
+	cfg.AgentSync = raw.AgentSync
 
 	return nil
 }
@@ -344,6 +398,15 @@ func loadEnv(cfg *Config) {
 		}
 	}
 
+	if v := os.Getenv("FRAMEWORK"); v != "" {
+		cfg.Framework = v
+	}
+	if v := os.Getenv("OPENCODE_BINARY"); v != "" {
+		cfg.OpenCode.Binary = v
+	}
+	if v := os.Getenv("OPENCODE_MODEL"); v != "" {
+		cfg.OpenCode.Model = v
+	}
 	if v := os.Getenv("SIDECAR_URL"); v != "" {
 		cfg.Sidecar.URL = v
 	}

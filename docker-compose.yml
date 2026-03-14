@@ -17,6 +17,9 @@ services:
       - OLLAMA_URL=http://host.docker.internal:11434
       - OLLAMA_EMBED_MODEL=${OLLAMA_EMBED_MODEL:-nomic-embed-text}
       - OLLAMA_LLM_MODEL=${OLLAMA_LLM_MODEL:-qwen2.5:7b}
+      # OpenCode backend (used when FRAMEWORK=opencode)
+      - OPENCODE_API_KEY=${OPENCODE_API_KEY}
+      - OPENCODE_MODEL=${OPENCODE_MODEL:-opencode-go/kimi-k2.5}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -72,6 +75,12 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    restart: unless-stopped
+
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    ports:
+      - "3000:3000"
     restart: unless-stopped
 
 volumes:

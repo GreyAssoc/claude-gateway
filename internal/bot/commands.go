@@ -16,7 +16,6 @@ import (
 	"github.com/you/claude-gateway/internal/orchestrator"
 	"github.com/you/claude-gateway/internal/pgdb"
 	"github.com/you/claude-gateway/internal/skills"
-	"github.com/you/claude-gateway/internal/triage"
 )
 
 func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
@@ -25,21 +24,37 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		text := "Claude Gateway v2 is ready.\n\n" +
 			"Send me any message and I'll process it with Claude Code.\n\n" +
 			"Commands:\n" +
-			"/stop — stop the current request\n" +
-			"/status — gateway health & rate limits\n" +
-			"/reset — clear conversation session\n" +
+			"/bootstrapset — add/update bootstrap instruction\n" +
+			"/contactadd — add contact detail to person\n" +
+			"/context — current context layers\n" +
 			"/cost — token usage this session\n" +
-			"/cron — active scheduled jobs\n" +
 			"/cronadd name \"schedule\" prompt — add a cron job\n" +
 			"/crondel name — remove a cron job\n" +
-			"/cronenable name — enable a cron job\n" +
 			"/crondisable name — disable a cron job\n" +
+			"/cronenable name — enable a cron job\n" +
+			"/cronlist — list scheduled jobs\n" +
+			"/dbcheck — check PostgreSQL conversations\n" +
+			"/framework [name] — show/switch AI framework\n" +
+			"/journal — view daily journal\n" +
+			"/journalsearch — search journal entries\n" +
+			"/memorieslist — list curated memories\n" +
+			"/model — show actual API model in use\n" +
+			"/memoryforget — remove a memory by text match\n" +
+			"/memorylist — list memories by category\n" +
+			"/memoryremember <text> — save a memory\n" +
+			"/peoplelist — list all people\n" +
+			"/personadd — add person to contacts\n" +
+			"/persondel — remove a person\n" +
+			"/personfind — find person by name\n" +
+			"/profile — view user profile\n" +
+			"/profiledel — delete profile aspect\n" +
+			"/profileset — set profile aspect\n" +
+			"/reset — clear conversation session\n" +
+			"/reviewauto [dir] — auto-detect language and review\n" +
+			"/reviewautosec [dir] — auto-detect with security focus\n" +
 			"/skills — list loaded skills\n" +
-			"/memories — list curated memories\n" +
-			"/remember <text> — save a memory\n" +
-			"/context — current context layers\n" +
-			"/autoreview [dir] — auto-detect language and review\n" +
-			"/autoreview_sec [dir] — auto-detect with security focus"
+			"/status — gateway health & rate limits\n" +
+			"/stop — stop the current request"
 
 		if b.skillsManager != nil {
 			var cmds []string
@@ -58,123 +73,98 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		}
 		b.sendMessage(msg.Chat.ID, text)
 
-	case "status":
-		b.handleStatus(ctx, msg)
-
-	case "reset":
-		b.handleReset(ctx, msg)
-
-	case "cost":
-		b.handleCost(msg)
-
-	case "cron":
-		b.handleCronList(msg)
-
-	case "skills":
-		b.handleSkills(msg)
-
-	case "skill":
-		b.handleSkillDetail(msg)
-
-	case "skill_enable":
-		b.handleSkillToggle(ctx, msg, true)
-
-	case "skill_disable":
-		b.handleSkillToggle(ctx, msg, false)
-
-	case "remember":
-		b.handleRemember(ctx, msg)
-
-	case "forget":
-		b.handleForget(ctx, msg)
-
-	case "memories":
-		b.handleMemories(ctx, msg)
-
-	case "today":
-		b.handleToday(ctx, msg)
-
+	case "bootstrapset":
+		b.handleSetBootstrap(ctx, msg)
+	case "contactadd":
+		b.handleAddContact(ctx, msg)
 	case "context":
 		b.handleContext(ctx, msg)
-
-	case "review_go":
-		b.handleOrchestratorTeam(ctx, msg, "go-dev-team")
-
-	case "review_go_sec":
-		b.handleOrchestratorTeam(ctx, msg, "go-sec-team")
-
-	case "review_fe":
-		b.handleOrchestratorTeam(ctx, msg, "fe-dev-team")
-
-	case "review_fe_sec":
-		b.handleOrchestratorTeam(ctx, msg, "fe-sec-team")
-
-	case "review_design":
-		b.handleOrchestratorTeam(ctx, msg, "design")
-
-	case "review_integration":
-		b.handleOrchestratorTeam(ctx, msg, "integration")
-
-	case "review_python":
-		b.handleOrchestratorTeam(ctx, msg, "python-dev-team")
-
-	case "review_python_sec":
-		b.handleOrchestratorTeam(ctx, msg, "python-sec-team")
-
-	case "autoreview":
-		b.handleAutoReview(ctx, msg, false)
-
-	case "autoreview_sec":
-		b.handleAutoReview(ctx, msg, true)
-
-	case "gauntlet":
-		b.handleGauntlet(ctx, msg)
-
-	case "agents":
-		b.handleAgentsList(msg)
-
-	case "runs":
-		b.handleRunsList(ctx, msg)
-
-	case "addperson":
-		b.handleAddPerson(ctx, msg)
-	case "people":
-		b.handleListPeople(ctx, msg)
-	case "person":
-		b.handleFindPerson(ctx, msg)
-	case "addcontact":
-		b.handleAddContact(ctx, msg)
-	case "delperson":
-		b.handleDelPerson(ctx, msg)
-	case "setbootstrap":
-		b.handleSetBootstrap(ctx, msg)
-	case "listmemory":
-		b.handleListMemory(ctx, msg)
-	case "journal":
-		b.handleJournal(ctx, msg)
-	case "journal_search":
-		b.handleJournalSearch(ctx, msg)
-	case "profile":
-		b.handleProfile(ctx, msg)
-	case "setprofile":
-		b.handleSetProfile(ctx, msg)
-	case "delprofile":
-		b.handleDelProfile(ctx, msg)
-
+	case "cost":
+		b.handleCost(msg)
 	case "cronadd":
 		b.handleCronAdd(msg)
 	case "crondel":
 		b.handleCronDel(msg)
-	case "cronenable":
-		b.handleCronEnable(msg)
 	case "crondisable":
 		b.handleCronDisable(msg)
-
-	case "stop":
-		b.handleStop(msg)
-
+	case "cronenable":
+		b.handleCronEnable(msg)
+	case "cronlist":
+		b.handleCronList(msg)
 	case "dbcheck":
 		b.handleDBCheck(ctx, msg)
+	case "framework":
+		b.handleFramework(ctx, msg)
+	case "gauntlet":
+		b.handleGauntlet(ctx, msg)
+	case "journal":
+		b.handleJournal(ctx, msg)
+	case "journalsearch":
+		b.handleJournalSearch(ctx, msg)
+	case "memorieslist":
+		b.handleMemories(ctx, msg)
+	case "model":
+		b.handleModel(msg)
+	case "memoryforget":
+		b.handleForget(ctx, msg)
+	case "memorylist":
+		b.handleListMemory(ctx, msg)
+	case "memoryremember":
+		b.handleRemember(ctx, msg)
+	case "orchestratoragents":
+		b.handleAgentsList(msg)
+	case "orchestratorruns":
+		b.handleRunsList(ctx, msg)
+	case "peoplelist":
+		b.handleListPeople(ctx, msg)
+	case "personadd":
+		b.handleAddPerson(ctx, msg)
+	case "persondel":
+		b.handleDelPerson(ctx, msg)
+	case "personfind":
+		b.handleFindPerson(ctx, msg)
+	case "profile":
+		b.handleProfile(ctx, msg)
+	case "profiledel":
+		b.handleDelProfile(ctx, msg)
+	case "profileset":
+		b.handleSetProfile(ctx, msg)
+	case "reset":
+		b.handleReset(ctx, msg)
+	case "reviewauto":
+		b.handleAutoReview(ctx, msg, false)
+	case "reviewautosec":
+		b.handleAutoReview(ctx, msg, true)
+	case "reviewdesign":
+		b.handleOrchestratorTeam(ctx, msg, "design")
+	case "reviewfe":
+		b.handleOrchestratorTeam(ctx, msg, "fe-dev-team")
+	case "reviewfesec":
+		b.handleOrchestratorTeam(ctx, msg, "fe-sec-team")
+	case "reviewgo":
+		b.handleOrchestratorTeam(ctx, msg, "go-dev-team")
+	case "reviewgosec":
+		b.handleOrchestratorTeam(ctx, msg, "go-sec-team")
+	case "reviewintegration":
+		b.handleOrchestratorTeam(ctx, msg, "integration")
+	case "reviewpython":
+		b.handleOrchestratorTeam(ctx, msg, "python-dev-team")
+	case "reviewpythonsec":
+		b.handleOrchestratorTeam(ctx, msg, "python-sec-team")
+	case "skills":
+		b.handleSkills(msg)
+	case "skilldetail":
+		b.handleSkillDetail(msg)
+	case "skillenable":
+		b.handleSkillToggle(ctx, msg, true)
+	case "skilldisable":
+		b.handleSkillToggle(ctx, msg, false)
+	case "status":
+		b.handleStatus(ctx, msg)
+	case "stop":
+		b.handleStop(msg)
+	case "today":
+		b.handleToday(ctx, msg)
 
 	default:
 		// Check if this is a skill command
@@ -238,7 +228,67 @@ func (b *Bot) gatewayIntentMatch(ctx context.Context, msg *tgbotapi.Message) boo
 		return true
 	}
 
+	// Framework switching
+	if b.matchFrameworkSwitch(ctx, msg, lower) {
+		return true
+	}
+
 	return false
+}
+
+// matchFrameworkSwitch detects natural language requests to switch or query
+// the AI framework. Returns true if handled.
+func (b *Bot) matchFrameworkSwitch(_ context.Context, msg *tgbotapi.Message, lower string) bool {
+	// Query: "which framework", "what framework", "current framework", "what backend"
+	if containsAny(lower, "which framework", "what framework", "current framework",
+		"what backend", "which backend", "active framework", "active backend",
+		"which model", "what model are you") {
+		b.handleFramework(context.Background(), msg)
+		return true
+	}
+
+	// Switch: detect intent + target
+	if !containsAny(lower, "switch", "use ", "change to", "swap to", "move to",
+		"enable opencode", "enable claude", "activate opencode", "activate claude",
+		"switch to opencode", "switch to claude") {
+		return false
+	}
+
+	// Extract target framework from the message
+	target := ""
+	switch {
+	case containsAny(lower, "opencode", "open code", "open-code", "zen"):
+		target = "opencode"
+	case containsAny(lower, "claude", "claude code", "sidecar"):
+		target = "claude"
+	}
+
+	if target == "" {
+		// They said "switch framework" but didn't specify which — show the menu
+		b.handleFramework(context.Background(), msg)
+		return true
+	}
+
+	// Synthesize a command message with the target as argument
+	// so handleFramework can process it.
+	switcher, ok := b.agent.(*agent.Switcher)
+	if !ok {
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Framework switching not available.\nActive backend: *%s*", b.agent.Name()))
+		return true
+	}
+
+	if switcher.Active() == target {
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Already using *%s*.", target))
+		return true
+	}
+
+	if err := switcher.Switch(target); err != nil {
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Failed: %v", err))
+		return true
+	}
+
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Switched to *%s*.", target))
+	return true
 }
 
 // containsAny returns true if s contains any of the given substrings.
@@ -274,50 +324,22 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		return
 	}
 
-	sessionID := fmt.Sprintf("tg-%d", msg.Chat.ID)
-
-	// Step 1: Triage with local LLM (if available)
-	var peopleNames, topics []string
-	if b.triager != nil && b.cfg.Triage.Enabled {
-		analysis, err := b.triager.Analyze(ctx, msg.Text)
-		if err != nil {
-			log.Printf("Triage: error: %v", err)
-		} else if analysis != nil {
-			log.Printf("Triage: %s", triage.FormatAnalysis(analysis))
-			peopleNames = analysis.PeopleNames
-			topics = analysis.Topics
-
-			if analysis.CanHandleLocally && analysis.LocalResponse != "" {
-				b.sendLongMessage(msg.Chat.ID, analysis.LocalResponse)
-				// Record for memory continuity — save synchronously, embed in background
-				if b.contextBuilder != nil {
-					saveCtx, saveCancel := context.WithTimeout(context.Background(), 5*time.Second)
-					ids, saveErr := b.contextBuilder.RecordExchangeSync(saveCtx, sessionID, msg.Text, analysis.LocalResponse)
-					saveCancel()
-					if saveErr != nil {
-						log.Printf("Failed to save local exchange: %v", saveErr)
-					} else {
-						b.bgWg.Add(1)
-						go func() {
-							defer b.bgWg.Done()
-							bgCtx, bgCancel := context.WithTimeout(context.Background(), 30*time.Second)
-							defer bgCancel()
-							b.contextBuilder.EnrichWithEmbeddings(bgCtx, ids, msg.Text, analysis.LocalResponse)
-						}()
-					}
-				}
-				return
-			}
+	// People detection: extract known names from message text for context enrichment.
+	// This replaces the triage LLM layer with a fast in-process lookup.
+	var peopleNames []string
+	if b.peopleManager != nil {
+		if names, err := b.peopleManager.MatchNames(ctx, msg.Text); err == nil {
+			peopleNames = names
 		}
 	}
 
-	// Step 2: Check rate limits (estimate ~1000 input tokens for a typical request)
+	// Check rate limits (estimate ~1000 input tokens for a typical request)
 	if !b.limiter.CanProceed(1000) {
 		status := b.limiter.GetStatus()
 		position := b.limiter.Enqueue(func() {
 			// Use Background: queued requests have independent lifecycles
 			// and should not be cancelled by the original handler's context.
-			b.processMessageWith(context.Background(), msg, msg.Text, "", peopleNames, topics)
+			b.processMessageWith(context.Background(), msg, msg.Text, "", peopleNames)
 		})
 		if position < 0 {
 			b.sendMessage(msg.Chat.ID,
@@ -331,13 +353,13 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		return
 	}
 
-	b.processMessageWith(ctx, msg, msg.Text, "", peopleNames, topics)
+	b.processMessageWith(ctx, msg, msg.Text, "", peopleNames)
 }
 
 // processMessageWith sends a message to Claude with streaming progress.
 // When systemPrompt is non-empty, it overrides the default system prompt builder.
-// peopleNames and topics come from triage analysis and are used for enriched context.
-func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, prompt, systemPrompt string, peopleNames, topics []string) {
+// peopleNames are used for enriched context (people profile injection).
+func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, prompt, systemPrompt string, peopleNames []string) {
 	// Send "Working..." indicator — we'll edit this message in-place with progress
 	thinking := tgbotapi.NewMessage(msg.Chat.ID, "Working...")
 	thinkingMsg, err := b.api.Send(thinking)
@@ -584,6 +606,13 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		return
 	}
 
+	// Track the API-reported model for /model command
+	if resp.Model != "" {
+		b.lastAPIModelMu.Lock()
+		b.lastAPIModel[msg.Chat.ID] = resp.Model
+		b.lastAPIModelMu.Unlock()
+	}
+
 	// Record usage
 	if resp.Usage != nil {
 		b.limiter.Record(resp.Usage)
@@ -634,41 +663,15 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		}
 	}
 
-	// Post-process: extract facts + update user profile
-	if b.triager != nil && b.cfg.Triage.AutoLearn && systemPrompt == "" {
+	// Post-process: update user profile observations (background, non-blocking)
+	if b.profiler != nil && systemPrompt == "" {
 		b.bgWg.Add(1)
 		go func(userMsg, assistantResp string) {
 			defer b.bgWg.Done()
 			bgCtx, bgCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer bgCancel()
-
-			// Extract facts from the exchange
-			facts, factErr := b.triager.ExtractFacts(bgCtx, userMsg, assistantResp)
-			if factErr != nil {
-				log.Printf("Fact extraction failed (non-fatal): %v", factErr)
-			} else if b.contextBuilder != nil && b.pgDB != nil {
-				pgDB := b.pgDB
-				for _, f := range facts {
-					if f.Importance >= b.cfg.Triage.MinImportance {
-						if _, saveErr := pgDB.SaveMemoryEntry(bgCtx, f.Category, f.Key, f.Content, "auto", f.Importance); saveErr != nil {
-							log.Printf("Auto-fact save failed (non-fatal): %v", saveErr)
-						}
-					}
-				}
-				// Prune if over limit
-				count, _ := pgDB.CountAutoFacts(bgCtx)
-				if count > b.cfg.Triage.MaxAutoFacts {
-					if _, pruneErr := pgDB.PruneAutoFacts(bgCtx, b.cfg.Triage.MaxAutoFacts); pruneErr != nil {
-						log.Printf("Auto-fact pruning failed (non-fatal): %v", pruneErr)
-					}
-				}
-			}
-
-			// Update user profile observations
-			if b.profiler != nil {
-				if profErr := b.profiler.UpdateFromConversation(bgCtx, userMsg, assistantResp); profErr != nil {
-					log.Printf("Profile update failed (non-fatal): %v", profErr)
-				}
+			if profErr := b.profiler.UpdateFromConversation(bgCtx, userMsg, assistantResp); profErr != nil {
+				log.Printf("Profile update failed (non-fatal): %v", profErr)
 			}
 		}(prompt, resp.Text)
 	}
@@ -1145,7 +1148,7 @@ func (b *Bot) handleSkillCommand(ctx context.Context, msg *tgbotapi.Message, ski
 		return
 	}
 
-	b.processMessageWith(ctx, msg, args, systemPrompt, nil, nil)
+	b.processMessageWith(ctx, msg, args, systemPrompt, nil)
 }
 
 // --- v2 command handlers ---
@@ -1643,4 +1646,88 @@ func (b *Bot) handleCronDisable(msg *tgbotapi.Message) {
 		return
 	}
 	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Cron job %q disabled.", name))
+}
+
+// handleFramework shows the current AI framework or switches to a new one.
+//
+//	/framework          — show current + available
+// handleModel shows the actual API model from the last response, not a
+// self-reported model identity. This is immune to conversation history
+// pollution and always reflects what the API actually returned.
+func (b *Bot) handleModel(msg *tgbotapi.Message) {
+	configured := b.cfg.Sidecar.DefaultModel
+	framework := "claude"
+	if sw, ok := b.agent.(*agent.Switcher); ok {
+		framework = sw.Active()
+		if framework == "opencode" {
+			configured = b.cfg.OpenCode.Model
+		}
+	}
+
+	b.lastAPIModelMu.RLock()
+	apiModel := b.lastAPIModel[msg.Chat.ID]
+	b.lastAPIModelMu.RUnlock()
+
+	var text strings.Builder
+	fmt.Fprintf(&text, "Framework: `%s`\n", framework)
+	fmt.Fprintf(&text, "Configured: `%s`\n", configured)
+	if apiModel != "" {
+		fmt.Fprintf(&text, "Last API model: `%s`", apiModel)
+	} else {
+		text.WriteString("Last API model: (no request yet — send a message first)")
+	}
+
+	b.sendMarkdownMessage(msg.Chat.ID, text.String())
+}
+
+//	/framework claude   — switch to Claude Code
+//	/framework opencode — switch to OpenCode
+func (b *Bot) handleFramework(_ context.Context, msg *tgbotapi.Message) {
+	switcher, ok := b.agent.(*agent.Switcher)
+	if !ok {
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Framework switching not available.\nActive backend: *%s*", b.agent.Name()))
+		return
+	}
+
+	arg := strings.TrimSpace(msg.CommandArguments())
+
+	if arg == "" {
+		// Show current status with model info
+		active := switcher.Active()
+		available := switcher.Available()
+
+		// Map framework names to their configured models
+		models := map[string]string{
+			"claude":   b.cfg.Sidecar.DefaultModel,
+			"opencode": b.cfg.OpenCode.Model,
+		}
+
+		var lines []string
+		lines = append(lines, fmt.Sprintf("*Active framework:* %s", active))
+		lines = append(lines, "")
+		for _, name := range available {
+			icon := "  "
+			if name == active {
+				icon = "▶ "
+			}
+			model := models[name]
+			if model == "" {
+				model = "default"
+			}
+			lines = append(lines, fmt.Sprintf("%s`%s` — %s", icon, name, model))
+		}
+		lines = append(lines, "")
+		lines = append(lines, "Switch: /framework <name>")
+
+		b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
+		return
+	}
+
+	// Switch
+	if err := switcher.Switch(arg); err != nil {
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Failed: %v", err))
+		return
+	}
+
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Switched to *%s*.", arg))
 }

@@ -211,14 +211,9 @@ func (m *Manager) BuildSystemPromptSection(ctx context.Context) string {
 
 	var parts []string
 
-	// Layer 1: Bootstrap files
-	m.mu.RLock()
-	for _, bf := range m.bootstraps {
-		escapedName := format.XMLEscapeAttr(bf.Name)
-		content := format.CDATAEscape(bf.Content)
-		parts = append(parts, fmt.Sprintf("<bootstrap name=\"%s\">\n<![CDATA[%s]]>\n</bootstrap>", escapedName, content))
-	}
-	m.mu.RUnlock()
+	// Layer 1: Bootstrap files — now injected via SessionStart hook.
+	// The hook fires on startup, resume, compact, and clear events,
+	// so bootstrap content survives compaction without system prompt injection.
 
 	// Layer 2: CLAUDE.md files (read live — always fresh, even after compaction)
 	for _, mdPath := range m.claudeMDPaths {

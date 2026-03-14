@@ -196,3 +196,42 @@ func buildPersonText(fullName, preferredName, pType, role, company, notes string
 	}
 	return strings.Join(parts, ". ")
 }
+
+// MatchNames scans the message text for known people names (full name and
+// preferred name) using case-insensitive substring matching. Returns the
+// matched names suitable for passing to FindPeople / BuildEnrichedPrompt.
+// This is a fast, in-process replacement for the Ollama triage NER step.
+func (m *Manager) MatchNames(ctx context.Context, text string) ([]string, error) {
+	people, err := m.db.ListPeople(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	lower := strings.ToLower(text)
+	seen := make(map[string]bool)
+	var matched []string
+
+	for _, p := range people {
+		// Check preferred name first (shorter, more likely to appear)
+		name := p.PreferredName
+		if name == "" {
+			name = p.FullName
+		}
+		if name == "" {
+			continue
+		}
+		if strings.Contains(lower, strings.ToLower(name)) && !seen[name] {
+			seen[name] = true
+			matched = append(matched, name)
+		}
+		// Also check full name if different from preferred
+		if p.FullName != "" && p.FullName != name {
+			if strings.Contains(lower, strings.ToLower(p.FullName)) && !seen[p.FullName] {
+				seen[p.FullName] = true
+				matched = append(matched, p.FullName)
+			}
+		}
+	}
+
+	return matched, nil
+}

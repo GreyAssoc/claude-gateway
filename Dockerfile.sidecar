@@ -7,7 +7,7 @@ FROM node:20-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       python3 python3-pip git ca-certificates curl \
-      libreoffice-calc openssh-client rsync cups-client && \
+      libreoffice-calc openssh-client rsync cups-client jq && \
     rm -rf /var/lib/apt/lists/*
 
 # Python packages for grey-docs skills (awards, notices, schedule of condition)
@@ -28,6 +28,9 @@ RUN for i in 1 2 3; do \
     done
 ENV PATH="/root/.claude/local/bin:$PATH"
 
+# Log installed Claude Code version (must support Opus 4.6, released Feb 2026)
+RUN claude --version || true
+
 # Also keep the npm CLI for backward compatibility with /run-agent endpoint
 RUN npm install -g @anthropic-ai/claude-code
 
@@ -45,7 +48,12 @@ COPY sidecar/package.json sidecar/package-lock.json* ./
 RUN npm install --production
 COPY sidecar/index.js .
 
-# Claude Code settings (tool permissions)
+# Hooks: SessionStart (context injection), PostToolUse (anti-pattern checker,
+# retry detector, compaction shield). Scripts + context files + patterns.
+COPY hooks/ /app/hooks/
+RUN chmod +x /app/hooks/*.sh
+
+# Claude Code settings (tool permissions + hooks)
 RUN mkdir -p /root/.config/claude-code
 COPY configs/claude-code-settings.json /root/.config/claude-code/settings.json
 

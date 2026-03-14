@@ -22,7 +22,7 @@ type NotifyFunc func(text string)
 // Scheduler manages cron jobs that invoke Claude.
 type Scheduler struct {
 	cron    *cron.Cron
-	agent   *agent.Client
+	agent   agent.Backend
 	limiter *ratelimiter.Limiter
 	notify  NotifyFunc
 	workDir string
@@ -44,7 +44,7 @@ type jobInfo struct {
 }
 
 // New creates a cron scheduler that executes Claude prompts on a schedule.
-func New(agentClient *agent.Client, limiter *ratelimiter.Limiter, notify NotifyFunc, workDir string) *Scheduler {
+func New(agentClient agent.Backend, limiter *ratelimiter.Limiter, notify NotifyFunc, workDir string) *Scheduler {
 	return &Scheduler{
 		cron:    cron.New(),
 		agent:   agentClient,

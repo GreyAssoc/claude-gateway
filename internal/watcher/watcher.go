@@ -20,7 +20,7 @@ type NotifyFunc func(text string)
 
 // Manager runs all watchers.
 type Manager struct {
-	agent   *agent.Client
+	agent   agent.Backend
 	limiter *ratelimiter.Limiter
 	notify  NotifyFunc
 	workDir string
@@ -38,7 +38,7 @@ type watchTask struct {
 }
 
 // NewManager creates a watcher manager that polls external services for notifications.
-func NewManager(agentClient *agent.Client, limiter *ratelimiter.Limiter, notify NotifyFunc, workDir string) *Manager {
+func NewManager(agentClient agent.Backend, limiter *ratelimiter.Limiter, notify NotifyFunc, workDir string) *Manager {
 	return &Manager{
 		agent:   agentClient,
 		limiter: limiter,
@@ -130,7 +130,7 @@ func safeInterval(seconds int, name string) time.Duration {
 // --- Gmail Watcher ---
 
 type gmailWatcher struct {
-	agent      *agent.Client
+	agent      agent.Backend
 	limiter    *ratelimiter.Limiter
 	notify     NotifyFunc
 	workDir    string
@@ -139,7 +139,7 @@ type gmailWatcher struct {
 	lastCheck  time.Time
 }
 
-func newGmailWatcher(a *agent.Client, l *ratelimiter.Limiter, n NotifyFunc, wd string, cfg config.WatcherConfig) *gmailWatcher {
+func newGmailWatcher(a agent.Backend, l *ratelimiter.Limiter, n NotifyFunc, wd string, cfg config.WatcherConfig) *gmailWatcher {
 	return &gmailWatcher{
 		agent:     a,
 		limiter:   l,
@@ -190,7 +190,7 @@ func (g *gmailWatcher) check(ctx context.Context) {
 // --- Calendar Watcher ---
 
 type calendarWatcher struct {
-	agent          *agent.Client
+	agent          agent.Backend
 	limiter        *ratelimiter.Limiter
 	notify         NotifyFunc
 	workDir        string
@@ -206,7 +206,7 @@ type calendarEvent struct {
 	Location string `json:"location"`
 }
 
-func newCalendarWatcher(a *agent.Client, l *ratelimiter.Limiter, n NotifyFunc, wd string, cfg config.WatcherConfig) *calendarWatcher {
+func newCalendarWatcher(a agent.Backend, l *ratelimiter.Limiter, n NotifyFunc, wd string, cfg config.WatcherConfig) *calendarWatcher {
 	return &calendarWatcher{
 		agent:          a,
 		limiter:        l,

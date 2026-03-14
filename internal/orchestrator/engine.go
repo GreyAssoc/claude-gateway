@@ -17,7 +17,7 @@ import (
 // Engine manages orchestrator team runs.
 type Engine struct {
 	db           *db.DB
-	agentClient  *agent.Client
+	agentClient  agent.Backend
 	agentDNADir  string
 	workspaceDir string
 	timeout      time.Duration
@@ -34,7 +34,7 @@ type RunResult struct {
 }
 
 // NewEngine creates an orchestrator engine.
-func NewEngine(database *db.DB, agentClient *agent.Client, agentDNADir, workspaceDir string, timeoutSeconds int) *Engine {
+func NewEngine(database *db.DB, agentClient agent.Backend, agentDNADir, workspaceDir string, timeoutSeconds int) *Engine {
 	return &Engine{
 		db:           database,
 		agentClient:  agentClient,
