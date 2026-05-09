@@ -62,6 +62,40 @@ function is429(msg) {
   );
 }
 
+// --- Provider routing ---
+// Maps a provider name to the Anthropic-compatible endpoint exposed by that
+// vendor. The Claude Agent SDK reads ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
+// at subprocess spawn time, so we override them per request via options.env.
+const PROVIDERS = {
+  deepseek: {
+    baseURL: "https://api.deepseek.com/anthropic",
+    apiKeyEnv: "DEEPSEEK_API_KEY",
+    defaultModel: "deepseek-v4-pro",
+  },
+};
+
+// buildProviderOverlay returns { env, model } for a provider, or null if no
+// provider was requested. Throws if the provider is unknown or the API key
+// env var is missing — those are caller errors that should surface to the user.
+function buildProviderOverlay(providerName, requestedModel) {
+  if (!providerName) return null;
+  const p = PROVIDERS[providerName];
+  if (!p) {
+    throw new Error(`Unknown provider: ${providerName}`);
+  }
+  const apiKey = process.env[p.apiKeyEnv];
+  if (!apiKey) {
+    throw new Error(`Missing ${p.apiKeyEnv} env var for provider ${providerName}`);
+  }
+  return {
+    env: {
+      ANTHROPIC_BASE_URL: p.baseURL,
+      ANTHROPIC_AUTH_TOKEN: apiKey,
+    },
+    model: requestedModel || p.defaultModel,
+  };
+}
+
 // --- Abort tracking ---
 // Maps sessionId -> { aborted: false } for in-flight requests.
 // The abort flag is checked inside the for-await loop to break early.
@@ -70,7 +104,7 @@ const activeRequests = new Map();
 // --- WebSocket Handlers ---
 
 async function handleAsk(msg, send) {
-  const { session_id, prompt, cwd, max_turns, system_prompt, allowed_tools, model } = msg;
+  const { session_id, prompt, cwd, max_turns, system_prompt, allowed_tools, model, provider } = msg;
 
   if (!prompt) {
     send({ type: "error", error: "prompt is required" });
@@ -105,7 +139,26 @@ async function handleAsk(msg, send) {
       "WebFetch", "WebSearch",
     ];
     if (system_prompt) options.systemPrompt = system_prompt;
-    if (model) options.model = model;
+
+    // Provider overlay (e.g. provider="deepseek") routes the request to a
+    // different Anthropic-compatible endpoint. When unset, default Claude
+    // behavior is preserved exactly.
+    let overlay;
+    try {
+      overlay = buildProviderOverlay(provider, model);
+    } catch (e) {
+      send({ type: "error", error: e.message });
+      clearInterval(keepalive);
+      activeRequests.delete(sessionId);
+      return;
+    }
+    if (overlay) {
+      options.env = { ...process.env, ...overlay.env };
+      options.model = overlay.model;
+    } else if (model) {
+      options.model = model;
+    }
+
     if (session && session.sdkSessionId) options.resume = session.sdkSessionId;
 
     options.stderr = (data) => {
@@ -116,7 +169,7 @@ async function handleAsk(msg, send) {
       }
     };
 
-    console.log(`[ws-ask ${sessionId}] query (cwd: ${workDir}, model: ${model || "default"}, resume: ${session?.sdkSessionId || "none"})`);
+    console.log(`[ws-ask ${sessionId}] query (cwd: ${workDir}, model: ${options.model || "default"}, provider: ${provider || "claude"}, resume: ${session?.sdkSessionId || "none"})`);
 
     const conversation = query({ prompt, options });
 
@@ -272,7 +325,7 @@ async function handleAsk(msg, send) {
 }
 
 async function handleRunAgent(msg, send) {
-  const { prompt, system_prompt, cwd, allowed_tools, timeout_ms, model } = msg;
+  const { prompt, system_prompt, cwd, allowed_tools, timeout_ms, model, provider } = msg;
 
   if (!prompt) {
     send({ type: "error", error: "prompt is required" });
@@ -287,13 +340,25 @@ async function handleRunAgent(msg, send) {
     fullPrompt = system_prompt + "\n\n---\n\n" + prompt;
   }
 
+  let overlay;
+  try {
+    overlay = buildProviderOverlay(provider, model);
+  } catch (e) {
+    send({ type: "error", error: e.message });
+    return;
+  }
+
+  const effectiveModel = overlay ? overlay.model : model;
   const args = ["-p", fullPrompt, "--output-format", "text"];
-  if (model) args.push("--model", model);
+  if (effectiveModel) args.push("--model", effectiveModel);
   if (allowed_tools && allowed_tools.length > 0) {
     args.push("--allowedTools", allowed_tools.join(","));
   }
 
-  console.log(`[ws-agent] Spawning isolated process (cwd: ${workDir}, timeout: ${timeoutMs}ms)`);
+  const childEnv = { ...process.env, HOME: "/root", PWD: workDir };
+  if (overlay) Object.assign(childEnv, overlay.env);
+
+  console.log(`[ws-agent] Spawning isolated process (cwd: ${workDir}, model: ${effectiveModel || "default"}, provider: ${provider || "claude"}, timeout: ${timeoutMs}ms)`);
 
   try {
     const output = await new Promise((resolve, reject) => {
@@ -301,7 +366,7 @@ async function handleRunAgent(msg, send) {
         cwd: workDir,
         timeout: timeoutMs,
         maxBuffer: 10 * 1024 * 1024,
-        env: { ...process.env, HOME: "/root", PWD: workDir },
+        env: childEnv,
       }, (err, stdout, stderr) => {
         if (err) {
           reject(err.killed

@@ -112,6 +112,9 @@ triage:
   min_importance: 4
 
 # Agent/command sync between Claude Code and OpenCode directories
+opencode:
+  model: "opencode-go/glm-5"
+
 agent_sync:
   enabled: true
   # Directories default to ${WORK_DIR}/.claude/agents etc. if not set

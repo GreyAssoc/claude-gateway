@@ -1,5 +1,30 @@
 # Claude Gateway v2
 
+## Quick Commands — Restart / Rebuild
+
+Run from `/workspace/projects/claude-gateway/`:
+
+```bash
+# Restart entire stack (recreates containers — picks up mount/compose changes)
+docker compose down && docker compose up -d
+
+# Restart sidecar only (e.g. after sidecar code change, no mount changes)
+docker compose restart sidecar
+
+# Full rebuild + restart (after Dockerfile or dependency changes)
+docker compose down && docker compose build && docker compose up -d
+
+# Tail logs after restart
+docker compose logs -f              # all services
+docker compose logs -f sidecar      # sidecar only
+docker compose logs -f gateway      # gateway only
+```
+
+> **Note:** `docker compose restart` reuses existing containers and will NOT pick up
+> changes to volumes/mounts in `docker-compose.yml`. Use `down` + `up` for mount changes.
+
+---
+
 ## Project Overview
 
 A Go + Node.js gateway that connects Claude to Telegram, with scheduled jobs, Gmail/Calendar watchers, memory management, and multi-agent orchestration.
@@ -76,9 +101,26 @@ make restart        # Restart everything
 
 ## Key Config Files
 
-- `.env` — Secrets (TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, CLAUDE_CONFIG_DIR)
+- `.env` — Secrets (TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, CLAUDE_CONFIG_DIR, DEEPSEEK_API_KEY)
 - `configs/gateway.yaml` — Cron, watchers, rate limits, memory
 - `memory/bootstrap/*.md` — Static context injected into every Claude request
+
+## Multi-provider via Anthropic-compatible endpoints
+
+The single sidecar can route requests to providers other than native Claude
+without code changes to the sidecar's agent loop. Each request carries a
+`provider` field; when set, the sidecar injects `ANTHROPIC_BASE_URL` and
+`ANTHROPIC_AUTH_TOKEN` per-call via the SDK's `options.env`. Skills, tool
+use, MCP, and session resume all keep working.
+
+Currently registered: `claude` (native), `deepseek` (when `DEEPSEEK_API_KEY`
+is set). Switch at runtime with `/framework deepseek` in Telegram.
+
+To add another vendor with an Anthropic-compatible endpoint, append to the
+`PROVIDERS` map in `sidecar/index.js` and register a backend in
+`cmd/gateway/main.go` via `agent.NewClientWithProvider(name, provider, url, timeout)`.
+Sessions are namespaced per provider on the wire so cross-provider state
+never collides.
 
 ## Container Environment
 

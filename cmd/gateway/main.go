@@ -90,6 +90,17 @@ func main() {
 	claudeBackend := agent.NewClient(cfg.Sidecar.URL, timeout)
 	backends = append(backends, claudeBackend)
 
+	// DeepSeek backend — same sidecar, but each request carries
+	// provider="deepseek" so the sidecar injects DeepSeek's
+	// Anthropic-compatible endpoint and API key for that subprocess only.
+	// Only registered when DEEPSEEK_API_KEY is set, so /framework deepseek
+	// only appears when configured.
+	if os.Getenv("DEEPSEEK_API_KEY") != "" {
+		deepseekBackend := agent.NewClientWithProvider("deepseek", "deepseek", cfg.Sidecar.URL, timeout)
+		backends = append(backends, deepseekBackend)
+		log.Println("DeepSeek backend registered (provider=deepseek)")
+	}
+
 	// OpenCode backend — always initialized if binary is available.
 	opencodeBackend := agent.NewOpenCodeClient(agent.OpenCodeConfig{
 		Binary:   cfg.OpenCode.Binary,

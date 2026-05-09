@@ -83,6 +83,7 @@ type wsRequest struct {
 	SystemPrompt string   `json:"system_prompt,omitempty"`
 	AllowedTools []string `json:"allowed_tools,omitempty"`
 	Model        string   `json:"model,omitempty"`
+	Provider     string   `json:"provider,omitempty"`
 	TimeoutMs    int      `json:"timeout_ms,omitempty"`
 }
 
@@ -119,7 +120,15 @@ type pendingReq struct {
 }
 
 // Client talks to the Node.js sidecar over a persistent WebSocket connection.
+//
+// A single sidecar can serve multiple Client instances, each pinned to a
+// different provider (e.g. one for native Claude, one for DeepSeek via
+// Anthropic-compatible endpoint). The provider value is forwarded on every
+// request and the sidecar injects the matching ANTHROPIC_BASE_URL /
+// ANTHROPIC_AUTH_TOKEN when spawning the SDK subprocess.
 type Client struct {
+	name     string // backend identifier returned by Name()
+	provider string // forwarded as wsRequest.Provider; empty means native Claude
 	wsURL     string
 	healthURL string
 
@@ -141,18 +150,31 @@ type Client struct {
 	bgWg        sync.WaitGroup // tracks maintainConnection, readLoop, pingLoop
 }
 
-// NewClient creates a sidecar WebSocket client. It connects immediately and
-// reconnects automatically in the background if the connection drops.
+// NewClient creates a sidecar WebSocket client for native Claude. It connects
+// immediately and reconnects automatically in the background if the connection
+// drops.
 //
 // Deprecated: The timeout parameter is unused — individual requests use
 // context-based timeouts. It will be removed once all callers are updated.
-func NewClient(baseURL string, _ time.Duration) *Client {
+func NewClient(baseURL string, timeout time.Duration) *Client {
+	return NewClientWithProvider("claude", "", baseURL, timeout)
+}
+
+// NewClientWithProvider creates a sidecar WebSocket client pinned to a
+// specific provider. `name` is what Name() returns (used by the Switcher).
+// `provider` is forwarded to the sidecar on every request — empty means
+// native Claude, non-empty (e.g. "deepseek") triggers env-var injection in
+// the sidecar to route the request to that vendor's Anthropic-compatible
+// endpoint.
+func NewClientWithProvider(name, provider, baseURL string, _ time.Duration) *Client {
 	// Derive WebSocket URL from HTTP URL
 	wsURL := strings.Replace(baseURL, "https://", "wss://", 1)
 	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
 	wsURL += "/ws"
 
 	c := &Client{
+		name:         name,
+		provider:     provider,
 		wsURL:        wsURL,
 		healthURL:    baseURL,
 		pending:      make(map[string]*pendingReq),
@@ -201,6 +223,35 @@ func (c *Client) Close() error {
 	return closeErr
 }
 
+// wireSessionID prefixes a logical sessionID with the provider name so that
+// sessions on different providers do not collide in the sidecar's in-memory
+// session map. Claude (provider="") sessions keep their bare ID for backwards
+// compatibility with any pre-existing entries.
+func (c *Client) wireSessionID(sessionID string) string {
+	if c.provider == "" || sessionID == "" {
+		return sessionID
+	}
+	return c.provider + ":" + sessionID
+}
+
+// wireModel returns the model name to send on the wire. When this client is
+// pinned to a non-default provider, Claude-style names ("sonnet", "haiku",
+// "opus") are stripped — the sidecar picks the provider's default. Other
+// names pass through so callers can target a specific provider model.
+func (c *Client) wireModel(model string) string {
+	if c.provider == "" {
+		return model
+	}
+	switch model {
+	case "", "sonnet", "haiku", "opus":
+		return ""
+	}
+	if strings.HasPrefix(model, "claude-") {
+		return ""
+	}
+	return model
+}
+
 // --- Public API (unchanged signatures) ---
 
 // Ask sends a prompt to Claude via the sidecar and returns the response.
@@ -222,13 +273,14 @@ func (c *Client) AskWithOptions(ctx context.Context, opts AskOptions) (*Response
 	req := wsRequest{
 		ID:           id,
 		Type:         "ask",
-		SessionID:    opts.SessionID,
+		SessionID:    c.wireSessionID(opts.SessionID),
 		Prompt:       opts.Prompt,
 		WorkDir:      opts.WorkDir,
 		MaxTurns:     opts.MaxTurns,
 		SystemPrompt: opts.SystemPrompt,
 		AllowedTools: opts.AllowedTools,
-		Model:        opts.Model,
+		Model:        c.wireModel(opts.Model),
+		Provider:     c.provider,
 	}
 
 	if err := c.writeJSONRetry(req); err != nil {
@@ -244,7 +296,7 @@ func (c *Client) AskWithOptions(ctx context.Context, opts AskOptions) (*Response
 			case "result":
 				r := &Response{
 					Text:      resp.Text,
-					SessionID: resp.SessionID,
+					SessionID: opts.SessionID,
 					Model:     resp.APIModel,
 					Usage:     resp.Usage,
 				}
@@ -277,13 +329,14 @@ func (c *Client) AskStreaming(ctx context.Context, opts AskOptions, onProgress f
 	req := wsRequest{
 		ID:           id,
 		Type:         "ask",
-		SessionID:    opts.SessionID,
+		SessionID:    c.wireSessionID(opts.SessionID),
 		Prompt:       opts.Prompt,
 		WorkDir:      opts.WorkDir,
 		MaxTurns:     opts.MaxTurns,
 		SystemPrompt: opts.SystemPrompt,
 		AllowedTools: opts.AllowedTools,
-		Model:        opts.Model,
+		Model:        c.wireModel(opts.Model),
+		Provider:     c.provider,
 	}
 
 	if err := c.writeJSONRetry(req); err != nil {
@@ -310,7 +363,7 @@ func (c *Client) AskStreaming(ctx context.Context, opts AskOptions, onProgress f
 			case "result":
 				return &Response{
 					Text:      resp.Text,
-					SessionID: resp.SessionID,
+					SessionID: opts.SessionID,
 					Model:     resp.APIModel,
 					Usage:     resp.Usage,
 				}, nil
@@ -338,7 +391,8 @@ func (c *Client) RunIsolatedAgent(ctx context.Context, opts RunAgentOptions) (*R
 		WorkDir:      opts.WorkDir,
 		SystemPrompt: opts.SystemPrompt,
 		AllowedTools: opts.AllowedTools,
-		Model:        opts.Model,
+		Model:        c.wireModel(opts.Model),
+		Provider:     c.provider,
 		TimeoutMs:    opts.TimeoutMs,
 	}
 
@@ -381,7 +435,7 @@ func (c *Client) AbortSession(sessionID string) {
 	req := wsRequest{
 		ID:        c.genID(),
 		Type:      "abort",
-		SessionID: sessionID,
+		SessionID: c.wireSessionID(sessionID),
 	}
 	if err := c.writeJSONRetry(req); err != nil {
 		log.Printf("AbortSession(%s): send failed: %v", sessionID, err)
@@ -397,7 +451,7 @@ func (c *Client) ResetSession(ctx context.Context, sessionID string) error {
 	req := wsRequest{
 		ID:        id,
 		Type:      "reset",
-		SessionID: sessionID,
+		SessionID: c.wireSessionID(sessionID),
 	}
 
 	if err := c.writeJSONRetry(req); err != nil {
@@ -424,7 +478,7 @@ func (c *Client) CheckSession(ctx context.Context, sessionID string) (*SessionSt
 	req := wsRequest{
 		ID:        id,
 		Type:      "check-session",
-		SessionID: sessionID,
+		SessionID: c.wireSessionID(sessionID),
 	}
 
 	if err := c.writeJSONRetry(req); err != nil {
@@ -740,7 +794,10 @@ func (c *Client) failAllPending(err error) {
 	}
 }
 
-// Name returns "claude" — the backend identifier for the Claude Code sidecar.
+// Name returns the backend identifier (e.g. "claude", "deepseek").
 func (c *Client) Name() string {
-	return "claude"
+	if c.name == "" {
+		return "claude"
+	}
+	return c.name
 }

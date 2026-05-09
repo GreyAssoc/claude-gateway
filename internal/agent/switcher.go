@@ -142,3 +142,15 @@ func (s *Switcher) Close() error {
 func (s *Switcher) Name() string {
 	return s.get().Name()
 }
+
+// GetOpenCodeClient returns the OpenCode backend if registered, or nil.
+func (s *Switcher) GetOpenCodeClient() *OpenCodeClient {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if b, ok := s.backends["opencode"]; ok {
+		if oc, ok := b.(*OpenCodeClient); ok {
+			return oc
+		}
+	}
+	return nil
+}

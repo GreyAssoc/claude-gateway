@@ -20,6 +20,8 @@ services:
       # OpenCode backend (used when FRAMEWORK=opencode)
       - OPENCODE_API_KEY=${OPENCODE_API_KEY}
       - OPENCODE_MODEL=${OPENCODE_MODEL:-opencode-go/kimi-k2.5}
+      # DeepSeek backend — gateway only registers the deepseek backend when this is set.
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -29,6 +31,12 @@ services:
       - ./configs:/app/configs
       # Agent DNA files for orchestrator (read-only)
       - ${WORK_DIR}/.claude/agents:/app/agents:ro
+      # Full workspace — needed by OpenCode backend to access all projects.
+      # Mirrors the sidecar mount so both frameworks see the same files.
+      - ${WORK_DIR}:/workspace
+      # Client data directories (read-only — for OpenCode skills that read client data)
+      - /home/stevew/grey-unraid/clients-current:/clients/current:ro
+      - /home/stevew/grey-unraid/clients-past:/clients/past:ro
     ports:
       - "${DASHBOARD_PORT:-8080}:8080"
     depends_on:
@@ -53,6 +61,9 @@ services:
       - GOG_KEYRING_PASSWORD=${GOG_KEYRING_PASSWORD}
       # Gemini API key (for SoC audio transcription)
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # DeepSeek API key — used when a request carries provider="deepseek".
+      # The sidecar injects this as ANTHROPIC_AUTH_TOKEN for that subprocess only.
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
     volumes:
       # Host workspace — mounted so Claude Code can read/write project files
       - ${WORK_DIR}:/workspace

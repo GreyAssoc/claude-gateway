@@ -39,6 +39,7 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 			"/journalsearch — search journal entries\n" +
 			"/memorieslist — list curated memories\n" +
 			"/model — show actual API model in use\n" +
+			"/models — switch OpenCode model\n" +
 			"/memoryforget — remove a memory by text match\n" +
 			"/memorylist — list memories by category\n" +
 			"/memoryremember <text> — save a memory\n" +
@@ -106,6 +107,8 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		b.handleMemories(ctx, msg)
 	case "model":
 		b.handleModel(msg)
+	case "models":
+		b.handleModels(msg)
 	case "memoryforget":
 		b.handleForget(ctx, msg)
 	case "memorylist":
@@ -313,6 +316,12 @@ func containsAny(s string, substrs ...string) bool {
 
 func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 	if msg.Text == "" {
+		return
+	}
+
+	// Intercept "." as a quick command menu.
+	if strings.TrimSpace(msg.Text) == "." {
+		b.sendCommandMenu(msg)
 		return
 	}
 
@@ -1727,6 +1736,87 @@ func (b *Bot) handleModel(msg *tgbotapi.Message) {
 	b.sendMarkdownMessage(msg.Chat.ID, text.String())
 }
 
+// opencodeModels is the curated list of models available for quick-switching.
+// Add new models here — they appear as inline keyboard buttons.
+var opencodeModels = []struct {
+	Label string // button text
+	ID    string // provider/model passed to opencode
+}{
+	{"DeepSeek R1 (88%)", "deepseek/deepseek-reasoner"},
+	{"Qwen3 235B (82%)", "alibaba/qwen3-235b-a22b"},
+	{"DeepSeek V3 (78%)", "deepseek/deepseek-chat"},
+	{"GLM-5 (65%)", "opencode-go/glm-5"},
+	{"Kimi K2.5 (60%)", "opencode-go/kimi-k2.5"},
+}
+
+// /models — show inline keyboard to pick an OpenCode model.
+func (b *Bot) handleModels(msg *tgbotapi.Message) {
+	// Quick-switch via argument: /models deepseek/deepseek-chat
+	if arg := strings.TrimSpace(msg.CommandArguments()); arg != "" {
+		b.switchOpenCodeModel(msg.Chat.ID, arg)
+		return
+	}
+
+	sw, ok := b.agent.(*agent.Switcher)
+	if !ok {
+		b.sendMessage(msg.Chat.ID, "Framework switching not available.")
+		return
+	}
+	oc := sw.GetOpenCodeClient()
+	if oc == nil {
+		b.sendMessage(msg.Chat.ID, "OpenCode backend not registered.")
+		return
+	}
+
+	current := oc.GetModel()
+
+	// Build inline keyboard — 2 buttons per row
+	var rows [][]tgbotapi.InlineKeyboardButton
+	var row []tgbotapi.InlineKeyboardButton
+	for _, m := range opencodeModels {
+		label := m.Label
+		if m.ID == current {
+			label = "✅ " + label
+		}
+		btn := tgbotapi.NewInlineKeyboardButtonData(label, "model:"+m.ID)
+		row = append(row, btn)
+		if len(row) == 2 {
+			rows = append(rows, row)
+			row = nil
+		}
+	}
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+
+	reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Current model: `%s`\nPick a model:", current))
+	reply.ParseMode = tgbotapi.ModeMarkdown
+	reply.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	if _, err := b.api.Send(reply); err != nil {
+		log.Printf("Failed to send models keyboard: %v", err)
+	}
+}
+
+// switchOpenCodeModel changes the OpenCode model and confirms.
+func (b *Bot) switchOpenCodeModel(chatID int64, modelID string) {
+	sw, ok := b.agent.(*agent.Switcher)
+	if !ok {
+		b.sendMessage(chatID, "Framework switching not available.")
+		return
+	}
+	oc := sw.GetOpenCodeClient()
+	if oc == nil {
+		b.sendMessage(chatID, "OpenCode backend not registered.")
+		return
+	}
+
+	old := oc.GetModel()
+	oc.SetModel(modelID)
+	b.cfg.OpenCode.Model = modelID // keep config in sync for /model display
+
+	b.sendMarkdownMessage(chatID, fmt.Sprintf("Model switched: `%s` → `%s`", old, modelID))
+}
+
 //	/framework claude   — switch to Claude Code
 //	/framework opencode — switch to OpenCode
 func (b *Bot) handleFramework(_ context.Context, msg *tgbotapi.Message) {
@@ -1747,6 +1837,7 @@ func (b *Bot) handleFramework(_ context.Context, msg *tgbotapi.Message) {
 		models := map[string]string{
 			"claude":   b.cfg.Sidecar.DefaultModel,
 			"opencode": b.cfg.OpenCode.Model,
+			"deepseek": "deepseek-v4-pro",
 		}
 
 		var lines []string
@@ -1777,4 +1868,37 @@ func (b *Bot) handleFramework(_ context.Context, msg *tgbotapi.Message) {
 	}
 
 	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Switched to *%s*.", arg))
+}
+
+// sendCommandMenu sends a grid of tappable inline buttons for quick access to commands.
+// Triggered by typing "." (period).
+func (b *Bot) sendCommandMenu(msg *tgbotapi.Message) {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		{
+			tgbotapi.NewInlineKeyboardButtonData("📋 Tasks", "menu:tasks"),
+			tgbotapi.NewInlineKeyboardButtonData("📊 Status", "menu:status"),
+			tgbotapi.NewInlineKeyboardButtonData("✅ Todos", "menu:todos"),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("🤖 Models", "menu:models"),
+			tgbotapi.NewInlineKeyboardButtonData("🔨 Build", "menu:build"),
+			tgbotapi.NewInlineKeyboardButtonData("📐 Plan", "menu:plan"),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("⏰ Cron", "menu:cronlist"),
+			tgbotapi.NewInlineKeyboardButtonData("🧹 Clear", "menu:clear"),
+			tgbotapi.NewInlineKeyboardButtonData("🔊 Verbose", "menu:verbose"),
+		},
+		{
+			tgbotapi.NewInlineKeyboardButtonData("💓 Heartbeat", "menu:heartbeat"),
+			tgbotapi.NewInlineKeyboardButtonData("📂 CWD", "menu:cwd"),
+			tgbotapi.NewInlineKeyboardButtonData("💰 Cost", "menu:cost"),
+		},
+	}
+
+	reply := tgbotapi.NewMessage(msg.Chat.ID, "Pick a command:")
+	reply.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	if _, err := b.api.Send(reply); err != nil {
+		log.Printf("Failed to send command menu: %v", err)
+	}
 }

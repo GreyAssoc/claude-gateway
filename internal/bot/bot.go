@@ -236,6 +236,11 @@ func (b *Bot) Run(ctx context.Context) {
 			b.handlerWg.Wait()
 			return
 		case update := <-updates:
+			// Handle inline keyboard callback queries (e.g. /models selection)
+			if update.CallbackQuery != nil {
+				go b.handleCallbackQuery(ctx, update.CallbackQuery)
+				continue
+			}
 			if update.Message == nil {
 				continue
 			}
@@ -286,6 +291,54 @@ func (b *Bot) handleUpdate(ctx context.Context, msg *tgbotapi.Message) {
 	b.handleMessage(ctx, msg)
 }
 
+// handleCallbackQuery processes inline keyboard button presses.
+func (b *Bot) handleCallbackQuery(_ context.Context, cq *tgbotapi.CallbackQuery) {
+	// Acknowledge the callback to remove the "loading" spinner
+	ack := tgbotapi.NewCallback(cq.ID, "")
+	if _, err := b.api.Request(ack); err != nil {
+		log.Printf("Failed to ack callback query: %v", err)
+	}
+
+	data := cq.Data
+	chatID := cq.Message.Chat.ID
+
+	switch {
+	case strings.HasPrefix(data, "model:"):
+		modelID := strings.TrimPrefix(data, "model:")
+		b.switchOpenCodeModel(chatID, modelID)
+
+		// Delete the keyboard message to keep chat clean
+		del := tgbotapi.NewDeleteMessage(chatID, cq.Message.MessageID)
+		if _, err := b.api.Request(del); err != nil {
+			log.Printf("Failed to delete models keyboard: %v", err)
+		}
+
+	case strings.HasPrefix(data, "menu:"):
+		// Delete the menu message to keep chat clean
+		del := tgbotapi.NewDeleteMessage(chatID, cq.Message.MessageID)
+		if _, err := b.api.Request(del); err != nil {
+			log.Printf("Failed to delete command menu: %v", err)
+		}
+
+		// Synthesize a command message and route it
+		cmd := strings.TrimPrefix(data, "menu:")
+		fakeMsg := &tgbotapi.Message{
+			Chat: cq.Message.Chat,
+			From: cq.From,
+			Text: "/" + cmd,
+		}
+		fakeMsg.Entities = []tgbotapi.MessageEntity{{
+			Type:   "bot_command",
+			Offset: 0,
+			Length: len("/" + cmd),
+		}}
+		b.handleCommand(context.Background(), fakeMsg)
+
+	default:
+		log.Printf("Unknown callback data: %s", data)
+	}
+}
+
 // registerTelegramCommands registers bot commands with Telegram so users
 // get autocomplete in the command menu. Includes both built-in commands
 // and skill commands (skills with a non-empty Command field).
@@ -306,6 +359,7 @@ func (b *Bot) registerTelegramCommands() {
 		{Command: "journalsearch", Description: "Search journal entries"},
 		{Command: "memorieslist", Description: "List curated memories"},
 		{Command: "model", Description: "Show actual API model in use"},
+		{Command: "models", Description: "Switch OpenCode model"},
 		{Command: "memoryforget", Description: "Remove a memory by text match"},
 		{Command: "memorylist", Description: "List memories by category"},
 		{Command: "memoryremember", Description: "Save a memory"},

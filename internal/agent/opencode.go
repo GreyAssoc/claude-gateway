@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -33,11 +34,27 @@ type OpenCodeConfig struct {
 // No sidecar, no WebSocket — pure process spawning.
 type OpenCodeClient struct {
 	cfg     OpenCodeConfig
+	cfgMu   sync.RWMutex // protects cfg.Model for runtime swaps
 	healthy atomic.Bool
 
 	// Track active processes for abort support
 	procs   map[string]*activeProc
 	procsMu sync.Mutex
+}
+
+// SetModel swaps the OpenCode model at runtime (thread-safe).
+func (c *OpenCodeClient) SetModel(model string) {
+	c.cfgMu.Lock()
+	c.cfg.Model = model
+	c.cfgMu.Unlock()
+	log.Printf("OpenCode: model changed to %s", model)
+}
+
+// GetModel returns the current OpenCode model (thread-safe).
+func (c *OpenCodeClient) GetModel() string {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.cfg.Model
 }
 
 // activeProc tracks a running opencode process for a given session.
@@ -103,7 +120,7 @@ func NewOpenCodeClient(cfg OpenCodeConfig) *OpenCodeClient {
 		c.healthy.Store(false)
 	} else {
 		c.healthy.Store(true)
-		log.Printf("OpenCode: backend ready (binary: %s, model: %s)", cfg.Binary, cfg.Model)
+		log.Printf("OpenCode: backend ready (binary: %s, model: %s) [v2-dual-pipe]", cfg.Binary, cfg.Model)
 	}
 
 	return c
@@ -121,7 +138,10 @@ func (c *OpenCodeClient) Ask(ctx context.Context, sessionID, prompt, workDir str
 
 // AskWithOptions sends a prompt with full configuration options.
 func (c *OpenCodeClient) AskWithOptions(ctx context.Context, opts AskOptions) (*Response, error) {
-	args := c.buildArgs(opts.Prompt, opts.SystemPrompt, opts.Model, opts.SessionID, false)
+	args, cleanup := c.buildArgs(opts.Prompt, opts.SystemPrompt, opts.Model, opts.SessionID, false)
+	if cleanup != nil {
+		defer cleanup()
+	}
 
 	workDir := opts.WorkDir
 	if workDir == "" {
@@ -153,7 +173,10 @@ func (c *OpenCodeClient) AskWithOptions(ctx context.Context, opts AskOptions) (*
 
 // AskStreaming sends a prompt and streams progress events.
 func (c *OpenCodeClient) AskStreaming(ctx context.Context, opts AskOptions, onProgress func(StreamEvent)) (*Response, error) {
-	args := c.buildArgs(opts.Prompt, opts.SystemPrompt, opts.Model, opts.SessionID, true)
+	args, cleanup := c.buildArgs(opts.Prompt, opts.SystemPrompt, opts.Model, opts.SessionID, true)
+	if cleanup != nil {
+		defer cleanup()
+	}
 
 	workDir := opts.WorkDir
 	if workDir == "" {
@@ -179,85 +202,128 @@ func (c *OpenCodeClient) AskStreaming(ctx context.Context, opts AskOptions, onPr
 		}()
 	}
 
-	stdout, err := cmd.StdoutPipe()
+	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("opencode stdout pipe: %w", err)
 	}
 
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("opencode stderr pipe: %w", err)
+	}
+
+	// OpenCode hangs if stdin is not closed — it waits for interactive input.
+	cmd.Stdin = strings.NewReader("")
+
+	log.Printf("OpenCode: starting %s %v (dir=%s)", c.cfg.Binary, args, workDir)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("opencode start: %w", err)
 	}
 
-	// Parse streaming JSON events
+	// Parse streaming JSON events from BOTH stdout and stderr.
+	// Different OpenCode versions write events to different fds.
+	var mu sync.Mutex
 	var resultText strings.Builder
 	var totalUsage Usage
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024) // 10MB max line
+	var parseErr error
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
+	// parseLines processes JSON event lines from a reader.
+	parseLines := func(r io.Reader, source string) {
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
 
-		var event opencodeJSONEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			// Not JSON — treat as plain text output
-			log.Printf("OpenCode [raw]: %s", line)
-			resultText.WriteString(line)
-			resultText.WriteString("\n")
-			continue
-		}
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
 
-		switch event.Type {
-		case "text":
-			text := event.Part.Text
-			if text != "" {
-				resultText.WriteString(text)
-				if onProgress != nil {
-					onProgress(StreamEvent{Type: "progress", Text: text})
+			var event opencodeJSONEvent
+			if err := json.Unmarshal([]byte(line), &event); err != nil {
+				// Not JSON — log diagnostic/warning lines
+				log.Printf("OpenCode [%s]: %s", source, line)
+				continue
+			}
+
+			mu.Lock()
+			switch event.Type {
+			case "text":
+				text := event.Part.Text
+				if text != "" {
+					resultText.WriteString(text)
+					mu.Unlock()
+					if onProgress != nil {
+						onProgress(StreamEvent{Type: "progress", Text: text})
+					}
+					continue
 				}
-			}
-		case "tool_use", "tool_call":
-			if onProgress != nil {
-				onProgress(StreamEvent{Type: "progress", Tool: event.Part.Tool, Input: event.Part.Input})
-			}
-		case "step_finish":
-			// Extract usage from step_finish tokens
-			if event.Part.Tokens != nil {
-				totalUsage.InputTokens += event.Part.Tokens.Input
-				totalUsage.OutputTokens += event.Part.Tokens.Output
-			}
-		case "step_start":
-			// ignore
-		case "error":
-			errMsg := ""
-			if event.Error != nil {
-				errMsg = event.Error.Name
-				if event.Error.Data != nil {
-					var d struct{ Message string `json:"message"` }
-					if json.Unmarshal(event.Error.Data, &d) == nil && d.Message != "" {
-						errMsg = d.Message
+			case "tool_use", "tool_call":
+				mu.Unlock()
+				if onProgress != nil {
+					onProgress(StreamEvent{Type: "progress", Tool: event.Part.Tool, Input: event.Part.Input})
+				}
+				continue
+			case "step_finish":
+				if event.Part.Tokens != nil {
+					totalUsage.InputTokens += event.Part.Tokens.Input
+					totalUsage.OutputTokens += event.Part.Tokens.Output
+				}
+			case "step_start":
+				// ignore
+			case "error":
+				errMsg := ""
+				if event.Error != nil {
+					errMsg = event.Error.Name
+					if event.Error.Data != nil {
+						var d struct{ Message string `json:"message"` }
+						if json.Unmarshal(event.Error.Data, &d) == nil && d.Message != "" {
+							errMsg = d.Message
+						}
 					}
 				}
-			}
-			return &Response{Error: errMsg}, fmt.Errorf("opencode error: %s", errMsg)
-		default:
-			// Capture any unrecognized event that has text in part
-			if event.Part.Text != "" {
-				resultText.WriteString(event.Part.Text)
-				if onProgress != nil {
-					onProgress(StreamEvent{Type: "progress", Text: event.Part.Text})
+				parseErr = fmt.Errorf("opencode error: %s", errMsg)
+				resultText.Reset()
+				resultText.WriteString(errMsg)
+			default:
+				if event.Part.Text != "" {
+					resultText.WriteString(event.Part.Text)
+					mu.Unlock()
+					if onProgress != nil {
+						onProgress(StreamEvent{Type: "progress", Text: event.Part.Text})
+					}
+					continue
 				}
 			}
+			mu.Unlock()
 		}
 	}
 
-	if err := cmd.Wait(); err != nil {
-		// If we got output, use it even if exit code is non-zero
+	// Read both pipes concurrently — one might have the events, the other
+	// might have diagnostic output or nothing. This handles both OpenCode
+	// versions that output to stdout vs stderr.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		parseLines(stdoutPipe, "stdout")
+	}()
+	go func() {
+		defer wg.Done()
+		parseLines(stderrPipe, "stderr")
+	}()
+	wg.Wait()
+
+	waitErr := cmd.Wait()
+
+	log.Printf("OpenCode: process finished (exit=%v, resultLen=%d, parseErr=%v)",
+		waitErr, resultText.Len(), parseErr)
+
+	if parseErr != nil {
+		return &Response{Error: resultText.String()}, parseErr
+	}
+
+	if waitErr != nil {
 		if resultText.Len() > 0 {
 			return &Response{
 				Text:      strings.TrimSpace(resultText.String()),
@@ -265,7 +331,7 @@ func (c *OpenCodeClient) AskStreaming(ctx context.Context, opts AskOptions, onPr
 				Usage:     &totalUsage,
 			}, nil
 		}
-		return &Response{Error: stderrBuf.String()}, fmt.Errorf("opencode process: %w", err)
+		return &Response{Error: waitErr.Error()}, fmt.Errorf("opencode process: %w", waitErr)
 	}
 
 	return &Response{
@@ -291,8 +357,8 @@ func (c *OpenCodeClient) RunIsolatedAgent(ctx context.Context, opts RunAgentOpti
 
 	if opts.Model != "" {
 		args = append(args, "--model", opts.Model)
-	} else if c.cfg.Model != "" {
-		args = append(args, "--model", c.cfg.Model)
+	} else if m := c.GetModel(); m != "" {
+		args = append(args, "--model", m)
 	}
 
 	args = append(args, opts.Prompt)
@@ -395,15 +461,18 @@ func (c *OpenCodeClient) Name() string {
 // --- Internal helpers ---
 
 // buildArgs constructs the opencode CLI arguments.
-func (c *OpenCodeClient) buildArgs(prompt, systemPrompt, model, sessionID string, jsonFormat bool) []string {
+// Returns the argument list and an optional cleanup function for temp agent files.
+// The caller MUST call cleanup (if non-nil) when the process finishes.
+func (c *OpenCodeClient) buildArgs(prompt, systemPrompt, model, sessionID string, jsonFormat bool) ([]string, func()) {
 	args := []string{"run"}
 
 	// Always prefer our configured model. The caller may pass a Claude model
 	// name (e.g. "opus") which is meaningless to OpenCode. Only use the
 	// caller's model if it looks like an OpenCode model (contains "/").
+	cfgModel := c.GetModel()
 	switch {
-	case c.cfg.Model != "":
-		args = append(args, "--model", c.cfg.Model)
+	case cfgModel != "":
+		args = append(args, "--model", cfgModel)
 	case model != "" && strings.Contains(model, "/"):
 		args = append(args, "--model", model)
 	}
@@ -418,22 +487,19 @@ func (c *OpenCodeClient) buildArgs(prompt, systemPrompt, model, sessionID string
 	}
 
 	// System prompt via temporary agent if provided
+	var cleanupFn func()
 	if systemPrompt != "" {
 		agentFile, cleanup, err := c.createTempAgent(systemPrompt)
 		if err != nil {
 			log.Printf("OpenCode: failed to create temp agent for system prompt: %v", err)
 		} else {
-			// Note: cleanup must be deferred by the caller — we handle this in execute()
-			// For buildArgs, we just add the flag. The temp file lifecycle is managed by
-			// the caller (AskWithOptions etc.) but for simplicity here, we leak the file
-			// and let the OS clean /tmp. A proper fix would restructure the API.
-			_ = cleanup // caller responsibility
+			cleanupFn = cleanup
 			args = append(args, "--agent", agentFile)
 		}
 	}
 
 	args = append(args, prompt)
-	return args
+	return args, cleanupFn
 }
 
 // execute runs an opencode process and captures output.
@@ -460,6 +526,7 @@ func (c *OpenCodeClient) execute(ctx context.Context, args []string, workDir str
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
+	cmd.Stdin = strings.NewReader("") // prevent OpenCode from waiting for interactive input
 
 	if err := cmd.Run(); err != nil {
 		// If we captured output, return it alongside the error
@@ -492,7 +559,9 @@ func truncate(s string, n int) string {
 func (c *OpenCodeClient) createTempAgent(systemPrompt string) (agentName string, cleanup func(), err error) {
 	dir := c.cfg.AgentDir
 	if dir == "" {
-		dir = filepath.Join(os.TempDir(), "opencode-agents")
+		// Default to the standard OpenCode agents directory so that
+		// `--agent <name>` resolves correctly.
+		dir = filepath.Join(c.cfg.WorkDir, ".opencode", "agents")
 	}
 
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -505,6 +574,15 @@ func (c *OpenCodeClient) createTempAgent(systemPrompt string) (agentName string,
 
 	content := fmt.Sprintf(`---
 description: Gateway system prompt agent
+tools:
+  read: true
+  write: true
+  edit: true
+  bash: true
+  glob: true
+  grep: true
+  webfetch: true
+  websearch: true
 ---
 
 %s`, systemPrompt)
