@@ -20,6 +20,7 @@ import (
 	"github.com/you/claude-gateway/internal/ctxbuilder"
 	"github.com/you/claude-gateway/internal/db"
 	"github.com/you/claude-gateway/internal/cron"
+	"github.com/you/claude-gateway/internal/gworkspace"
 	"github.com/you/claude-gateway/internal/journal"
 	"github.com/you/claude-gateway/internal/memory"
 	"github.com/you/claude-gateway/internal/orchestrator"
@@ -87,6 +88,10 @@ type Bot struct {
 	journal        *journal.Manager
 	profiler       *profile.Profiler
 	agentSyncer    *agentsync.Syncer
+
+	// Google Workspace OAuth service — used by /googleauth and shared with
+	// the sidecar's gog binary via a writable token volume.
+	google *gworkspace.GoogleService
 }
 
 // Option configures optional Bot dependencies.
@@ -150,6 +155,12 @@ func WithProfiler(p *profile.Profiler) Option {
 // WithAgentSyncer sets the agent/command syncer.
 func WithAgentSyncer(s *agentsync.Syncer) Option {
 	return func(b *Bot) { b.agentSyncer = s }
+}
+
+// WithGoogle sets the Google Workspace OAuth service used by /googleauth.
+// The same service writes the token JSON the sidecar's gog binary reads.
+func WithGoogle(g *gworkspace.GoogleService) Option {
+	return func(b *Bot) { b.google = g }
 }
 
 // New creates a new Bot. Optional dependencies are configured via Option functions.

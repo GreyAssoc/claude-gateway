@@ -1,3 +1,20 @@
+# CHANGED 2026-05-09: replaced steipete/gogcli with an in-tree `gog` binary
+# built from /workspace/projects/claude-gateway/cmd/gog/. The previous CLI
+# stored OAuth tokens in an ephemeral container path that was wiped on
+# restart (host mount was read-only). The new binary uses a token JSON file
+# on a Docker volume shared with the gateway, with atomic save on refresh.
+
+# ---------- Stage 1: build the gog Go binary ----------
+FROM golang:1.25-alpine AS gog-builder
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/gog/ ./cmd/gog/
+COPY internal/gworkspace/ ./internal/gworkspace/
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o /out/gog ./cmd/gog && \
+    /out/gog --version
+
+# ---------- Stage 2: sidecar runtime ----------
 FROM node:20-slim
 
 # Install system dependencies
@@ -34,9 +51,9 @@ RUN claude --version || true
 # Also keep the npm CLI for backward compatibility with /run-agent endpoint
 RUN npm install -g @anthropic-ai/claude-code
 
-# Install gog CLI for Google Workspace (Gmail, Calendar, Drive, Sheets)
-RUN curl -fsSL https://github.com/steipete/gogcli/releases/download/v0.11.0/gogcli_0.11.0_linux_amd64.tar.gz \
-    | tar -xz -C /usr/local/bin gog && chmod +x /usr/local/bin/gog
+# CHANGED 2026-05-09: in-tree gog binary instead of `curl` from steipete/gogcli.
+COPY --from=gog-builder /out/gog /usr/local/bin/gog
+RUN chmod +x /usr/local/bin/gog && gog --version
 
 # Install Playwright MCP server + Chromium for web browsing
 RUN npm install -g @playwright/mcp@latest && \
@@ -64,11 +81,14 @@ COPY configs/claude-code-settings.json /root/.config/claude-code/settings.json
 
 EXPOSE 3001
 
-# Copy OAuth creds and gog config from read-only mounts to writable dirs, then start.
-# Settings are copied AFTER OAuth creds to ensure they aren't overwritten.
+# Copy OAuth creds at startup. Token storage for gog lives on a writable
+# volume mounted at /root/.config/gog (docker-compose.yml), shared with the
+# gateway container so OAuth refreshes persist across restarts.
+# CHANGED 2026-05-09: dropped the gogcli-ro keyring copy step; the new gog
+# uses a single token JSON file on a writable volume — no keyring needed.
 CMD ["sh", "-c", "\
   mkdir -p /root/.claude && cp -a /root/.claude-ro/. /root/.claude/ && echo 'Claude OAuth creds copied OK' && \
   cp /root/.config/claude-code/settings.json /root/.claude/settings.json && echo 'Claude Code settings applied' && \
-  if [ -d /root/.config/gogcli-ro ]; then mkdir -p /root/.config/gogcli && cp -a /root/.config/gogcli-ro/. /root/.config/gogcli/ && echo 'gog config copied OK'; fi && \
+  mkdir -p /root/.config/gog && echo 'gog token dir ready' && \
   if [ -d /root/.ssh-ro ]; then mkdir -p /root/.ssh && cp -a /root/.ssh-ro/. /root/.ssh/ && chmod 700 /root/.ssh && chmod 600 /root/.ssh/id_* 2>/dev/null; chmod 644 /root/.ssh/*.pub 2>/dev/null; echo 'SSH keys copied OK'; fi && \
   exec node index.js"]

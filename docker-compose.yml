@@ -22,10 +22,22 @@ services:
       - OPENCODE_MODEL=${OPENCODE_MODEL:-opencode-go/kimi-k2.5}
       # DeepSeek backend — gateway only registers the deepseek backend when this is set.
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      # Google Workspace OAuth (gog). If unset, the gateway falls back to
+      # parsing /root/.config/gog/client_secret.json (mounted from the repo).
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - GOG_TOKEN_PATH=/root/.config/gog/token.json
+      - GOOGLE_CLIENT_SECRET_FILE=/root/.config/gog/client_secret.json
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - gateway-data:/app/data
+      # Google Workspace OAuth state — shared with sidecar so refreshes
+      # persist across restarts. Named volume so it survives `docker compose down`.
+      - gog-tokens:/root/.config/gog
+      # Google OAuth client_secret JSON (read-only). Used as a fallback when
+      # GOOGLE_CLIENT_ID/SECRET env vars aren't set.
+      - ./client_secret_482559817561-37gh7itjpjkdq11m0t2n7in4kon6pul4.apps.googleusercontent.com.json:/root/.config/gog/client_secret.json:ro
       - ${WORK_DIR}/.claude/skills:/app/skills:ro
       - ./memory:/app/memory
       - ./configs:/app/configs
@@ -55,10 +67,15 @@ services:
       # Without this, Node.js may attempt IPv6 first, stall for 10-60s, then
       # fall back to IPv4.
       - NODE_OPTIONS=--dns-result-order=ipv4first
-      # gog CLI for Google Workspace access (Gmail, Calendar, Drive, Sheets)
+      # gog CLI for Google Workspace (Gmail, Calendar, Drive, Sheets)
+      # CHANGED 2026-05-09: token storage moved from a keyring (lost on
+      # restart) to a JSON file on a shared volume. No password / keyring
+      # backend env vars needed any more — auth is via the gateway's
+      # /googleauth Telegram command.
       - GOG_ACCOUNT=steve.w@greyandassociates.co.uk
-      - GOG_KEYRING_BACKEND=file
-      - GOG_KEYRING_PASSWORD=${GOG_KEYRING_PASSWORD}
+      - GOG_TOKEN_PATH=/root/.config/gog/token.json
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       # Gemini API key (for SoC audio transcription)
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       # DeepSeek API key — used when a request carries provider="deepseek".
@@ -72,8 +89,12 @@ services:
       - /home/stevew/grey-unraid/clients-past:/clients/past:ro
       # Claude OAuth credentials — mounted read-only, copied to writable /root/.claude at startup
       - ${CLAUDE_CONFIG_DIR}:/root/.claude-ro:ro
-      # gog CLI config & keyring (read-only, copied to writable dir at startup)
-      - ${HOME}/.config/gogcli:/root/.config/gogcli-ro:ro
+      # Google Workspace OAuth state — same named volume the gateway writes to.
+      # CHANGED 2026-05-09: was ${HOME}/.config/gogcli (read-only, lost refreshes).
+      - gog-tokens:/root/.config/gog
+      # OAuth client_secret JSON (read-only). The gog binary loads it as a
+      # fallback when GOOGLE_CLIENT_ID/SECRET env vars aren't set.
+      - ./client_secret_482559817561-37gh7itjpjkdq11m0t2n7in4kon6pul4.apps.googleusercontent.com.json:/root/.config/gog/client_secret.json:ro
       # SSH keys (read-only, copied to writable /root/.ssh at startup)
       - ${HOME}/.ssh:/root/.ssh-ro:ro
       # CUPS printing (host printer access via socket)
@@ -96,3 +117,6 @@ services:
 
 volumes:
   gateway-data:
+  # Google Workspace OAuth tokens — written by gateway (/googleauth) and
+  # read+refreshed by the sidecar's gog binary. Named so it survives `down`.
+  gog-tokens:

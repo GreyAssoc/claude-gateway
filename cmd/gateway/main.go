@@ -20,6 +20,7 @@ import (
 	"github.com/you/claude-gateway/internal/ctxbuilder"
 	"github.com/you/claude-gateway/internal/dashboard"
 	"github.com/you/claude-gateway/internal/db"
+	"github.com/you/claude-gateway/internal/gworkspace"
 	"github.com/you/claude-gateway/internal/journal"
 	"github.com/you/claude-gateway/internal/memory"
 	"github.com/you/claude-gateway/internal/ollama"
@@ -194,6 +195,19 @@ func main() {
 	// --- Orchestrator Engine ---
 	orchEngine := orchestrator.NewEngine(database, agentClient, cfg.Orchestrator.AgentDNADir, cfg.WorkDir, cfg.Orchestrator.Timeout)
 
+	// --- Google Workspace OAuth service ---
+	// Shared with the sidecar's `gog` binary via a Docker volume mounted at
+	// /root/.config/gog. Credentials come from env first; if unset, we fall
+	// back to parsing /root/.config/gog/client_secret.json (mounted from the
+	// repo). Failure to construct is non-fatal — /googleauth will tell the
+	// user what's missing.
+	googleSvc, googleErr := buildGoogleService()
+	if googleErr != nil {
+		log.Printf("Google Workspace: not initialised (%v) — /googleauth will be unavailable until env or client_secret.json is fixed", googleErr)
+	} else {
+		log.Printf("Google Workspace: %s", googleSvc.Status())
+	}
+
 	// --- Telegram Bot ---
 	tgBot, err := bot.New(cfg, agentClient, limiter, database,
 		bot.WithSkillsManager(skillsMgr),
@@ -206,6 +220,7 @@ func main() {
 		bot.WithJournal(journalMgr),
 		bot.WithProfiler(profiler),
 		bot.WithAgentSyncer(agentSyncer),
+		bot.WithGoogle(googleSvc),
 		bot.WithSystemPromptBuilder(func(ctx context.Context) string {
 			// Legacy fallback — used only when contextBuilder is nil
 			var parts []string
@@ -624,4 +639,43 @@ Return ONLY the summary text, no JSON, no markdown headers.`
 	} else {
 		log.Printf("Profile doc sync: condensed %s → aspect %s (%d chars)", key, aspectName, len(summary))
 	}
+}
+
+// buildGoogleService constructs the Google OAuth service used by /googleauth.
+// Credential resolution order:
+//  1. GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET environment variables.
+//  2. JSON file at GOOGLE_CLIENT_SECRET_FILE (default /root/.config/gog/client_secret.json).
+//
+// Token storage: GOG_TOKEN_PATH (default /root/.config/gog/token.json) — must be
+// on a Docker volume shared with the sidecar so refreshes persist across restarts.
+func buildGoogleService() (*gworkspace.GoogleService, error) {
+	clientID := os.Getenv("GOOGLE_CLIENT_ID")
+	clientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
+
+	if clientID == "" || clientSecret == "" {
+		jsonPath := os.Getenv("GOOGLE_CLIENT_SECRET_FILE")
+		if jsonPath == "" {
+			jsonPath = "/root/.config/gog/client_secret.json"
+		}
+		id, secret, err := gworkspace.LoadClientCredentialsJSON(jsonPath)
+		if err != nil {
+			return nil, fmt.Errorf("no GOOGLE_CLIENT_ID/SECRET in env and %s unreadable: %w", jsonPath, err)
+		}
+		clientID = id
+		clientSecret = secret
+	}
+
+	tokenPath := os.Getenv("GOG_TOKEN_PATH")
+	if tokenPath == "" {
+		tokenPath = "/root/.config/gog/token.json"
+	}
+	if err := gworkspace.EnsureTokenDir(tokenPath); err != nil {
+		return nil, fmt.Errorf("cannot create token dir: %w", err)
+	}
+
+	return gworkspace.NewGoogleService(gworkspace.GoogleConfig{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		TokenPath:    tokenPath,
+	})
 }

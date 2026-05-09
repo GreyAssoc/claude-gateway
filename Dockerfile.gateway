@@ -1,5 +1,7 @@
 # Build stage
-FROM golang:1.22-alpine AS builder
+# CHANGED 2026-05-09: bumped from golang:1.22-alpine to 1.25-alpine because
+# golang.org/x/oauth2 (added for the in-tree gog port) requires Go ≥ 1.25.
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /build
 

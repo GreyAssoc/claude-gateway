@@ -62,7 +62,9 @@ psql "$POSTGRES_URL" -c "\d tablename" # Describe table
 
 ## Google Workspace (gog CLI)
 
-Use the **Bash tool** to run `gog` commands for Google Workspace access (Gmail, Calendar, Drive, Sheets). Auth is pre-configured for `steve.w@greyandassociates.co.uk` — no setup needed, just run the commands.
+Use the **Bash tool** to run `gog` commands for Google Workspace access (Gmail, Calendar, Drive, Sheets). The `gog` binary is built in-tree (cmd/gog/) and authenticates via a token JSON file at `/root/.config/gog/token.json` on a Docker volume shared with the gateway. Auth is pre-configured for `steve.w@greyandassociates.co.uk` — no setup needed, just run the commands.
+
+**If `gog` reports "not authenticated"** (e.g. after a fresh deploy or revoked token): tell Steve to run `/googleauth` in Telegram, follow the URL, and paste the resulting code back as `/googleauth <code>`. The token is then auto-refreshed on every API call and atomically saved on rotation, so this should rarely be needed.
 
 ### Gmail
 

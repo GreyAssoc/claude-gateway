@@ -35,6 +35,7 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 			"/cronlist — list scheduled jobs\n" +
 			"/dbcheck — check PostgreSQL conversations\n" +
 			"/framework [name] — show/switch AI framework\n" +
+			"/googleauth [code|status] — Google Workspace OAuth\n" +
 			"/journal — view daily journal\n" +
 			"/journalsearch — search journal entries\n" +
 			"/memorieslist — list curated memories\n" +
@@ -97,6 +98,8 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		b.handleDBCheck(ctx, msg)
 	case "framework":
 		b.handleFramework(ctx, msg)
+	case "googleauth":
+		b.handleGoogleAuth(ctx, msg)
 	case "gauntlet":
 		b.handleGauntlet(ctx, msg)
 	case "journal":
