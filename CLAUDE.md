@@ -105,6 +105,30 @@ make restart        # Restart everything
 - `configs/gateway.yaml` — Cron, watchers, rate limits, memory
 - `memory/bootstrap/*.md` — Static context injected into every Claude request
 
+## Auto-compaction
+
+The sidecar tracks per-session context utilisation on every `/ask` result
+(`input + cache_read + cache_creation` against the model's window). When
+usage crosses `COMPACT_THRESHOLD` (default 0.80), the currently-active
+provider's model writes a markdown bullet summary of the conversation,
+the SDK resume id is dropped, and the summary is queued as the seed
+prompt for the next `/ask` — the user sees one notification line and
+continues without losing thread.
+
+| Surface | Behaviour |
+|---|---|
+| Threshold | `COMPACT_THRESHOLD` env (default `0.80`) |
+| Summary writer | The currently-active provider/model (so DeepSeek summarises DeepSeek sessions, etc.) |
+| Old SDK session | Discarded from the sidecar's in-memory map; superseded summary persisted to `session_compactions` table for memory retrieval |
+| Notification | One-line Telegram message ("🗜 Conversation auto-compacted at 82% of context window. Fresh session seeded with summary; continue normally.") |
+| Manual trigger | `/compact` Telegram command — same flow, ignores threshold |
+| Disable | Set `COMPACT_THRESHOLD=2.0` (effectively unreachable) |
+
+Implementation: `sidecar/index.js` (runCompaction, handleCompact, pendingSeed),
+gateway side: `internal/agent/claude.go` (CompactSession),
+`internal/bot/commands.go` (`/compact` handler, `handleCompactionEvent`),
+`internal/db` (migration v6: `session_compactions`).
+
 ## Multi-provider via Anthropic-compatible endpoints
 
 The single sidecar can route requests to providers other than native Claude

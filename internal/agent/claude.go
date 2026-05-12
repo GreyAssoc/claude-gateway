@@ -29,12 +29,41 @@ type Usage struct {
 
 // Response is what the sidecar returns.
 type Response struct {
-	Text          string `json:"text"`
-	SessionID     string `json:"session_id"`
-	Model         string `json:"api_model,omitempty"`
-	Usage         *Usage `json:"usage,omitempty"`
-	Error         string `json:"error,omitempty"`
-	IsRateLimited bool   `json:"is_rate_limited,omitempty"`
+	Text          string         `json:"text"`
+	SessionID     string         `json:"session_id"`
+	Model         string         `json:"api_model,omitempty"`
+	Usage         *Usage         `json:"usage,omitempty"`
+	Context       *ContextStatus `json:"context,omitempty"`
+	Compaction    *Compaction    `json:"compaction,omitempty"`
+	Error         string         `json:"error,omitempty"`
+	IsRateLimited bool           `json:"is_rate_limited,omitempty"`
+}
+
+// ContextStatus reports the session's per-turn context utilisation.
+// Populated on every successful /ask result.
+type ContextStatus struct {
+	TokensUsed     int `json:"tokens_used"`
+	ContextWindow  int `json:"context_window"`
+	UsageRatioPct  int `json:"usage_ratio_pct"`
+}
+
+// Compaction is metadata about an auto- or manual-compaction event.
+// Present only on Responses where the sidecar actually compacted the
+// active session. The summary is the model-written digest seeded into
+// the next fresh SDK session as its first user message.
+type Compaction struct {
+	Triggered       bool   `json:"triggered"`
+	OK              bool   `json:"ok"`
+	Reason          string `json:"reason"`           // e.g. "threshold_80pct", "manual"
+	TriggeredBy     string `json:"triggered_by"`     // "auto" | "manual"
+	Summary         string `json:"summary,omitempty"`
+	OldSDKSessionID string `json:"old_sdk_session_id,omitempty"`
+	UsageRatioPct   int    `json:"usage_ratio_pct,omitempty"`
+	ContextWindow   int    `json:"context_window,omitempty"`
+	TokensAtTrigger int    `json:"tokens_at_trigger,omitempty"`
+	Provider        string `json:"provider,omitempty"`
+	Model           string `json:"model,omitempty"`
+	Error           string `json:"error,omitempty"`
 }
 
 // AskOptions configures a request to the sidecar.
@@ -89,16 +118,19 @@ type wsRequest struct {
 
 // wsResponse is the JSON message received from the sidecar via WebSocket.
 type wsResponse struct {
-	ID            string `json:"id"`
-	Type          string `json:"type"`
-	Tool          string `json:"tool,omitempty"`
-	Input         string `json:"input,omitempty"`
-	Text          string `json:"text,omitempty"`
-	SessionID     string `json:"session_id,omitempty"`
-	APIModel      string `json:"api_model,omitempty"`
-	Usage         *Usage `json:"usage,omitempty"`
-	Error         string `json:"error,omitempty"`
-	IsRateLimited bool   `json:"is_rate_limited,omitempty"`
+	ID            string         `json:"id"`
+	Type          string         `json:"type"`
+	Tool          string         `json:"tool,omitempty"`
+	Input         string         `json:"input,omitempty"`
+	Text          string         `json:"text,omitempty"`
+	SessionID     string         `json:"session_id,omitempty"`
+	APIModel      string         `json:"api_model,omitempty"`
+	Usage         *Usage         `json:"usage,omitempty"`
+	Context       *ContextStatus `json:"context,omitempty"`
+	Compaction    *Compaction    `json:"compaction,omitempty"`
+	OK            *bool          `json:"ok,omitempty"`
+	Error         string         `json:"error,omitempty"`
+	IsRateLimited bool           `json:"is_rate_limited,omitempty"`
 	// Session detection fields (from check-session response)
 	Alive        bool   `json:"alive,omitempty"`
 	SDKSessionID string `json:"sdk_session_id,omitempty"`
@@ -295,10 +327,12 @@ func (c *Client) AskWithOptions(ctx context.Context, opts AskOptions) (*Response
 			switch resp.Type {
 			case "result":
 				r := &Response{
-					Text:      resp.Text,
-					SessionID: opts.SessionID,
-					Model:     resp.APIModel,
-					Usage:     resp.Usage,
+					Text:       resp.Text,
+					SessionID:  opts.SessionID,
+					Model:      resp.APIModel,
+					Usage:      resp.Usage,
+					Context:    resp.Context,
+					Compaction: resp.Compaction,
 				}
 				if resp.Error != "" {
 					return r, fmt.Errorf("claude error: %s", resp.Error)
@@ -362,10 +396,12 @@ func (c *Client) AskStreaming(ctx context.Context, opts AskOptions, onProgress f
 				// Keepalive from sidecar — ignore
 			case "result":
 				return &Response{
-					Text:      resp.Text,
-					SessionID: opts.SessionID,
-					Model:     resp.APIModel,
-					Usage:     resp.Usage,
+					Text:       resp.Text,
+					SessionID:  opts.SessionID,
+					Model:      resp.APIModel,
+					Usage:      resp.Usage,
+					Context:    resp.Context,
+					Compaction: resp.Compaction,
 				}, nil
 			case "error":
 				r := &Response{IsRateLimited: resp.IsRateLimited, Error: resp.Error}
@@ -466,6 +502,46 @@ func (c *Client) ResetSession(ctx context.Context, sessionID string) error {
 			return fmt.Errorf("reset error: %s", resp.Error)
 		}
 		return nil
+	}
+}
+
+// CompactSession asks the sidecar to summarise the active session and
+// queue the summary as the seed of a new fresh SDK session. This is the
+// manual-trigger path (the auto path runs inline inside AskStreaming
+// when the threshold is crossed).
+//
+// Returns the resulting Compaction metadata, including the summary text,
+// so the caller can surface it to the user. A nil Compaction return
+// with no error means there was nothing to compact (no active session).
+func (c *Client) CompactSession(ctx context.Context, sessionID string) (*Compaction, error) {
+	id := c.genID()
+	ch := c.allocReq(id)
+	defer c.freeReq(id)
+
+	req := wsRequest{
+		ID:        id,
+		Type:      "compact",
+		SessionID: c.wireSessionID(sessionID),
+		Provider:  c.provider,
+	}
+
+	if err := c.writeJSONRetry(req); err != nil {
+		return nil, fmt.Errorf("send compact request: %w", err)
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp := <-ch:
+		if resp.Type == "error" {
+			return nil, fmt.Errorf("compact error: %s", resp.Error)
+		}
+		// compact-result carries the Compaction payload (or an error description)
+		if resp.Compaction != nil {
+			return resp.Compaction, nil
+		}
+		// No compaction metadata (e.g. session didn't exist). Surface as nil.
+		return nil, nil
 	}
 }
 

@@ -12,11 +12,59 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"github.com/you/claude-gateway/internal/agent"
+	"github.com/you/claude-gateway/internal/db"
 	"github.com/you/claude-gateway/internal/format"
 	"github.com/you/claude-gateway/internal/orchestrator"
 	"github.com/you/claude-gateway/internal/pgdb"
 	"github.com/you/claude-gateway/internal/skills"
 )
+
+// handleCompactionEvent surfaces an auto- or manual-compaction event to
+// the user and persists it for later memory retrieval. Best-effort: a
+// failure to notify or persist must not break the live chat path.
+func (b *Bot) handleCompactionEvent(chatID int64, sessionID string, c *agent.Compaction) {
+	if c == nil {
+		return
+	}
+
+	// Telegram notification — Claude-Code-style auto-compact line.
+	var sb strings.Builder
+	if c.TriggeredBy == "manual" {
+		sb.WriteString("🗜 *Compacted on request.* ")
+	} else {
+		sb.WriteString("🗜 *Conversation auto-compacted")
+		if c.UsageRatioPct > 0 {
+			sb.WriteString(fmt.Sprintf(" at %d%% of context window", c.UsageRatioPct))
+		}
+		sb.WriteString(".* ")
+	}
+	sb.WriteString("Fresh session seeded with summary; continue normally.")
+	notice := sb.String()
+	if _, err := b.api.Send(tgbotapi.NewMessage(chatID, notice)); err != nil {
+		log.Printf("Compaction notice send failed: %v", err)
+	}
+
+	if b.database == nil {
+		return
+	}
+
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dbCancel()
+	if err := b.database.RecordCompaction(dbCtx, db.CompactionRecord{
+		SessionID:       sessionID,
+		OldSDKSessionID: c.OldSDKSessionID,
+		Summary:         c.Summary,
+		Reason:          c.Reason,
+		TriggeredBy:     c.TriggeredBy,
+		UsageRatioPct:   c.UsageRatioPct,
+		ContextWindow:   c.ContextWindow,
+		TokensAtTrigger: c.TokensAtTrigger,
+		Provider:        c.Provider,
+		Model:           c.Model,
+	}); err != nil {
+		log.Printf("Failed to record compaction: %v", err)
+	}
+}
 
 func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 	switch msg.Command() {
@@ -51,6 +99,7 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 			"/profile — view user profile\n" +
 			"/profiledel — delete profile aspect\n" +
 			"/profileset — set profile aspect\n" +
+			"/compact — summarise session and start fresh (preserves context)\n" +
 			"/reset — clear conversation session\n" +
 			"/reviewauto [dir] — auto-detect language and review\n" +
 			"/reviewautosec [dir] — auto-detect with security focus\n" +
@@ -136,6 +185,8 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		b.handleDelProfile(ctx, msg)
 	case "profileset":
 		b.handleSetProfile(ctx, msg)
+	case "compact":
+		b.handleCompact(ctx, msg)
 	case "reset":
 		b.handleReset(ctx, msg)
 	case "reviewauto":
@@ -670,6 +721,13 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 
 	b.sendLongMessage(msg.Chat.ID, text)
 
+	// Auto-compaction notice: if the sidecar compacted this turn,
+	// surface a Claude-Code-style notification to the user and persist
+	// the event so the memory module can recall the summary later.
+	if resp.Compaction != nil && resp.Compaction.Triggered && resp.Compaction.OK {
+		b.handleCompactionEvent(msg.Chat.ID, sessionID, resp.Compaction)
+	}
+
 	// Post-process: record exchange to PostgreSQL for persistent memory.
 	// Save synchronously (fast DB inserts, no embedding) so the next
 	// message's BuildEnrichedPrompt always sees these turns. Embedding
@@ -774,6 +832,36 @@ func (b *Bot) handleReset(ctx context.Context, msg *tgbotapi.Message) {
 	b.sessionsMu.Unlock()
 
 	b.sendMessage(msg.Chat.ID, "Session cleared. Fresh start.")
+}
+
+// handleCompact runs a manual session compaction: the active model
+// summarises the session, the summary becomes the seed of a fresh
+// session, and the user is notified. Unlike /reset, prior context is
+// preserved (as a summary) rather than discarded.
+func (b *Bot) handleCompact(ctx context.Context, msg *tgbotapi.Message) {
+	sessionID := fmt.Sprintf("tg-%d", msg.Chat.ID)
+	b.sendMessage(msg.Chat.ID, "🗜 Summarising conversation and preparing fresh session…")
+
+	c, err := b.agent.CompactSession(ctx, sessionID)
+	if err != nil {
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Compact failed: %v", err))
+		return
+	}
+	if c == nil {
+		b.sendMessage(msg.Chat.ID, "Nothing to compact — no active session.")
+		return
+	}
+	if !c.OK {
+		errMsg := c.Error
+		if errMsg == "" {
+			errMsg = "unknown error"
+		}
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Compact failed: %s", errMsg))
+		return
+	}
+
+	// Reuse the shared notify+persist path.
+	b.handleCompactionEvent(msg.Chat.ID, sessionID, c)
 }
 
 func (b *Bot) handleStop(msg *tgbotapi.Message) {

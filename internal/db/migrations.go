@@ -176,6 +176,28 @@ var migrations = []migration{
 			CREATE INDEX IF NOT EXISTS idx_ov_run ON orchestrator_verdicts(run_id);
 		`,
 	},
+	{
+		version: 6,
+		name:    "session_compactions",
+		sql: `
+			CREATE TABLE IF NOT EXISTS session_compactions (
+				id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+				session_id           TEXT NOT NULL,
+				old_sdk_session_id   TEXT,
+				summary              TEXT NOT NULL,
+				reason               TEXT NOT NULL,           -- 'threshold_80pct', 'manual', etc.
+				triggered_by         TEXT NOT NULL DEFAULT 'auto', -- 'auto' | 'manual'
+				usage_ratio_pct      INTEGER NOT NULL DEFAULT 0,   -- 0..100
+				context_window       INTEGER NOT NULL DEFAULT 0,
+				tokens_at_trigger    INTEGER NOT NULL DEFAULT 0,
+				provider             TEXT,
+				model                TEXT,
+				created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+			CREATE INDEX IF NOT EXISTS idx_sc_session   ON session_compactions(session_id);
+			CREATE INDEX IF NOT EXISTS idx_sc_created   ON session_compactions(created_at);
+		`,
+	},
 }
 
 // migrate runs all pending migrations in order.

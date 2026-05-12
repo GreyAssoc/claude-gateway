@@ -118,6 +118,10 @@ func (s *Switcher) CheckSession(ctx context.Context, sessionID string) (*Session
 	return s.get().CheckSession(ctx, sessionID)
 }
 
+func (s *Switcher) CompactSession(ctx context.Context, sessionID string) (*Compaction, error) {
+	return s.get().CompactSession(ctx, sessionID)
+}
+
 func (s *Switcher) Health(ctx context.Context) error {
 	return s.get().Health(ctx)
 }

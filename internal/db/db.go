@@ -174,6 +174,109 @@ func (d *DB) RecordSession(ctx context.Context, sessionID, source, prompt string
 	return nil
 }
 
+// CompactionRecord is a row in the session_compactions table.
+//
+// Each row is one auto- or manual-compaction event: the running token
+// total crossed the threshold, the active model wrote a summary of the
+// conversation, and a fresh SDK session was started seeded with that
+// summary. The row records everything needed to replay or recall the
+// superseded chunk.
+type CompactionRecord struct {
+	ID               int64
+	SessionID        string
+	OldSDKSessionID  string
+	Summary          string
+	Reason           string
+	TriggeredBy      string
+	UsageRatioPct    int
+	ContextWindow    int
+	TokensAtTrigger  int
+	Provider         string
+	Model            string
+	CreatedAt        string
+}
+
+// RecordCompaction persists a session-compaction event. SessionID is the
+// gateway-side logical session id (typically tg-<chat_id>). The summary
+// is the model-written digest seeded into the next fresh SDK session.
+func (d *DB) RecordCompaction(ctx context.Context, r CompactionRecord) error {
+	_, err := d.ExecContext(ctx,
+		`INSERT INTO session_compactions (
+			session_id, old_sdk_session_id, summary, reason, triggered_by,
+			usage_ratio_pct, context_window, tokens_at_trigger,
+			provider, model, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+		r.SessionID, r.OldSDKSessionID, r.Summary, r.Reason, r.TriggeredBy,
+		r.UsageRatioPct, r.ContextWindow, r.TokensAtTrigger,
+		r.Provider, r.Model,
+	)
+	if err != nil {
+		return fmt.Errorf("record compaction: %w", err)
+	}
+	return nil
+}
+
+// RecentCompactions returns the most recent compaction rows across all
+// sessions. The memory module uses this to surface "what we summarised
+// recently" as searchable historical context.
+func (d *DB) RecentCompactions(ctx context.Context, limit int) ([]CompactionRecord, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := d.QueryContext(ctx,
+		`SELECT id, session_id, COALESCE(old_sdk_session_id, ''), summary, reason,
+		        triggered_by, usage_ratio_pct, context_window, tokens_at_trigger,
+		        COALESCE(provider, ''), COALESCE(model, ''), created_at
+		 FROM session_compactions
+		 ORDER BY id DESC
+		 LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("recent compactions: %w", err)
+	}
+	defer rows.Close()
+	var out []CompactionRecord
+	for rows.Next() {
+		var r CompactionRecord
+		if err := rows.Scan(&r.ID, &r.SessionID, &r.OldSDKSessionID, &r.Summary, &r.Reason,
+			&r.TriggeredBy, &r.UsageRatioPct, &r.ContextWindow, &r.TokensAtTrigger,
+			&r.Provider, &r.Model, &r.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan compaction row: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// CompactionsForSession returns the chronological compaction history of
+// one logical session (oldest first). Useful when stitching a long
+// conversation back together for replay or audit.
+func (d *DB) CompactionsForSession(ctx context.Context, sessionID string) ([]CompactionRecord, error) {
+	rows, err := d.QueryContext(ctx,
+		`SELECT id, session_id, COALESCE(old_sdk_session_id, ''), summary, reason,
+		        triggered_by, usage_ratio_pct, context_window, tokens_at_trigger,
+		        COALESCE(provider, ''), COALESCE(model, ''), created_at
+		 FROM session_compactions
+		 WHERE session_id = ?
+		 ORDER BY id ASC`, sessionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("compactions for session: %w", err)
+	}
+	defer rows.Close()
+	var out []CompactionRecord
+	for rows.Next() {
+		var r CompactionRecord
+		if err := rows.Scan(&r.ID, &r.SessionID, &r.OldSDKSessionID, &r.Summary, &r.Reason,
+			&r.TriggeredBy, &r.UsageRatioPct, &r.ContextWindow, &r.TokensAtTrigger,
+			&r.Provider, &r.Model, &r.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan compaction row: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // RecordRateLimitSnapshot writes a rate limit window snapshot.
 func (d *DB) RecordRateLimitSnapshot(ctx context.Context, requests, inputTokens, outputTokens int, headroom float64) error {
 	_, err := d.ExecContext(ctx,

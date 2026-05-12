@@ -32,6 +32,14 @@ type Backend interface {
 	// CheckSession checks if a session is alive.
 	CheckSession(ctx context.Context, sessionID string) (*SessionStatus, error)
 
+	// CompactSession asks the backend to summarise the active session and
+	// start a fresh one seeded with that summary. Manual trigger; the
+	// auto trigger lives inside Ask/AskStreaming (sidecar threshold).
+	// Returns the Compaction metadata, or nil if nothing was compacted
+	// (e.g. session not present). Backends that don't implement
+	// compaction may return (nil, nil) to indicate a silent no-op.
+	CompactSession(ctx context.Context, sessionID string) (*Compaction, error)
+
 	// Health checks if the backend is responding.
 	Health(ctx context.Context) error
 

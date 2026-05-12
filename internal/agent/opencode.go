@@ -411,6 +411,14 @@ func (c *OpenCodeClient) ResetSession(_ context.Context, sessionID string) error
 	return nil
 }
 
+// CompactSession is a no-op for OpenCode — each run is isolated, so
+// there is no in-process state to summarise. Returns (nil, nil) to
+// indicate a silent no-op per the Backend interface contract.
+func (c *OpenCodeClient) CompactSession(_ context.Context, sessionID string) (*Compaction, error) {
+	log.Printf("OpenCode: compact session %s (no-op, process-based)", sessionID)
+	return nil, nil
+}
+
 // CheckSession returns a synthetic status. OpenCode sessions are process-based,
 // so a session is "alive" only while a process is running.
 func (c *OpenCodeClient) CheckSession(_ context.Context, sessionID string) (*SessionStatus, error) {
