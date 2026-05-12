@@ -540,9 +540,10 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		}
 	}
 
-	// Per-request timeout: 30 minutes balances complex multi-file tasks
-	// against semaphore slot exhaustion from stuck requests.
-	reqCtx, reqCancel := context.WithTimeout(ctx, 30*time.Minute)
+	// Per-request timeout: 60 minutes accommodates full pipeline tests
+	// and long multi-file tasks while still capping stuck requests so
+	// they release their semaphore slot eventually.
+	reqCtx, reqCancel := context.WithTimeout(ctx, 60*time.Minute)
 	defer reqCancel()
 
 	// Register cancel so /stop can interrupt this request.
