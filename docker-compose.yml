@@ -37,7 +37,7 @@ services:
       - gog-tokens:/root/.config/gog
       # Google OAuth client_secret JSON (read-only). Used as a fallback when
       # GOOGLE_CLIENT_ID/SECRET env vars aren't set.
-      - ./client_secret_482559817561-37gh7itjpjkdq11m0t2n7in4kon6pul4.apps.googleusercontent.com.json:/root/.config/gog/client_secret.json:ro
+      - ./client_secret.json:/root/.config/gog/client_secret.json:ro
       - ${WORK_DIR}/.claude/skills:/app/skills:ro
       - ./memory:/app/memory
       - ./configs:/app/configs
@@ -81,6 +81,10 @@ services:
       # DeepSeek API key — used when a request carries provider="deepseek".
       # The sidecar injects this as ANTHROPIC_AUTH_TOKEN for that subprocess only.
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      # grey-docs scripts have a guard that refuses direct execution unless
+      # they're invoked via an MCP server. No grey-docs MCP server exists, so
+      # we override the guard here. Revisit when a real MCP server is built.
+      - GREY_DOCS_ALLOW_DIRECT=1
     volumes:
       # Host workspace — mounted so Claude Code can read/write project files
       - ${WORK_DIR}:/workspace
@@ -94,7 +98,7 @@ services:
       - gog-tokens:/root/.config/gog
       # OAuth client_secret JSON (read-only). The gog binary loads it as a
       # fallback when GOOGLE_CLIENT_ID/SECRET env vars aren't set.
-      - ./client_secret_482559817561-37gh7itjpjkdq11m0t2n7in4kon6pul4.apps.googleusercontent.com.json:/root/.config/gog/client_secret.json:ro
+      - ./client_secret.json:/root/.config/gog/client_secret.json:ro
       # SSH keys (read-only, copied to writable /root/.ssh at startup)
       - ${HOME}/.ssh:/root/.ssh-ro:ro
       # CUPS printing (host printer access via socket)
