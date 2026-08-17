@@ -765,7 +765,7 @@ func (c *Client) readLoop(conn *websocket.Conn) {
 			switch resp.Type {
 			case "result", "error":
 				// Terminal events must never be dropped — if dropped, the caller
-				// hangs until the 60-minute context timeout. Use blocking send.
+				// hangs until the per-request context timeout (120 min). Use blocking send.
 				req.ch <- resp
 			default:
 				// Non-terminal events (progress, heartbeat) can be safely dropped.

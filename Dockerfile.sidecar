@@ -51,6 +51,16 @@ RUN claude --version || true
 # Also keep the npm CLI for backward compatibility with /run-agent endpoint
 RUN npm install -g @anthropic-ai/claude-code
 
+# Grok Build CLI — SuperGrok / X Premium+ subscription login (not the API).
+# Binary is copied to /usr/local/bin so a runtime volume on /root/.grok
+# (auth.json) does not hide the installed CLI.
+RUN curl -fsSL https://x.ai/cli/install.sh | bash \
+ && REAL="$(readlink -f /root/.grok/bin/grok)" \
+ && rm -f /usr/local/bin/grok /usr/local/bin/agent \
+ && cp "$REAL" /usr/local/bin/grok \
+ && chmod +x /usr/local/bin/grok \
+ && grok --version
+
 # CHANGED 2026-05-09: in-tree gog binary instead of `curl` from steipete/gogcli.
 COPY --from=gog-builder /out/gog /usr/local/bin/gog
 RUN chmod +x /usr/local/bin/gog && gog --version
@@ -87,6 +97,7 @@ EXPOSE 3001
 # CHANGED 2026-05-09: dropped the gogcli-ro keyring copy step; the new gog
 # uses a single token JSON file on a writable volume — no keyring needed.
 CMD ["sh", "-c", "\
+  mkdir -p /root/.grok && echo 'grok home ready' && \
   mkdir -p /root/.claude && cp -a /root/.claude-ro/. /root/.claude/ && echo 'Claude OAuth creds copied OK' && \
   cp /root/.config/claude-code/settings.json /root/.claude/settings.json && echo 'Claude Code settings applied' && \
   mkdir -p /root/.config/gog && echo 'gog token dir ready' && \

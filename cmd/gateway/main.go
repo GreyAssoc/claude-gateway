@@ -102,6 +102,14 @@ func main() {
 		log.Println("DeepSeek backend registered (provider=deepseek)")
 	}
 
+	// Grok backend — SuperGrok subscription via Grok Build CLI in the sidecar
+	// (`grok login --device-auth`, tokens in ~/.grok/auth.json). Always
+	// registered; first use without a login tells the user to send /grokauth.
+	// This is NOT the pay-per-token XAI_API_KEY path.
+	grokBackend := agent.NewClientWithProvider("grok", "grok", cfg.Sidecar.URL, timeout)
+	backends = append(backends, grokBackend)
+	log.Println("Grok backend registered (SuperGrok / Grok Build CLI)")
+
 	// OpenCode backend — always initialized if binary is available.
 	opencodeBackend := agent.NewOpenCodeClient(agent.OpenCodeConfig{
 		Binary:   cfg.OpenCode.Binary,

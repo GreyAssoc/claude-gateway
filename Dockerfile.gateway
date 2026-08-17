@@ -30,7 +30,7 @@ RUN apk add --no-cache nodejs npm \
 # Runtime stage
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata postgresql-client libstdc++ libgcc
+RUN apk add --no-cache ca-certificates tzdata postgresql-client libstdc++ libgcc jq
 
 # Copy the native musl opencode binary (no Node.js needed at runtime)
 COPY --from=opencode /usr/local/bin/opencode /usr/local/bin/opencode

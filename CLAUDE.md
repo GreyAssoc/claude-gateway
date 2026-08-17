@@ -101,7 +101,7 @@ make restart        # Restart everything
 
 ## Key Config Files
 
-- `.env` — Secrets (TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, CLAUDE_CONFIG_DIR, DEEPSEEK_API_KEY)
+- `.env` — Secrets (TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, CLAUDE_CONFIG_DIR, DEEPSEEK_API_KEY, XAI_API_KEY)
 - `configs/gateway.yaml` — Cron, watchers, rate limits, memory
 - `memory/bootstrap/*.md` — Static context injected into every Claude request
 
@@ -138,7 +138,10 @@ without code changes to the sidecar's agent loop. Each request carries a
 use, MCP, and session resume all keep working.
 
 Currently registered: `claude` (native), `deepseek` (when `DEEPSEEK_API_KEY`
-is set). Switch at runtime with `/framework deepseek` in Telegram.
+is set), `grok` (SuperGrok subscription via Grok Build CLI). Switch at
+runtime with `/framework deepseek`, `/framework grok`, or the `/models`
+picker. Grok uses `/grokauth` (device-code login) — not `XAI_API_KEY`.
+These do not go through OpenCode.
 
 To add another vendor with an Anthropic-compatible endpoint, append to the
 `PROVIDERS` map in `sidecar/index.js` and register a backend in

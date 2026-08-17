@@ -73,6 +73,14 @@ func (s *Switcher) Available() []string {
 	return s.availableLocked()
 }
 
+// Has reports whether a backend with the given name is registered.
+func (s *Switcher) Has(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.backends[name]
+	return ok
+}
+
 func (s *Switcher) availableLocked() []string {
 	names := make([]string, 0, len(s.backends))
 	for name := range s.backends {

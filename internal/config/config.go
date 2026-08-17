@@ -223,7 +223,7 @@ func Load(yamlPath string) (*Config, error) {
 		cfg.Sidecar.URL = "http://sidecar:3001"
 	}
 	if cfg.Sidecar.TimeoutSeconds <= 0 {
-		cfg.Sidecar.TimeoutSeconds = 3600
+		cfg.Sidecar.TimeoutSeconds = 7200
 	}
 	if cfg.Sidecar.HealthPath == "" {
 		cfg.Sidecar.HealthPath = "/health"

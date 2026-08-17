@@ -316,7 +316,7 @@ func (b *Bot) handleCallbackQuery(_ context.Context, cq *tgbotapi.CallbackQuery)
 	switch {
 	case strings.HasPrefix(data, "model:"):
 		modelID := strings.TrimPrefix(data, "model:")
-		b.switchOpenCodeModel(chatID, modelID)
+		b.switchSelectableModel(chatID, modelID)
 
 		// Delete the keyboard message to keep chat clean
 		del := tgbotapi.NewDeleteMessage(chatID, cq.Message.MessageID)
@@ -366,11 +366,12 @@ func (b *Bot) registerTelegramCommands() {
 		{Command: "cronlist", Description: "List scheduled jobs"},
 		{Command: "dbcheck", Description: "Check PostgreSQL conversations"},
 		{Command: "framework", Description: "Show/switch AI framework"},
+		{Command: "grokauth", Description: "Sign in SuperGrok (subscription)"},
 		{Command: "journal", Description: "View daily journal"},
 		{Command: "journalsearch", Description: "Search journal entries"},
 		{Command: "memorieslist", Description: "List curated memories"},
 		{Command: "model", Description: "Show actual API model in use"},
-		{Command: "models", Description: "Switch OpenCode model"},
+		{Command: "models", Description: "Switch DeepSeek / Grok"},
 		{Command: "memoryforget", Description: "Remove a memory by text match"},
 		{Command: "memorylist", Description: "List memories by category"},
 		{Command: "memoryremember", Description: "Save a memory"},

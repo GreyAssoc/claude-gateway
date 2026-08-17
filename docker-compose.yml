@@ -20,8 +20,10 @@ services:
       # OpenCode backend (used when FRAMEWORK=opencode)
       - OPENCODE_API_KEY=${OPENCODE_API_KEY}
       - OPENCODE_MODEL=${OPENCODE_MODEL:-opencode-go/kimi-k2.5}
-      # DeepSeek backend — gateway only registers the deepseek backend when this is set.
+      # DeepSeek / Grok backends — gateway only registers each when the key is set.
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - XAI_API_KEY=${XAI_API_KEY:-${GROK_API_KEY}}
+      - GROK_API_KEY=${GROK_API_KEY:-${XAI_API_KEY}}
       # Google Workspace OAuth (gog). If unset, the gateway falls back to
       # parsing /root/.config/gog/client_secret.json (mounted from the repo).
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
@@ -78,9 +80,12 @@ services:
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       # Gemini API key (for SoC audio transcription)
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      # DeepSeek API key — used when a request carries provider="deepseek".
-      # The sidecar injects this as ANTHROPIC_AUTH_TOKEN for that subprocess only.
+      # Provider API keys — used when a request carries provider="deepseek" or
+      # provider="grok". The sidecar injects the matching key as
+      # ANTHROPIC_AUTH_TOKEN for that subprocess only.
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - XAI_API_KEY=${XAI_API_KEY:-${GROK_API_KEY}}
+      - GROK_API_KEY=${GROK_API_KEY:-${XAI_API_KEY}}
       # grey-docs scripts have a guard that refuses direct execution unless
       # they're invoked via an MCP server. No grey-docs MCP server exists, so
       # we override the guard here. Revisit when a real MCP server is built.
@@ -91,6 +96,10 @@ services:
       # Client data directories (read-only — for skills that read/copy client data)
       - /home/stevew/grey-unraid/clients-current:/clients/current:ro
       - /home/stevew/grey-unraid/clients-past:/clients/past:ro
+      # SuperGrok / Grok Build session (auth.json). Persists device-code login
+      # across recreates. The grok binary itself lives in the image at
+      # /usr/local/bin/grok so this volume does not hide it.
+      - grok-home:/root/.grok
       # Claude OAuth credentials — mounted read-only, copied to writable /root/.claude at startup
       - ${CLAUDE_CONFIG_DIR}:/root/.claude-ro:ro
       # Google Workspace OAuth state — same named volume the gateway writes to.
@@ -124,3 +133,5 @@ volumes:
   # Google Workspace OAuth tokens — written by gateway (/googleauth) and
   # read+refreshed by the sidecar's gog binary. Named so it survives `down`.
   gog-tokens:
+  # SuperGrok session (auth.json from `grok login --device-auth`).
+  grok-home:

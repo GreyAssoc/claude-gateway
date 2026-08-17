@@ -1,6 +1,10 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import express from "express";
 import { WebSocketServer } from "ws";
 
@@ -35,6 +39,9 @@ const CONTEXT_WINDOWS = {
   // DeepSeek (Anthropic-compat endpoint)
   "deepseek-v4-pro": 128_000,
   "deepseek-chat": 128_000,
+  // xAI Grok (Anthropic-compat at https://api.x.ai)
+  "grok-4.6": 2_000_000,
+  "grok-4.5": 2_000_000,
 };
 
 function contextWindowFor(modelName) {
@@ -111,6 +118,19 @@ function cleanStderr(data) {
     .trim();
 }
 
+// SDK / provider internals that must not appear in Telegram.
+function isSdkNoise(text) {
+  if (!text) return true;
+  const t = text.trim();
+  if (t.length < 2) return true;
+  if (t === "Session initialized") return true;
+  if (/thinking_tokens/i.test(t)) return true;
+  if (/unrecognized_model/i.test(t)) return true;
+  if (/^\[system:/.test(t)) return true;
+  if (/^\[claude-code:/.test(t)) return true;
+  return false;
+}
+
 function is429(msg) {
   return msg && (
     msg.includes("429") ||
@@ -129,6 +149,14 @@ const PROVIDERS = {
     apiKeyEnv: "DEEPSEEK_API_KEY",
     defaultModel: "deepseek-v4-pro",
   },
+  // xAI Anthropic SDK compat: base_url is https://api.x.ai (SDK appends /v1/messages).
+  // Accept XAI_API_KEY (official) or GROK_API_KEY (alias used in this project's .env).
+  grok: {
+    baseURL: "https://api.x.ai",
+    apiKeyEnv: "XAI_API_KEY",
+    apiKeyEnvAlt: "GROK_API_KEY",
+    defaultModel: "grok-4.5",
+  },
 };
 
 // buildProviderOverlay returns { env, model } for a provider, or null if no
@@ -140,9 +168,10 @@ function buildProviderOverlay(providerName, requestedModel) {
   if (!p) {
     throw new Error(`Unknown provider: ${providerName}`);
   }
-  const apiKey = process.env[p.apiKeyEnv];
+  const apiKey = process.env[p.apiKeyEnv] || (p.apiKeyEnvAlt && process.env[p.apiKeyEnvAlt]);
   if (!apiKey) {
-    throw new Error(`Missing ${p.apiKeyEnv} env var for provider ${providerName}`);
+    const needed = p.apiKeyEnvAlt ? `${p.apiKeyEnv} or ${p.apiKeyEnvAlt}` : p.apiKeyEnv;
+    throw new Error(`Missing ${needed} env var for provider ${providerName}`);
   }
   return {
     env: {
@@ -151,6 +180,175 @@ function buildProviderOverlay(providerName, requestedModel) {
     },
     model: requestedModel || p.defaultModel,
   };
+}
+
+// --- SuperGrok (Grok Build CLI) ------------------------------------------
+// SuperGrok / X Premium+ is a subscription login, not an API key. The CLI
+// stores the session in ~/.grok/auth.json after `grok login --device-auth`.
+// We strip XAI_API_KEY / GROK_API_KEY from the child env so Grok cannot
+// silently fall back to pay-per-token API billing.
+
+const GROK_HOME = process.env.GROK_HOME || "/root/.grok";
+const GROK_AUTH = path.join(GROK_HOME, "auth.json");
+
+function grokSubscriptionEnv() {
+  const env = { ...process.env, HOME: "/root", GROK_HOME };
+  delete env.XAI_API_KEY;
+  delete env.GROK_API_KEY;
+  return env;
+}
+
+function grokBinaryExists() {
+  try {
+    fs.accessSync("/usr/local/bin/grok", fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function grokIsLoggedIn() {
+  try {
+    const st = fs.statSync(GROK_AUTH);
+    return st.isFile() && st.size > 20;
+  } catch {
+    return false;
+  }
+}
+
+function parseDeviceAuth(text) {
+  const urlMatch = text.match(/https?:\/\/[^\s"'<>]+/i);
+  const codeMatch =
+    text.match(/\b(?:code|user[_ ]?code)\s*[:=]\s*([A-Z0-9][A-Z0-9-]{3,})\b/i) ||
+    text.match(/\b([A-Z0-9]{4}-[A-Z0-9]{4,})\b/);
+  return {
+    url: urlMatch ? urlMatch[0].replace(/[.,;]+$/, "") : "",
+    code: codeMatch ? codeMatch[1] : "",
+  };
+}
+
+// Only the model's visible answer belongs on Telegram. Grok Build's
+// streaming-json also emits thoughts, tool calls, command menus, usage,
+// and file dumps — those must never be forwarded.
+function grokVisibleText(ev) {
+  if (!ev || typeof ev !== "object") return "";
+  if (ev.type !== "text") return "";
+  if (typeof ev.data === "string") return ev.data;
+  if (typeof ev.text === "string") return ev.text;
+  return "";
+}
+
+function grokToolLabel(ev) {
+  if (!ev || ev.type !== "tool_call") return "";
+  return String(ev.title || ev.toolName || ev.kind || "tool").slice(0, 60);
+}
+
+const GROK_SESSION_MAP = path.join(GROK_HOME, "gateway-sessions.json");
+
+function loadGrokSessionMap() {
+  try {
+    return JSON.parse(fs.readFileSync(GROK_SESSION_MAP, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveGrokSessionMap(map) {
+  try {
+    fs.writeFileSync(GROK_SESSION_MAP, JSON.stringify(map), { mode: 0o600 });
+  } catch (err) {
+    console.warn("[grok] failed to persist session map:", err.message);
+  }
+}
+
+// Grok --session-id must be a UUID. Gateway IDs look like "grok:tg-123".
+// Hash them deterministically so the same Telegram chat resumes after restart.
+function grokSessionUUID(seed) {
+  const hex = createHash("sha256").update(String(seed)).digest("hex").slice(0, 32);
+  const variant = ((parseInt(hex.slice(16, 18), 16) & 0x3f) | 0x80).toString(16).padStart(2, "0");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    "5" + hex.slice(13, 16),
+    variant + hex.slice(18, 20),
+    hex.slice(20, 32),
+  ].join("-");
+}
+
+function grokSessionFlags(sessionId) {
+  const map = loadGrokSessionMap();
+  let rec = map[sessionId];
+  if (!rec || !rec.uuid) {
+    rec = { uuid: grokSessionUUID(sessionId), created: false };
+    map[sessionId] = rec;
+    saveGrokSessionMap(map);
+  }
+  if (rec.created) {
+    return { flags: ["--resume", rec.uuid], rec, map };
+  }
+  return { flags: ["--session-id", rec.uuid], rec, map };
+}
+
+function markGrokSessionCreated(sessionId) {
+  const map = loadGrokSessionMap();
+  if (!map[sessionId]) return;
+  map[sessionId].created = true;
+  saveGrokSessionMap(map);
+}
+
+function resetGrokSession(sessionId) {
+  const map = loadGrokSessionMap();
+  map[sessionId] = { uuid: randomUUID(), created: false };
+  saveGrokSessionMap(map);
+}
+
+let grokLoginState = {
+  proc: null,
+  url: "",
+  code: "",
+  done: true,
+  ok: false,
+  error: "",
+};
+
+function startGrokLogin() {
+  if (grokLoginState.proc) {
+    return { started: true, already: true };
+  }
+  if (!grokBinaryExists()) {
+    return { started: false, error: "Grok Build CLI is not installed. Rebuild the sidecar." };
+  }
+  grokLoginState = { proc: null, url: "", code: "", done: false, ok: false, error: "", log: "" };
+  const child = spawn("grok", ["login", "--device-auth"], {
+    env: grokSubscriptionEnv(),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  grokLoginState.proc = child;
+  const onData = (buf) => {
+    grokLoginState.log += buf.toString();
+    const parsed = parseDeviceAuth(grokLoginState.log);
+    if (parsed.url) grokLoginState.url = parsed.url;
+    if (parsed.code) grokLoginState.code = parsed.code;
+  };
+  child.stdout.on("data", onData);
+  child.stderr.on("data", onData);
+  child.on("error", (err) => {
+    grokLoginState.done = true;
+    grokLoginState.ok = false;
+    grokLoginState.error = err.message;
+    grokLoginState.proc = null;
+  });
+  child.on("close", (code) => {
+    grokLoginState.done = true;
+    grokLoginState.ok = code === 0 && grokIsLoggedIn();
+    if (!grokLoginState.ok && !grokLoginState.error) {
+      grokLoginState.error = grokIsLoggedIn()
+        ? ""
+        : `login exited ${code}`;
+    }
+    grokLoginState.proc = null;
+  });
+  return { started: true, already: false };
 }
 
 // --- Abort tracking ---
@@ -165,6 +363,11 @@ async function handleAsk(msg, send) {
 
   if (!prompt) {
     send({ type: "error", error: "prompt is required" });
+    return;
+  }
+
+  if (provider === "grok") {
+    await handleGrokAsk(msg, send);
     return;
   }
 
@@ -237,7 +440,7 @@ async function handleAsk(msg, send) {
     options.stderr = (data) => {
       process.stderr.write(`[claude-sdk] ${data}`);
       const clean = cleanStderr(data);
-      if (clean.length > 2) {
+      if (!isSdkNoise(clean)) {
         send({ type: "progress", text: clean.slice(0, 300) });
       }
     };
@@ -257,7 +460,12 @@ async function handleAsk(msg, send) {
 
       if (type === "system" && message.subtype === "init") {
         sdkSessionId = message.session_id;
-        send({ type: "progress", text: "Session initialized" });
+        continue;
+      }
+
+      // DeepSeek (and other reasoning models) emit thinking as system
+      // events. Those are not user-facing — keep them in the sidecar log.
+      if (type === "system") {
         continue;
       }
 
@@ -295,10 +503,9 @@ async function handleAsk(msg, send) {
         continue;
       }
 
-      // Forward unknown event types
+      // Unknown SDK event types — log only, do not leak into Telegram.
       const preview = JSON.stringify(message).slice(0, 200);
       console.log(`[ws-ask ${sessionId}]   other: ${preview}`);
-      send({ type: "progress", text: `[${type}${sub}]` });
     }
 
     clearInterval(keepalive);
@@ -446,11 +653,158 @@ async function handleAsk(msg, send) {
   }
 }
 
+async function handleGrokAsk(msg, send) {
+  const { session_id, prompt, cwd, system_prompt, model } = msg;
+  const sessionId = session_id || "default";
+  const workDir = cwd || DEFAULT_CWD;
+  const effectiveModel = model && !String(model).startsWith("claude-") ? model : "grok-4.5";
+
+  if (!grokBinaryExists()) {
+    send({ type: "error", error: "Grok Build CLI is not installed in the sidecar. Rebuild the sidecar image." });
+    return;
+  }
+  if (!grokIsLoggedIn()) {
+    send({ type: "error", error: "SuperGrok is not signed in. Send /grokauth in Telegram and complete the device login." });
+    return;
+  }
+
+  let effectivePrompt = prompt;
+  if (system_prompt) {
+    effectivePrompt = system_prompt + "\n\n---\n\n" + prompt;
+  }
+
+  const keepalive = setInterval(() => {
+    send({ type: "heartbeat" });
+  }, 15000);
+
+  const abortState = { aborted: false, child: null };
+  activeRequests.set(sessionId, abortState);
+
+  const sess = grokSessionFlags(sessionId);
+  // The gateway injects bootstrap + profile + history — far too large for
+  // argv (spawn E2BIG). Grok accepts the same payload via --prompt-file.
+  const promptFile = path.join(os.tmpdir(), `grok-prompt-${randomUUID()}.txt`);
+  try {
+    fs.writeFileSync(promptFile, effectivePrompt, { mode: 0o600 });
+  } catch (err) {
+    send({ type: "error", error: `failed to write grok prompt file: ${err.message}` });
+    clearInterval(keepalive);
+    activeRequests.delete(sessionId);
+    return;
+  }
+
+  const args = [
+    "--prompt-file", promptFile,
+    "--cwd", workDir,
+    ...sess.flags,
+    "--always-approve",
+    "--output-format", "streaming-json",
+    "-m", effectiveModel,
+  ];
+
+  console.log(`[ws-ask ${sessionId}] grok-cli (cwd: ${workDir}, model: ${effectiveModel}, session: ${sess.flags.join(" ")}, prompt_bytes: ${Buffer.byteLength(effectivePrompt)})`);
+
+  try {
+    const text = await new Promise((resolve, reject) => {
+      const child = spawn("grok", args, {
+        cwd: workDir,
+        env: grokSubscriptionEnv(),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      abortState.child = child;
+
+      let assembled = "";
+      let stderrRaw = "";
+      let lineBuf = "";
+
+      const handleLine = (line) => {
+        if (!line) return;
+        let ev;
+        try {
+          ev = JSON.parse(line);
+        } catch {
+          return;
+        }
+        const chunk = grokVisibleText(ev);
+        if (chunk) {
+          assembled += chunk;
+          return;
+        }
+        const tool = grokToolLabel(ev);
+        if (tool) {
+          send({ type: "progress", tool, input: "" });
+        }
+      };
+
+      child.stdout.on("data", (d) => {
+        lineBuf += d.toString();
+        const lines = lineBuf.split("\n");
+        lineBuf = lines.pop() || "";
+        for (const line of lines) handleLine(line);
+      });
+      child.stderr.on("data", (d) => {
+        stderrRaw += d.toString();
+      });
+      child.on("error", (err) => reject(err));
+      child.on("close", (code) => {
+        if (lineBuf) handleLine(lineBuf);
+        if (abortState.aborted) {
+          reject(new Error("aborted"));
+          return;
+        }
+        const answer = assembled.trim();
+        if (code !== 0 && !answer) {
+          const detail = stderrRaw.trim().split("\n").slice(-8).join("\n");
+          reject(new Error(detail || `grok exited ${code}`));
+          return;
+        }
+        resolve(answer);
+      });
+    });
+
+    markGrokSessionCreated(sessionId);
+    sessions.set(sessionId, {
+      sdkSessionId: null,
+      lastActive: Date.now(),
+      lastTurnTotal: 0,
+      contextWindow: CONTEXT_WINDOWS[effectiveModel] || DEFAULT_CONTEXT_WINDOW,
+      pendingSeed: null,
+      provider: "grok",
+      model: effectiveModel,
+    });
+
+    send({
+      type: "result",
+      text,
+      session_id: sessionId,
+      api_model: effectiveModel,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    });
+  } catch (err) {
+    console.error(`[ws-ask ${sessionId}] grok-cli error:`, err.message);
+    send({ type: "error", error: err.message, is_rate_limited: is429(err.message) });
+  } finally {
+    clearInterval(keepalive);
+    activeRequests.delete(sessionId);
+    try { fs.unlinkSync(promptFile); } catch (_) {}
+  }
+}
+
 async function handleRunAgent(msg, send) {
   const { prompt, system_prompt, cwd, allowed_tools, timeout_ms, model, provider } = msg;
 
   if (!prompt) {
     send({ type: "error", error: "prompt is required" });
+    return;
+  }
+
+  if (provider === "grok") {
+    await handleGrokAsk(msg, send);
     return;
   }
 
@@ -666,6 +1020,7 @@ async function handleCompact(msg, send) {
 function handleReset(msg, send) {
   const sessionId = msg.session_id || "default";
   sessions.delete(sessionId);
+  resetGrokSession(sessionId);
   console.log(`Session ${sessionId} cleared`);
   send({ type: "ack", session_id: sessionId });
 }
@@ -687,6 +1042,41 @@ function handleCheckSession(msg, send) {
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", sessions: sessions.size, uptime: process.uptime() });
+});
+
+app.get("/grok/status", (_req, res) => {
+  res.json({
+    binary: grokBinaryExists(),
+    logged_in: grokIsLoggedIn(),
+  });
+});
+
+app.post("/grok/login", (_req, res) => {
+  const result = startGrokLogin();
+  if (!result.started) {
+    res.status(503).json(result);
+    return;
+  }
+  res.json({
+    started: true,
+    already: !!result.already,
+    url: grokLoginState.url,
+    code: grokLoginState.code,
+    done: grokLoginState.done,
+    ok: grokLoginState.ok,
+    logged_in: grokIsLoggedIn(),
+  });
+});
+
+app.get("/grok/login", (_req, res) => {
+  res.json({
+    url: grokLoginState.url,
+    code: grokLoginState.code,
+    done: grokLoginState.done,
+    ok: grokLoginState.ok,
+    error: grokLoginState.error,
+    logged_in: grokIsLoggedIn(),
+  });
 });
 
 app.get("/sessions", (_req, res) => {
@@ -744,6 +1134,9 @@ wss.on("connection", (ws) => {
             const target = activeRequests.get(sid);
             if (target) {
               target.aborted = true;
+              if (target.child && typeof target.child.kill === "function") {
+                try { target.child.kill("SIGTERM"); } catch (_) {}
+              }
               console.log(`[ws-abort] Abort flag set for session ${sid}`);
             } else {
               console.log(`[ws-abort] No active request for session ${sid}`);

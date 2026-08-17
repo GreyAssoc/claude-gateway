@@ -47,8 +47,8 @@ func TestLoad_DefaultValues(t *testing.T) {
 	}
 
 	// Check defaults
-	if cfg.Sidecar.TimeoutSeconds != 3600 {
-		t.Errorf("Sidecar.TimeoutSeconds = %d, want 3600", cfg.Sidecar.TimeoutSeconds)
+	if cfg.Sidecar.TimeoutSeconds != 7200 {
+		t.Errorf("Sidecar.TimeoutSeconds = %d, want 7200", cfg.Sidecar.TimeoutSeconds)
 	}
 	if cfg.Heartbeat.IntervalSeconds != 300 {
 		t.Errorf("Heartbeat.IntervalSeconds = %d, want 300", cfg.Heartbeat.IntervalSeconds)
@@ -165,8 +165,8 @@ orchestrator:
 		t.Fatalf("Load failed: %v", err)
 	}
 
-	if cfg.Sidecar.TimeoutSeconds != 3600 {
-		t.Errorf("Sidecar.TimeoutSeconds = %d after negative YAML, want 3600", cfg.Sidecar.TimeoutSeconds)
+	if cfg.Sidecar.TimeoutSeconds != 7200 {
+		t.Errorf("Sidecar.TimeoutSeconds = %d after negative YAML, want 7200", cfg.Sidecar.TimeoutSeconds)
 	}
 	if cfg.Orchestrator.Timeout != 600 {
 		t.Errorf("Orchestrator.Timeout = %d after negative YAML, want 600", cfg.Orchestrator.Timeout)

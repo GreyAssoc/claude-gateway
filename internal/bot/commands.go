@@ -84,11 +84,12 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 			"/dbcheck — check PostgreSQL conversations\n" +
 			"/framework [name] — show/switch AI framework\n" +
 			"/googleauth [code|status] — Google Workspace OAuth\n" +
+			"/grokauth [status] — sign in SuperGrok (subscription, not API)\n" +
 			"/journal — view daily journal\n" +
 			"/journalsearch — search journal entries\n" +
 			"/memorieslist — list curated memories\n" +
 			"/model — show actual API model in use\n" +
-			"/models — switch OpenCode model\n" +
+			"/models — switch DeepSeek / Grok\n" +
 			"/memoryforget — remove a memory by text match\n" +
 			"/memorylist — list memories by category\n" +
 			"/memoryremember <text> — save a memory\n" +
@@ -149,6 +150,8 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		b.handleFramework(ctx, msg)
 	case "googleauth":
 		b.handleGoogleAuth(ctx, msg)
+	case "grokauth":
+		b.handleGrokAuth(ctx, msg)
 	case "gauntlet":
 		b.handleGauntlet(ctx, msg)
 	case "journal":
@@ -312,7 +315,7 @@ func (b *Bot) matchFrameworkSwitch(_ context.Context, msg *tgbotapi.Message, low
 	// Bare "use" or "switch" without a framework target must NOT match,
 	// otherwise normal messages like "use the SEO agent" get intercepted.
 	hasFrameworkTarget := containsAny(lower, "opencode", "open code", "open-code", "zen",
-		"claude", "claude code", "sidecar")
+		"claude", "claude code", "sidecar", "deepseek", "grok")
 
 	if !hasFrameworkTarget {
 		return false
@@ -321,7 +324,9 @@ func (b *Bot) matchFrameworkSwitch(_ context.Context, msg *tgbotapi.Message, low
 	hasSwitchIntent := containsAny(lower, "switch", "change to", "swap to", "move to",
 		"enable opencode", "enable claude", "activate opencode", "activate claude",
 		"switch to opencode", "switch to claude", "use opencode", "use claude",
-		"use open code", "use claude code")
+		"use open code", "use claude code", "use deepseek", "switch to deepseek",
+		"use grok", "switch to grok", "enable deepseek", "enable grok",
+		"activate deepseek", "activate grok")
 
 	if !hasSwitchIntent {
 		return false
@@ -332,6 +337,10 @@ func (b *Bot) matchFrameworkSwitch(_ context.Context, msg *tgbotapi.Message, low
 	switch {
 	case containsAny(lower, "opencode", "open code", "open-code", "zen"):
 		target = "opencode"
+	case containsAny(lower, "deepseek"):
+		target = "deepseek"
+	case containsAny(lower, "grok"):
+		target = "grok"
 	case containsAny(lower, "claude", "claude code", "sidecar"):
 		target = "claude"
 	}
@@ -540,10 +549,10 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		}
 	}
 
-	// Per-request timeout: 60 minutes accommodates full pipeline tests
+	// Per-request timeout: 120 minutes accommodates full pipeline tests
 	// and long multi-file tasks while still capping stuck requests so
 	// they release their semaphore slot eventually.
-	reqCtx, reqCancel := context.WithTimeout(ctx, 60*time.Minute)
+	reqCtx, reqCancel := context.WithTimeout(ctx, 120*time.Minute)
 	defer reqCancel()
 
 	// Register cancel so /stop can interrupt this request.
@@ -647,7 +656,7 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		if ev.Tool != "" {
 			icon := toolIcon(ev.Tool)
 			progressLines = append(progressLines, fmt.Sprintf("%s %s: %s", icon, ev.Tool, ev.Input))
-		} else if ev.Text != "" {
+		} else if ev.Text != "" && !isNoiseProgress(ev.Text) {
 			responsePreview.WriteString(ev.Text)
 			responsePreview.WriteByte('\n')
 		} else {
@@ -766,6 +775,22 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 }
 
 // toolIcon returns an emoji icon for a Claude tool name.
+// isNoiseProgress hides SDK internals that leak through the stream
+// (DeepSeek thinking ticks, Claude Code model warnings, session chatter).
+func isNoiseProgress(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" || t == "Session initialized" {
+		return true
+	}
+	if strings.Contains(t, "thinking_tokens") || strings.Contains(t, "unrecognized_model") {
+		return true
+	}
+	if strings.HasPrefix(t, "[system:") || strings.HasPrefix(t, "[claude-code:") {
+		return true
+	}
+	return false
+}
+
 func toolIcon(tool string) string {
 	switch tool {
 	case "Read":
@@ -1807,9 +1832,7 @@ func (b *Bot) handleModel(msg *tgbotapi.Message) {
 	framework := "claude"
 	if sw, ok := b.agent.(*agent.Switcher); ok {
 		framework = sw.Active()
-		if framework == "opencode" {
-			configured = b.cfg.OpenCode.Model
-		}
+		configured = b.modelForFramework(framework)
 	}
 
 	b.lastAPIModelMu.RLock()
@@ -1828,24 +1851,41 @@ func (b *Bot) handleModel(msg *tgbotapi.Message) {
 	b.sendMarkdownMessage(msg.Chat.ID, text.String())
 }
 
-// opencodeModels is the curated list of models available for quick-switching.
-// Add new models here — they appear as inline keyboard buttons.
-var opencodeModels = []struct {
-	Label string // button text
-	ID    string // provider/model passed to opencode
+// selectableModels is the curated list shown by /models. Each entry is a
+// first-class sidecar provider (Anthropic-compatible), not an OpenCode model.
+// Backend is the switcher name; Model is what that provider actually runs.
+var selectableModels = []struct {
+	Label   string // button text
+	Backend string // switcher / provider name
+	Model   string // vendor model id
 }{
-	{"DeepSeek R1 (88%)", "deepseek/deepseek-reasoner"},
-	{"Qwen3 235B (82%)", "alibaba/qwen3-235b-a22b"},
-	{"DeepSeek V3 (78%)", "deepseek/deepseek-chat"},
-	{"GLM-5 (65%)", "opencode-go/glm-5"},
-	{"Kimi K2.5 (60%)", "opencode-go/kimi-k2.5"},
+	{"DeepSeek V4 Pro", "deepseek", "deepseek-v4-pro"},
+	{"Grok 4.5", "grok", "grok-4.5"},
 }
 
-// /models — show inline keyboard to pick an OpenCode model.
+// modelForFramework returns the configured/default model string for a backend.
+func (b *Bot) modelForFramework(framework string) string {
+	return configuredModelName(framework, b.cfg.Sidecar.DefaultModel, b.cfg.OpenCode.Model)
+}
+
+func configuredModelName(framework, claudeDefault, opencodeDefault string) string {
+	switch framework {
+	case "deepseek":
+		return "deepseek-v4-pro"
+	case "grok":
+		return "grok-4.5"
+	case "opencode":
+		return opencodeDefault
+	default:
+		return claudeDefault
+	}
+}
+
+// /models — show inline keyboard to pick a direct provider (DeepSeek / Grok).
 func (b *Bot) handleModels(msg *tgbotapi.Message) {
-	// Quick-switch via argument: /models deepseek/deepseek-chat
+	// Quick-switch via argument: /models grok  or  /models deepseek
 	if arg := strings.TrimSpace(msg.CommandArguments()); arg != "" {
-		b.switchOpenCodeModel(msg.Chat.ID, arg)
+		b.switchSelectableModel(msg.Chat.ID, arg)
 		return
 	}
 
@@ -1854,23 +1894,22 @@ func (b *Bot) handleModels(msg *tgbotapi.Message) {
 		b.sendMessage(msg.Chat.ID, "Framework switching not available.")
 		return
 	}
-	oc := sw.GetOpenCodeClient()
-	if oc == nil {
-		b.sendMessage(msg.Chat.ID, "OpenCode backend not registered.")
-		return
-	}
 
-	current := oc.GetModel()
+	current := sw.Active()
 
-	// Build inline keyboard — 2 buttons per row
 	var rows [][]tgbotapi.InlineKeyboardButton
 	var row []tgbotapi.InlineKeyboardButton
-	for _, m := range opencodeModels {
+	shown := 0
+	for _, m := range selectableModels {
+		if !sw.Has(m.Backend) {
+			continue
+		}
+		shown++
 		label := m.Label
-		if m.ID == current {
+		if m.Backend == current {
 			label = "✅ " + label
 		}
-		btn := tgbotapi.NewInlineKeyboardButtonData(label, "model:"+m.ID)
+		btn := tgbotapi.NewInlineKeyboardButtonData(label, "model:"+m.Backend)
 		row = append(row, btn)
 		if len(row) == 2 {
 			rows = append(rows, row)
@@ -1880,8 +1919,12 @@ func (b *Bot) handleModels(msg *tgbotapi.Message) {
 	if len(row) > 0 {
 		rows = append(rows, row)
 	}
+	if shown == 0 {
+		b.sendMessage(msg.Chat.ID, "No direct providers registered.\nSet DEEPSEEK_API_KEY and/or GROK_API_KEY, then restart the gateway.")
+		return
+	}
 
-	reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Current model: `%s`\nPick a model:", current))
+	reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Current: `%s` — `%s`\nPick a model:", current, b.modelForFramework(current)))
 	reply.ParseMode = tgbotapi.ModeMarkdown
 	reply.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	if _, err := b.api.Send(reply); err != nil {
@@ -1889,24 +1932,42 @@ func (b *Bot) handleModels(msg *tgbotapi.Message) {
 	}
 }
 
-// switchOpenCodeModel changes the OpenCode model and confirms.
-func (b *Bot) switchOpenCodeModel(chatID int64, modelID string) {
+// switchSelectableModel switches the active sidecar provider (deepseek / grok).
+func (b *Bot) switchSelectableModel(chatID int64, name string) {
 	sw, ok := b.agent.(*agent.Switcher)
 	if !ok {
 		b.sendMessage(chatID, "Framework switching not available.")
 		return
 	}
-	oc := sw.GetOpenCodeClient()
-	if oc == nil {
-		b.sendMessage(chatID, "OpenCode backend not registered.")
+
+	name = strings.ToLower(strings.TrimSpace(name))
+	// Accept a label, backend name, or vendor model id.
+	backend := name
+	label := name
+	for _, m := range selectableModels {
+		if name == m.Backend || name == m.Model || strings.EqualFold(name, m.Label) {
+			backend = m.Backend
+			label = m.Label
+			break
+		}
+	}
+
+	if !sw.Has(backend) {
+		hint := "Set the matching API key (DEEPSEEK_API_KEY or GROK_API_KEY) and restart."
+		b.sendMessage(chatID, fmt.Sprintf("*%s* is not registered.\n%s", backend, hint))
 		return
 	}
 
-	old := oc.GetModel()
-	oc.SetModel(modelID)
-	b.cfg.OpenCode.Model = modelID // keep config in sync for /model display
-
-	b.sendMarkdownMessage(chatID, fmt.Sprintf("Model switched: `%s` → `%s`", old, modelID))
+	old := sw.Active()
+	if old == backend {
+		b.sendMarkdownMessage(chatID, fmt.Sprintf("Already using *%s* (`%s`).", label, b.modelForFramework(backend)))
+		return
+	}
+	if err := sw.Switch(backend); err != nil {
+		b.sendMessage(chatID, fmt.Sprintf("Failed: %v", err))
+		return
+	}
+	b.sendMarkdownMessage(chatID, fmt.Sprintf("Switched: `%s` → *%s* (`%s`)", old, label, b.modelForFramework(backend)))
 }
 
 //	/framework claude   — switch to Claude Code
@@ -1930,6 +1991,7 @@ func (b *Bot) handleFramework(_ context.Context, msg *tgbotapi.Message) {
 			"claude":   b.cfg.Sidecar.DefaultModel,
 			"opencode": b.cfg.OpenCode.Model,
 			"deepseek": "deepseek-v4-pro",
+			"grok":     "grok-4.5",
 		}
 
 		var lines []string
