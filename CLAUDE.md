@@ -21,7 +21,14 @@ docker compose logs -f gateway      # gateway only
 ```
 
 > **Note:** `docker compose restart` reuses existing containers and will NOT pick up
-> changes to volumes/mounts in `docker-compose.yml`. Use `down` + `up` for mount changes.
+> changes to volumes/mounts in `docker-compose.yml` **or** env vars interpolated at
+> container-create time. Use `down` + `up` for mount/compose changes.
+>
+> DeepSeek/Grok API keys are read live from `claude-gateway/.env` by the sidecar
+> (`GATEWAY_ENV_FILE`). Rotating `DEEPSEEK_API_KEY` does not require a rebuild.
+> Do **not** export `DEEPSEEK_API_KEY` in the host shell — Compose interpolation
+> prefers the host over `.env`, which is what caused `401 ... ****5354` after
+> the file was already updated.
 
 ---
 
@@ -134,13 +141,21 @@ gateway side: `internal/agent/claude.go` (CompactSession),
 The single sidecar can route requests to providers other than native Claude
 without code changes to the sidecar's agent loop. Each request carries a
 `provider` field; when set, the sidecar injects `ANTHROPIC_BASE_URL` and
-`ANTHROPIC_AUTH_TOKEN` per-call via the SDK's `options.env`. Skills, tool
-use, MCP, and session resume all keep working.
+`ANTHROPIC_AUTH_TOKEN` per-call via the SDK's `options.env`. The API key is
+read from `claude-gateway/.env` at request time (not from a host-exported
+env var). The provider subprocess uses an isolated `CLAUDE_CONFIG_DIR` so
+host OAuth / cached keys cannot shadow it. Skills, tool use, MCP, and
+session resume all keep working.
 
 Currently registered: `claude` (native), `deepseek` (when `DEEPSEEK_API_KEY`
-is set), `grok` (SuperGrok subscription via Grok Build CLI). Switch at
-runtime with `/framework deepseek`, `/framework grok`, or the `/models`
-picker. Grok uses `/grokauth` (device-code login) — not `XAI_API_KEY`.
+is set), `grok` (SuperGrok subscription via Grok Build CLI), `qwen` (local
+vLLM on the host GPU when `VLLM_MODEL` / `VLLM_URL` is set; Ollama is the
+fallback if only `OLLAMA_CHAT_MODEL` is set). Switch at runtime with
+`/framework deepseek`, `/framework grok`, `/framework qwen`, or the
+`/models` picker. Grok uses `/grokauth` (device-code login) — not
+`XAI_API_KEY`. Local Qwen via vLLM uses Anthropic Messages API at
+`http://host.docker.internal:8005` (`ANTHROPIC_AUTH_TOKEN=dummy`,
+`--served-model-name` must match `VLLM_MODEL`).
 These do not go through OpenCode.
 
 To add another vendor with an Anthropic-compatible endpoint, append to the

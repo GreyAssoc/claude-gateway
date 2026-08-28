@@ -17,13 +17,11 @@ services:
       - OLLAMA_URL=http://host.docker.internal:11434
       - OLLAMA_EMBED_MODEL=${OLLAMA_EMBED_MODEL:-nomic-embed-text}
       - OLLAMA_LLM_MODEL=${OLLAMA_LLM_MODEL:-qwen2.5:7b}
-      # OpenCode backend (used when FRAMEWORK=opencode)
-      - OPENCODE_API_KEY=${OPENCODE_API_KEY}
+      # OpenCode backend (used when FRAMEWORK=opencode).
+      # API keys come from env_file (.env) — do NOT interpolate ${DEEPSEEK_API_KEY}
+      # here. Compose substitutes from the host shell first, which silently
+      # overrides the value in .env and was the source of stale DeepSeek 401s.
       - OPENCODE_MODEL=${OPENCODE_MODEL:-opencode-go/kimi-k2.5}
-      # DeepSeek / Grok backends — gateway only registers each when the key is set.
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-      - XAI_API_KEY=${XAI_API_KEY:-${GROK_API_KEY}}
-      - GROK_API_KEY=${GROK_API_KEY:-${XAI_API_KEY}}
       # Google Workspace OAuth (gog). If unset, the gateway falls back to
       # parsing /root/.config/gog/client_secret.json (mounted from the repo).
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
@@ -62,6 +60,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.sidecar
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file: .env
     environment:
       - SIDECAR_PORT=3001
       - WORK_DIR=/workspace
@@ -80,12 +81,18 @@ services:
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       # Gemini API key (for SoC audio transcription)
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      # Provider API keys — used when a request carries provider="deepseek" or
-      # provider="grok". The sidecar injects the matching key as
-      # ANTHROPIC_AUTH_TOKEN for that subprocess only.
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-      - XAI_API_KEY=${XAI_API_KEY:-${GROK_API_KEY}}
-      - GROK_API_KEY=${GROK_API_KEY:-${XAI_API_KEY}}
+      # Provider API keys (DEEPSEEK_API_KEY, GROK_API_KEY, OPENCODE_API_KEY)
+      # come from env_file (.env), not ${...} interpolation. Host-shell
+      # interpolation was overriding .env and sending a stale DeepSeek key.
+      # The sidecar also re-reads this file per request so key rotation does
+      # not require a container recreate.
+      - GATEWAY_ENV_FILE=/workspace/projects/claude-gateway/.env
+      # Ollama is on the host GPU. env_file may already set OLLAMA_URL;
+      # force the Docker-reachable hostname so a host-side localhost value
+      # cannot hide the 3090 from the sidecar.
+      - OLLAMA_URL=http://host.docker.internal:11434
+      # vLLM on the host GPU (separate compose, published 8005:8000).
+      - VLLM_URL=http://host.docker.internal:8005
       # grey-docs scripts have a guard that refuses direct execution unless
       # they're invoked via an MCP server. No grey-docs MCP server exists, so
       # we override the guard here. Revisit when a real MCP server is built.

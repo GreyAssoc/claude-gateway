@@ -1122,12 +1122,16 @@ heartbeat:
 | `POSTGRES_PASSWORD` | Yes | PostgreSQL password (used in compose) |
 | `OLLAMA_URL` | No | Ollama endpoint (default: http://host.docker.internal:11434) |
 | `OLLAMA_EMBED_MODEL` | No | Embedding model (default: nomic-embed-text) |
-| `OLLAMA_LLM_MODEL` | No | LLM model (default: qwen2.5:7b) |
+| `OLLAMA_LLM_MODEL` | No | LLM model for triage (default: qwen2.5:7b) |
+| `OLLAMA_CHAT_MODEL` | No | Fallback local chat model (Ollama) if vLLM is not configured. |
+| `VLLM_URL` | No | vLLM Anthropic/OpenAI endpoint (container: `http://host.docker.internal:8005`). |
+| `VLLM_MODEL` | No | vLLM `--served-model-name` for `/framework qwen` (e.g. `qwen3.8-27b`). |
 | `CLAUDE_CONFIG_DIR` | Yes | Path to Claude OAuth credentials |
 | `DASHBOARD_TOKEN` | No | Bearer token for remote dashboard access |
 | `DASHBOARD_PORT` | No | Dashboard port mapping (default: 8080) |
 | `GOG_KEYRING_PASSWORD` | No | Google Workspace keyring password |
 | `GEMINI_API_KEY` | No | Gemini API key (for audio transcription) |
+| `DEEPSEEK_API_KEY` | No | DeepSeek key for `/framework deepseek`. Read from this `.env` file (not the host shell). |
 | `RATE_LIMIT_RPM` | No | Override RPM limit |
 | `RATE_LIMIT_ITPM` | No | Override ITPM limit |
 | `RATE_LIMIT_OTPM` | No | Override OTPM limit |
@@ -1214,6 +1218,53 @@ ollama list
 
 The gateway Docker container connects to Ollama on the host via `http://host.docker.internal:11434`. Set `OLLAMA_URL` in `.env` if your setup differs. To keep models loaded in VRAM, set `OLLAMA_KEEP_ALIVE=-1` in your Ollama environment.
 
+### Local Qwen3.8 on the RTX 3090 (vLLM)
+
+vLLM's OpenAI image also serves Anthropic `/v1/messages`, which is what Claude Code talks. Run vLLM on the host (separate compose, GPU) and point the gateway at the published port.
+
+vLLM must be started with tool calling (already in your compose):
+
+```text
+--served-model-name qwen3.8-27b
+--enable-auto-tool-choice
+--tool-call-parser qwen3_coder
+--port 8000          # published as host 8005
+```
+
+Gateway `.env`:
+
+```bash
+VLLM_URL=http://host.docker.internal:8005
+VLLM_MODEL=qwen3.8-27b
+```
+
+`VLLM_MODEL` must match `--served-model-name`. Then recreate (gateway registers the backend at startup; sidecar JS is in the image):
+
+```bash
+# vLLM stack (host GPU) — keep this running
+# docker compose up -d   # in the vLLM compose directory
+
+cd /workspace/projects/claude-gateway
+docker compose down && docker compose build && docker compose up -d
+```
+
+Check from the host that the Anthropic endpoint answers:
+
+```bash
+curl -s http://127.0.0.1:8005/v1/models
+curl -s http://127.0.0.1:8005/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: dummy' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"qwen3.8-27b","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+Switch in Telegram with `/framework qwen` or `/models` → **Qwen3.8 (local)**.
+
+`--max-model-len 16384` is the context window the sidecar uses for auto-compact. If you raise it in vLLM, raise the map in `sidecar/index.js` to match.
+
+Triage/embeddings still use host Ollama (`qwen2.5:7b` + `nomic-embed-text`) if that stack is running. The 3090 is dedicated to vLLM.
+
 ### Graceful Degradation
 
 | Component Down | Impact |
@@ -1272,7 +1323,30 @@ The gateway Docker container connects to Ollama on the host via `http://host.doc
 | WebSocket i/o timeout after idle | Connection died during extended inactivity | Gateway auto-reconnects; if persistent, restart sidecar |
 | Claude doesn't know about tools/skills | Bootstrap memory not loaded or stale session | Check logs for "Bootstrap sync", then send `/reset` |
 | Go code changes not taking effect | Container not rebuilt | Run `docker compose up -d --build` |
+| DeepSeek 401 `Your api key: ****xxxx is invalid` | Host-shell `DEEPSEEK_API_KEY` or cached Claude creds overriding `.env` | Unset host `DEEPSEEK_API_KEY`, confirm `.env`, rebuild sidecar (see below) |
+| `/framework qwen` unknown / connection refused | vLLM not running, wrong port, or `VLLM_MODEL` ≠ `--served-model-name` | `curl :8005/v1/models`, set `VLLM_URL`/`VLLM_MODEL` in `.env`, recreate gateway+sidecar |
+| Qwen 400 context length | Claude Code cannot fit in vLLM 16k | Sidecar talks to `/v1/messages` directly (chat, no Claude Code tools). Rebuild sidecar. Raise `--max-model-len` to 32768 for agent mode. |
 | Triage not working / model not found | Wrong Ollama model name in config | Verify model with `ollama list`; check `OLLAMA_LLM_MODEL` in `.env` |
+
+### DeepSeek 401 — wrong API key suffix
+
+DeepSeek's error shows the last 4 characters of the key it actually received. If that suffix does not match `DEEPSEEK_API_KEY` in `claude-gateway/.env`, the sidecar was not using the file.
+
+Two things caused this:
+
+1. **Docker Compose interpolation.** `DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}` in `docker-compose.yml` is filled from the **host shell first**, then `.env`. An exported host variable (or a container created before you rotated the key, then `docker compose restart`) keeps sending the old key.
+2. **Claude Code credential cache.** The sidecar copies host `~/.claude` into the container. Claude Code can reuse a cached API key / OAuth token instead of `ANTHROPIC_AUTH_TOKEN`.
+
+The sidecar now reads `DEEPSEEK_API_KEY` from `/workspace/projects/claude-gateway/.env` on every request and runs DeepSeek in an isolated `CLAUDE_CONFIG_DIR`. After deploying this:
+
+```bash
+unset DEEPSEEK_API_KEY   # on the host, if it is exported
+cd /workspace/projects/claude-gateway
+docker compose down && docker compose build sidecar && docker compose up -d
+docker compose logs -f sidecar   # look for: [providers] deepseek ready ... last4=...
+```
+
+The logged `last4` must match the end of the key in `.env`. `docker compose restart` is not enough — the sidecar JS is baked into the image.
 
 ### PostgreSQL Permissions
 

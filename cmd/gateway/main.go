@@ -110,6 +110,17 @@ func main() {
 	backends = append(backends, grokBackend)
 	log.Println("Grok backend registered (SuperGrok / Grok Build CLI)")
 
+	// Local Qwen on the host GPU via vLLM (Anthropic /v1/messages on :8005).
+	// Always registered like grok — first request fails loudly if vLLM is down.
+	// Sidecar reads VLLM_URL / VLLM_MODEL from .env at request time.
+	qwenBackend := agent.NewClientWithProvider("qwen", "vllm", cfg.Sidecar.URL, timeout)
+	backends = append(backends, qwenBackend)
+	qwenModel := os.Getenv("VLLM_MODEL")
+	if qwenModel == "" {
+		qwenModel = "qwen3.8-27b"
+	}
+	log.Printf("Qwen local backend registered (provider=vllm, model=%s)", qwenModel)
+
 	// OpenCode backend — always initialized if binary is available.
 	opencodeBackend := agent.NewOpenCodeClient(agent.OpenCodeConfig{
 		Binary:   cfg.OpenCode.Binary,

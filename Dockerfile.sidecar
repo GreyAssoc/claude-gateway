@@ -69,6 +69,14 @@ RUN chmod +x /usr/local/bin/gog && gog --version
 RUN npm install -g @playwright/mcp@latest && \
     npx playwright install --with-deps chromium
 
+# Go toolchain — agents run `go test` / `go build` against /workspace.
+# Copied from the official bookworm image so glibc matches node:20-slim.
+COPY --from=golang:1.25-bookworm /usr/local/go /usr/local/go
+ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}" \
+    GOPATH="/root/go" \
+    GOTOOLCHAIN=local
+RUN go version
+
 # Sidecar app
 WORKDIR /app
 COPY sidecar/package.json sidecar/package-lock.json* ./

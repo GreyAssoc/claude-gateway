@@ -89,7 +89,7 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 			"/journalsearch — search journal entries\n" +
 			"/memorieslist — list curated memories\n" +
 			"/model — show actual API model in use\n" +
-			"/models — switch DeepSeek / Grok\n" +
+			"/models — switch DeepSeek / Grok / local Qwen\n" +
 			"/memoryforget — remove a memory by text match\n" +
 			"/memorylist — list memories by category\n" +
 			"/memoryremember <text> — save a memory\n" +
@@ -315,7 +315,7 @@ func (b *Bot) matchFrameworkSwitch(_ context.Context, msg *tgbotapi.Message, low
 	// Bare "use" or "switch" without a framework target must NOT match,
 	// otherwise normal messages like "use the SEO agent" get intercepted.
 	hasFrameworkTarget := containsAny(lower, "opencode", "open code", "open-code", "zen",
-		"claude", "claude code", "sidecar", "deepseek", "grok")
+		"claude", "claude code", "sidecar", "deepseek", "grok", "qwen", "ollama", "vllm")
 
 	if !hasFrameworkTarget {
 		return false
@@ -326,7 +326,10 @@ func (b *Bot) matchFrameworkSwitch(_ context.Context, msg *tgbotapi.Message, low
 		"switch to opencode", "switch to claude", "use opencode", "use claude",
 		"use open code", "use claude code", "use deepseek", "switch to deepseek",
 		"use grok", "switch to grok", "enable deepseek", "enable grok",
-		"activate deepseek", "activate grok")
+		"activate deepseek", "activate grok",
+		"use qwen", "switch to qwen", "enable qwen", "activate qwen",
+		"use ollama", "switch to ollama", "enable ollama",
+		"use vllm", "switch to vllm", "enable vllm")
 
 	if !hasSwitchIntent {
 		return false
@@ -339,6 +342,8 @@ func (b *Bot) matchFrameworkSwitch(_ context.Context, msg *tgbotapi.Message, low
 		target = "opencode"
 	case containsAny(lower, "deepseek"):
 		target = "deepseek"
+	case containsAny(lower, "qwen", "ollama", "vllm"):
+		target = "qwen"
 	case containsAny(lower, "grok"):
 		target = "grok"
 	case containsAny(lower, "claude", "claude code", "sidecar"):
@@ -467,12 +472,22 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		Model:     b.cfg.Sidecar.DefaultModel,
 	}
 
+	// Local Qwen via vLLM has a 16k window. Gateway bootstrap + profile +
+	// history + skill index plus Claude Code's own tool schemas already
+	// overflow it. Keep a one-paragraph instruction and skip enrichment.
+	localQwen := false
+	if sw, ok := b.agent.(*agent.Switcher); ok && sw.Active() == "qwen" {
+		localQwen = true
+	}
+
 	// System prompt injection:
 	// - If an explicit override is provided (skill commands), always use it.
 	// - Otherwise, check if the SDK session is alive in the sidecar.
 	//   If dead/new, build system prompt from PostgreSQL (or legacy memory manager).
 	needsSystemPrompt := true // tracks whether session is new (used for enriched prompt)
-	if systemPrompt != "" {
+	if localQwen && systemPrompt == "" {
+		opts.SystemPrompt = "You are a coding assistant running locally (Qwen3.8-27B via vLLM). The context window is 16384 tokens. Be concise. Prefer small diffs. Do not dump whole files. Do not emit long chain-of-thought — answer directly."
+	} else if systemPrompt != "" {
 		opts.SystemPrompt = systemPrompt
 		// Explicit system prompt = fresh session context
 	} else {
@@ -531,7 +546,7 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	// Bootstrap is only injected on new sessions — alive sessions already have it
 	// in the system prompt and the SDK manages context retention.
 	sessionAlive := !needsSystemPrompt
-	if b.contextBuilder != nil && systemPrompt == "" {
+	if b.contextBuilder != nil && systemPrompt == "" && !localQwen {
 		enrichCtx, enrichCancel := context.WithTimeout(ctx, 10*time.Second)
 		enriched, enrichErr := b.contextBuilder.BuildEnrichedPrompt(enrichCtx, sessionID, prompt, peopleNames, sessionAlive)
 		enrichCancel()
@@ -568,7 +583,7 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	// Rolling progress state — mutex-protected for concurrent access
 	// between the onProgress callback and the flush goroutine.
 	var mu sync.Mutex
-	var progressLines []string   // tool activity log
+	var progressLines []string          // tool activity log
 	var responsePreview strings.Builder // accumulates Claude's response text
 	var editPending bool
 	startTime := time.Now()
@@ -1824,6 +1839,7 @@ func (b *Bot) handleCronDisable(msg *tgbotapi.Message) {
 // handleFramework shows the current AI framework or switches to a new one.
 //
 //	/framework          — show current + available
+//
 // handleModel shows the actual API model from the last response, not a
 // self-reported model identity. This is immune to conversation history
 // pollution and always reflects what the API actually returned.
@@ -1861,19 +1877,28 @@ var selectableModels = []struct {
 }{
 	{"DeepSeek V4 Pro", "deepseek", "deepseek-v4-pro"},
 	{"Grok 4.5", "grok", "grok-4.5"},
+	{"Qwen3.8 (local)", "qwen", "qwen3.8-27b"},
 }
 
 // modelForFramework returns the configured/default model string for a backend.
 func (b *Bot) modelForFramework(framework string) string {
-	return configuredModelName(framework, b.cfg.Sidecar.DefaultModel, b.cfg.OpenCode.Model)
+	return configuredModelName(framework, b.cfg.Sidecar.DefaultModel, b.cfg.OpenCode.Model, b.cfg.OllamaChatModel, b.cfg.VLLMModel)
 }
 
-func configuredModelName(framework, claudeDefault, opencodeDefault string) string {
+func configuredModelName(framework, claudeDefault, opencodeDefault, ollamaChat, vllmModel string) string {
 	switch framework {
 	case "deepseek":
 		return "deepseek-v4-pro"
 	case "grok":
 		return "grok-4.5"
+	case "qwen", "ollama", "vllm":
+		if vllmModel != "" {
+			return vllmModel
+		}
+		if ollamaChat != "" {
+			return ollamaChat
+		}
+		return "qwen3.8-27b"
 	case "opencode":
 		return opencodeDefault
 	default:
@@ -1920,7 +1945,7 @@ func (b *Bot) handleModels(msg *tgbotapi.Message) {
 		rows = append(rows, row)
 	}
 	if shown == 0 {
-		b.sendMessage(msg.Chat.ID, "No direct providers registered.\nSet DEEPSEEK_API_KEY and/or GROK_API_KEY, then restart the gateway.")
+		b.sendMessage(msg.Chat.ID, "No direct providers registered.\nSet DEEPSEEK_API_KEY, GROK_API_KEY, and/or OLLAMA_CHAT_MODEL, then recreate the gateway.")
 		return
 	}
 
@@ -1941,6 +1966,9 @@ func (b *Bot) switchSelectableModel(chatID int64, name string) {
 	}
 
 	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "ollama" || name == "vllm" || strings.HasPrefix(name, "qwen3.8") {
+		name = "qwen"
+	}
 	// Accept a label, backend name, or vendor model id.
 	backend := name
 	label := name
@@ -1953,7 +1981,7 @@ func (b *Bot) switchSelectableModel(chatID int64, name string) {
 	}
 
 	if !sw.Has(backend) {
-		hint := "Set the matching API key (DEEPSEEK_API_KEY or GROK_API_KEY) and restart."
+		hint := "Set the matching key (DEEPSEEK_API_KEY, GROK_API_KEY, or OLLAMA_CHAT_MODEL) and recreate the gateway."
 		b.sendMessage(chatID, fmt.Sprintf("*%s* is not registered.\n%s", backend, hint))
 		return
 	}
@@ -1970,8 +1998,8 @@ func (b *Bot) switchSelectableModel(chatID int64, name string) {
 	b.sendMarkdownMessage(chatID, fmt.Sprintf("Switched: `%s` → *%s* (`%s`)", old, label, b.modelForFramework(backend)))
 }
 
-//	/framework claude   — switch to Claude Code
-//	/framework opencode — switch to OpenCode
+// /framework claude   — switch to Claude Code
+// /framework opencode — switch to OpenCode
 func (b *Bot) handleFramework(_ context.Context, msg *tgbotapi.Message) {
 	switcher, ok := b.agent.(*agent.Switcher)
 	if !ok {
@@ -1992,6 +2020,7 @@ func (b *Bot) handleFramework(_ context.Context, msg *tgbotapi.Message) {
 			"opencode": b.cfg.OpenCode.Model,
 			"deepseek": "deepseek-v4-pro",
 			"grok":     "grok-4.5",
+			"qwen":     b.modelForFramework("qwen"),
 		}
 
 		var lines []string
@@ -2016,6 +2045,10 @@ func (b *Bot) handleFramework(_ context.Context, msg *tgbotapi.Message) {
 	}
 
 	// Switch
+	arg = strings.ToLower(arg)
+	if arg == "ollama" || arg == "vllm" || strings.HasPrefix(arg, "qwen3.8") {
+		arg = "qwen"
+	}
 	if err := switcher.Switch(arg); err != nil {
 		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Failed: %v", err))
 		return

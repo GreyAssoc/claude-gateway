@@ -28,9 +28,10 @@ logs-gateway:
 logs-sidecar:
 	docker compose logs -f sidecar
 
-# Restart everything
+# Recreate containers (picks up .env / compose changes). `restart` alone
+# reuses the existing container env and will keep a stale API key.
 restart:
-	docker compose restart
+	docker compose up -d --force-recreate
 
 # Restart sidecar only (useful if it crashes)
 restart-sidecar:

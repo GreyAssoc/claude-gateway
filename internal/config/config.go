@@ -13,27 +13,30 @@ import (
 )
 
 type Config struct {
-	Framework       string // "claude" or "opencode" (default: "claude")
-	Telegram        Telegram
-	Sidecar         Sidecar
-	OpenCode        OpenCode
-	RateLimiter     RateLimiter
-	Cron            map[string]CronJob
-	Watchers        WatchersConfig
-	Heartbeat       Heartbeat
-	Database        Database
-	Skills          Skills
-	Memory          Memory
-	Orchestrator    Orchestrator
-	Dashboard       Dashboard
-	WorkDir         string
-	PostgresURL     string
-	OllamaURL       string
+	Framework        string // "claude" or "opencode" (default: "claude")
+	Telegram         Telegram
+	Sidecar          Sidecar
+	OpenCode         OpenCode
+	RateLimiter      RateLimiter
+	Cron             map[string]CronJob
+	Watchers         WatchersConfig
+	Heartbeat        Heartbeat
+	Database         Database
+	Skills           Skills
+	Memory           Memory
+	Orchestrator     Orchestrator
+	Dashboard        Dashboard
+	WorkDir          string
+	PostgresURL      string
+	OllamaURL        string
 	OllamaEmbedModel string
-	OllamaLLMModel  string
-	Context         ContextConfig
-	Triage          TriageConfig
-	AgentSync       AgentSync
+	OllamaLLMModel   string
+	OllamaChatModel  string // local /framework qwen via Ollama (OLLAMA_CHAT_MODEL)
+	VLLMURL          string
+	VLLMModel        string // local /framework qwen via vLLM (VLLM_MODEL)
+	Context          ContextConfig
+	Triage           TriageConfig
+	AgentSync        AgentSync
 }
 
 // OpenCode holds configuration for the OpenCode backend.
@@ -134,8 +137,8 @@ type Orchestrator struct {
 }
 
 type Dashboard struct {
-	Enabled  bool   `yaml:"enabled"`
-	Port     int    `yaml:"port"`
+	Enabled     bool   `yaml:"enabled"`
+	Port        int    `yaml:"port"`
 	BearerToken string `yaml:"-"`
 }
 
@@ -144,8 +147,8 @@ type rawConfig struct {
 	Framework string             `yaml:"framework"`
 	Cron      map[string]CronJob `yaml:"cron"`
 	Watchers  WatchersConfig     `yaml:"watchers"`
-	Heartbeat Heartbeat    `yaml:"heartbeat"`
-	OpenCode  OpenCode     `yaml:"opencode"`
+	Heartbeat Heartbeat          `yaml:"heartbeat"`
+	OpenCode  OpenCode           `yaml:"opencode"`
 	Sidecar   struct {
 		URL            string `yaml:"url"`
 		TimeoutSeconds int    `yaml:"timeout_seconds"`
@@ -153,24 +156,24 @@ type rawConfig struct {
 		DefaultModel   string `yaml:"default_model"`
 	} `yaml:"sidecar"`
 	RateLimiter struct {
-		RPM          any `yaml:"rpm"`
-		ITPM         any `yaml:"itpm"`
-		OTPM         any `yaml:"otpm"`
-		SafetyMargin float64     `yaml:"safety_margin"`
+		RPM          any     `yaml:"rpm"`
+		ITPM         any     `yaml:"itpm"`
+		OTPM         any     `yaml:"otpm"`
+		SafetyMargin float64 `yaml:"safety_margin"`
 	} `yaml:"ratelimiter"`
-	Database        Database      `yaml:"database"`
-	Skills          Skills        `yaml:"skills"`
-	Memory          Memory        `yaml:"memory"`
-	Orchestrator    Orchestrator  `yaml:"orchestrator"`
-	Dashboard       Dashboard     `yaml:"dashboard"`
-	WorkDir         string        `yaml:"work_dir"`
-	PostgresURL     string        `yaml:"postgres_url"`
-	OllamaURL       string        `yaml:"ollama_url"`
-	OllamaEmbedModel string       `yaml:"ollama_embed_model"`
-	OllamaLLMModel  string        `yaml:"ollama_llm_model"`
-	Context         ContextConfig `yaml:"context"`
-	Triage          TriageConfig  `yaml:"triage"`
-	AgentSync       AgentSync     `yaml:"agent_sync"`
+	Database         Database      `yaml:"database"`
+	Skills           Skills        `yaml:"skills"`
+	Memory           Memory        `yaml:"memory"`
+	Orchestrator     Orchestrator  `yaml:"orchestrator"`
+	Dashboard        Dashboard     `yaml:"dashboard"`
+	WorkDir          string        `yaml:"work_dir"`
+	PostgresURL      string        `yaml:"postgres_url"`
+	OllamaURL        string        `yaml:"ollama_url"`
+	OllamaEmbedModel string        `yaml:"ollama_embed_model"`
+	OllamaLLMModel   string        `yaml:"ollama_llm_model"`
+	Context          ContextConfig `yaml:"context"`
+	Triage           TriageConfig  `yaml:"triage"`
+	AgentSync        AgentSync     `yaml:"agent_sync"`
 }
 
 func Load(yamlPath string) (*Config, error) {
@@ -453,6 +456,15 @@ func loadEnv(cfg *Config) {
 	}
 	if v := os.Getenv("OLLAMA_LLM_MODEL"); v != "" {
 		cfg.OllamaLLMModel = v
+	}
+	if v := os.Getenv("OLLAMA_CHAT_MODEL"); v != "" {
+		cfg.OllamaChatModel = v
+	}
+	if v := os.Getenv("VLLM_URL"); v != "" {
+		cfg.VLLMURL = v
+	}
+	if v := os.Getenv("VLLM_MODEL"); v != "" {
+		cfg.VLLMModel = v
 	}
 }
 

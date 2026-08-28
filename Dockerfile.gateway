@@ -32,6 +32,13 @@ FROM alpine:3.20
 
 RUN apk add --no-cache ca-certificates tzdata postgresql-client libstdc++ libgcc jq
 
+# Go toolchain so OpenCode can build/test workspace projects.
+COPY --from=golang:1.25-alpine /usr/local/go /usr/local/go
+ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}" \
+    GOPATH="/root/go" \
+    GOTOOLCHAIN=local
+RUN go version
+
 # Copy the native musl opencode binary (no Node.js needed at runtime)
 COPY --from=opencode /usr/local/bin/opencode /usr/local/bin/opencode
 

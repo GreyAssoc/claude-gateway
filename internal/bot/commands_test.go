@@ -8,6 +8,7 @@ func TestSelectableModels_DeepSeekAndGrok(t *testing.T) {
 	want := map[string]string{
 		"deepseek": "deepseek-v4-pro",
 		"grok":     "grok-4.5",
+		"qwen":     "qwen3.8-27b",
 	}
 
 	if len(selectableModels) != len(want) {
@@ -55,15 +56,27 @@ func TestConfiguredModelName(t *testing.T) {
 	}{
 		{"deepseek", "deepseek-v4-pro"},
 		{"grok", "grok-4.5"},
+		{"qwen", "qwen3.8-27b"},
+		{"ollama", "qwen3.8-27b"},
+		{"vllm", "qwen3.8-27b"},
 		{"opencode", "opencode-go/glm-5"},
 		{"claude", "claude-sonnet-4-6"},
 		{"", "claude-sonnet-4-6"},
 	}
 	for _, tt := range tests {
-		got := configuredModelName(tt.framework, "claude-sonnet-4-6", "opencode-go/glm-5")
+		got := configuredModelName(tt.framework, "claude-sonnet-4-6", "opencode-go/glm-5", "", "")
 		if got != tt.want {
 			t.Errorf("configuredModelName(%q) = %q, want %q", tt.framework, got, tt.want)
 		}
+	}
+
+	got := configuredModelName("qwen", "claude-sonnet-4-6", "opencode-go/glm-5", "qwen3.8:27b-q4", "")
+	if got != "qwen3.8:27b-q4" {
+		t.Errorf("configuredModelName(qwen, ollama custom) = %q, want qwen3.8:27b-q4", got)
+	}
+	got = configuredModelName("qwen", "claude-sonnet-4-6", "opencode-go/glm-5", "ignored", "qwen3.8-27b")
+	if got != "qwen3.8-27b" {
+		t.Errorf("configuredModelName(qwen, vllm) = %q, want qwen3.8-27b", got)
 	}
 }
 
