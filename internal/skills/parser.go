@@ -19,6 +19,10 @@ type Skill struct {
 	ContentHash string
 	Precedence  int // 0=bundled, 1=managed, 2=workspace
 	Enabled     bool
+	Always      bool   // inject full body on every Qwen/vLLM turn
+	Harness     bool   // framework-agnostic; prefer over Claude-only skills on small windows
+	Kind        string // "skill", "agent", or "persona"
+	Owner       string // chat-agent folder handle; empty = global
 }
 
 // ParseSkillMD parses a SKILL.md file. Format:
@@ -35,6 +39,8 @@ func ParseSkillMD(content, sourcePath string, precedence int) (*Skill, error) {
 	name := extractNameFromPath(sourcePath)
 	description := ""
 	command := ""
+	always := false
+	harness := false
 	body := content
 
 	// Try to extract YAML frontmatter (between --- delimiters)
@@ -62,6 +68,12 @@ func ParseSkillMD(content, sourcePath string, precedence int) (*Skill, error) {
 					command = strings.Trim(command, `"'`)
 					command = strings.TrimPrefix(command, "/") // normalize: strip leading /
 				}
+				if strings.HasPrefix(line, "always:") {
+					always = parseYAMLBool(strings.TrimSpace(strings.TrimPrefix(line, "always:")))
+				}
+				if strings.HasPrefix(line, "harness:") {
+					harness = parseYAMLBool(strings.TrimSpace(strings.TrimPrefix(line, "harness:")))
+				}
 			}
 		}
 	}
@@ -81,7 +93,15 @@ func ParseSkillMD(content, sourcePath string, precedence int) (*Skill, error) {
 		ContentHash: hash,
 		Precedence:  precedence,
 		Enabled:     true,
+		Always:      always,
+		Harness:     harness,
+		Kind:        "skill",
 	}, nil
+}
+
+func parseYAMLBool(v string) bool {
+	v = strings.Trim(strings.ToLower(v), `"'`)
+	return v == "true" || v == "yes" || v == "1"
 }
 
 // FormatSkillIndex returns a lightweight index of skill names and descriptions.
@@ -121,7 +141,11 @@ func FormatSkillsXML(skills []Skill) string {
 	sb.WriteString("<skills>\n")
 	for _, s := range skills {
 		name := format.XMLEscapeAttr(s.Name)
-		sb.WriteString(fmt.Sprintf(`<skill name="%s">`, name))
+		kind := s.Kind
+		if kind == "" {
+			kind = "skill"
+		}
+		sb.WriteString(fmt.Sprintf(`<skill name="%s" kind="%s">`, name, format.XMLEscapeAttr(kind)))
 		sb.WriteString("\n<![CDATA[")
 		sb.WriteString(format.CDATAEscape(s.Content))
 		sb.WriteString("]]>\n</skill>\n")
@@ -142,7 +166,7 @@ func MatchSkills(skills []Skill, message string) []Skill {
 	for _, s := range skills {
 		nameLower := strings.ToLower(s.Name)
 		// Direct name match: "notices" in message matches skill "notices"
-		if strings.Contains(msgLower, nameLower) {
+		if strings.Contains(msgLower, nameLower) || catalogNameHit(message, s.Name) {
 			matched = append(matched, s)
 			continue
 		}
@@ -157,8 +181,43 @@ func MatchSkills(skills []Skill, message string) []Skill {
 	return matched
 }
 
+// MatchSkillsPreferHarness is MatchSkills, but if any harness-flagged skill
+// matched, drop Claude-only skills. Small-window models (Qwen) should not
+// spend tokens on Task-tool / agent workflows they cannot run.
+func MatchSkillsPreferHarness(skills []Skill, message string) []Skill {
+	matched := MatchSkills(skills, message)
+	if len(matched) == 0 {
+		return matched
+	}
+	var harness []Skill
+	for _, s := range matched {
+		if s.Harness {
+			harness = append(harness, s)
+		}
+	}
+	if len(harness) > 0 {
+		return harness
+	}
+	return matched
+}
+
 // containsAnyWord returns true if 2+ words (4+ chars each) from content
 // appear in message. Both must be pre-lowercased by the caller.
+func catalogNameHit(message, name string) bool {
+	msg := normalizePhrase(message)
+	n := normalizePhrase(name)
+	if n == "" || len(n) < 5 {
+		return false
+	}
+	return strings.Contains(msg, n)
+}
+
+func normalizePhrase(s string) string {
+	s = strings.ToLower(s)
+	s = strings.NewReplacer("-", " ", "_", " ").Replace(s)
+	return strings.Join(strings.Fields(s), " ")
+}
+
 func containsAnyWord(message, content string) bool {
 	words := strings.Fields(content)
 	matches := 0

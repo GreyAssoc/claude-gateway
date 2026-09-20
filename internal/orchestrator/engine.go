@@ -18,7 +18,7 @@ import (
 type Engine struct {
 	db           *db.DB
 	agentClient  agent.Backend
-	agentDNADir  string
+	agentDNADirs []string
 	workspaceDir string
 	timeout      time.Duration
 }
@@ -34,11 +34,13 @@ type RunResult struct {
 }
 
 // NewEngine creates an orchestrator engine.
-func NewEngine(database *db.DB, agentClient agent.Backend, agentDNADir, workspaceDir string, timeoutSeconds int) *Engine {
+func NewEngine(database *db.DB, agentClient agent.Backend, agentDNADirs []string, workspaceDir string, timeoutSeconds int) *Engine {
+	RegisterDiscoveredTeams(agentDNADirs)
+	log.Printf("Orchestrator: %d teams available: %s", len(TeamNames()), strings.Join(TeamNames(), ", "))
 	return &Engine{
 		db:           database,
 		agentClient:  agentClient,
-		agentDNADir:  agentDNADir,
+		agentDNADirs: agentDNADirs,
 		workspaceDir: workspaceDir,
 		timeout:      time.Duration(timeoutSeconds) * time.Second,
 	}
@@ -72,7 +74,7 @@ func (e *Engine) RunTeamStreaming(ctx context.Context, teamName, task string, on
 			onProgress(fmt.Sprintf("[%d/%d] Running %s...", i+1, len(team.Agents), ag.Name))
 		}
 
-		verdict := RunAgent(ctx, e.agentClient, ag, task, e.agentDNADir, e.workspaceDir, e.timeout)
+		verdict := RunAgent(ctx, e.agentClient, ag, task, e.agentDNADirs, e.workspaceDir, e.timeout)
 		LogVerdict(verdict)
 		verdicts = append(verdicts, verdict)
 

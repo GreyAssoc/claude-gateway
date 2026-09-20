@@ -62,6 +62,7 @@ type dbSnapshot struct {
 type queuedRequest struct {
 	callback func()
 	addedAt  time.Time
+	chatID   int64
 }
 
 // New creates a rate limiter with the given per-minute limits and safety margin.
@@ -286,4 +287,44 @@ func (l *Limiter) Enqueue(cb func()) int {
 	})
 
 	return len(l.queue)
+}
+
+// EnqueueChat is Enqueue tagged with a Telegram chat so /stop can drop
+// that chat's waiting items without firing them.
+func (l *Limiter) EnqueueChat(chatID int64, cb func()) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	const maxQueue = 100
+	if len(l.queue) >= maxQueue {
+		return -1
+	}
+
+	l.queue = append(l.queue, queuedRequest{
+		callback: cb,
+		addedAt:  time.Now(),
+		chatID:   chatID,
+	})
+
+	return len(l.queue)
+}
+
+// DropQueuedFor removes queued callbacks for chatID. Returns how many were dropped.
+func (l *Limiter) DropQueuedFor(chatID int64) int {
+	if l == nil || chatID == 0 {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	kept := l.queue[:0]
+	dropped := 0
+	for _, req := range l.queue {
+		if req.chatID == chatID {
+			dropped++
+			continue
+		}
+		kept = append(kept, req)
+	}
+	l.queue = kept
+	return dropped
 }

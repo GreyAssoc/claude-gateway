@@ -3,6 +3,15 @@
 # After editing .go files, runs `go vet` on the package to catch errors
 # immediately. Outputs violations so Claude fixes them before moving on.
 
+# Telegram DeepSeek/Claude must match @default: do not hang on `go vet`
+# after every Edit. Sidecar sets this for non-orchestrator asks.
+[ "${CLAUDE_GATEWAY_SKIP_GO_HOOK:-}" = "1" ] && exit 0
+
+export GOTOOLCHAIN=local
+export GOSUMDB=off
+export GOTELEMETRY=off
+export GIT_TERMINAL_PROMPT=0
+
 # Read hook input
 INPUT_FILE=$(mktemp)
 cat > "$INPUT_FILE"
@@ -40,8 +49,13 @@ else
     PKG_PATH="./${REL_PKG}"
 fi
 
-# Run go vet on just the affected package (fast, ~1-2s)
-VET_OUTPUT=$(cd "$MODULE_ROOT" && go vet "$PKG_PATH" 2>&1)
+# Run go vet on just the affected package (fast, ~1-2s). Cap so a
+# toolchain download can never stall the agent session.
+if command -v timeout >/dev/null 2>&1; then
+    VET_OUTPUT=$(cd "$MODULE_ROOT" && timeout 20 go vet "$PKG_PATH" 2>&1)
+else
+    VET_OUTPUT=$(cd "$MODULE_ROOT" && go vet "$PKG_PATH" 2>&1)
+fi
 VET_EXIT=$?
 
 if [ $VET_EXIT -ne 0 ] && [ -n "$VET_OUTPUT" ]; then

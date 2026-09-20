@@ -112,6 +112,30 @@ func TestWindowReset(t *testing.T) {
 	}
 }
 
+func TestDropQueuedFor(t *testing.T) {
+	l := New(1, 40000, 8000, 1.0)
+	l.Record(&agent.Usage{InputTokens: 100, OutputTokens: 50})
+	if l.CanProceed(100) {
+		t.Fatal("need a full window so enqueue is used")
+	}
+	fired := 0
+	posA := l.EnqueueChat(11, func() { fired++ })
+	posB := l.EnqueueChat(22, func() { fired++ })
+	if posA != 1 || posB != 2 {
+		t.Fatalf("positions %d %d", posA, posB)
+	}
+	if n := l.DropQueuedFor(11); n != 1 {
+		t.Fatalf("dropped %d, want 1", n)
+	}
+	if n := l.DropQueuedFor(11); n != 0 {
+		t.Fatalf("second drop %d", n)
+	}
+	st := l.GetStatus()
+	if st.QueueDepth != 1 {
+		t.Fatalf("queue depth %d, want 1 (chat 22)", st.QueueDepth)
+	}
+}
+
 func TestClose_DrainsQueue(t *testing.T) {
 	l := New(50, 40000, 8000, 0.85)
 

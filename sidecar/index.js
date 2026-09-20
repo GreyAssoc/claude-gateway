@@ -1,10 +1,14 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createServer } from "node:http";
+import dns from "node:dns/promises";
+import http, { createServer } from "node:http";
+import https from "node:https";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { URL } from "node:url";
 import express from "express";
 import { WebSocketServer } from "ws";
 
@@ -22,6 +26,9 @@ const DEFAULT_CWD = process.env.WORK_DIR || "/home/user/project";
 // that summary as its first user message. This is the same auto-compact
 // behaviour Claude Code applies to its own sessions.
 const COMPACT_THRESHOLD = parseFloat(process.env.COMPACT_THRESHOLD || "0.80");
+// Qwen/vLLM: compact when input fills this fraction of (context − reserved output).
+// 0.95 of usable window is just below the 114k+16k=131k overflow cliff.
+const VLLM_COMPACT_THRESHOLD = parseFloat(process.env.VLLM_COMPACT_THRESHOLD || "0.95");
 
 // Per-model context windows. Defaults are Anthropic's published numbers;
 // override per-model with the COG_CONTEXT_WINDOW_<MODEL> pattern if needed.
@@ -38,10 +45,12 @@ const CONTEXT_WINDOWS = {
   "claude-opus-4-6": 200_000,
   // DeepSeek (Anthropic-compat endpoint)
   "deepseek-v4-pro": 128_000,
+  "deepseek-flash": 1_000_000,
+  "deepseek-v4-flash": 1_000_000,
   "deepseek-chat": 128_000,
-  // Qwen3.8 via local vLLM (compose --max-model-len 16384)
-  "qwen3.8": 16_384,
-  "qwen3.8-27b": 16_384,
+  // Qwen3.8 via local vLLM (serve --max-model-len 131072)
+  "qwen3.8": 131_072,
+  "qwen3.8-27b": 131_072,
   // xAI Grok (Anthropic-compat at https://api.x.ai)
   "grok-4.6": 2_000_000,
   "grok-4.5": 2_000_000,
@@ -53,7 +62,7 @@ function contextWindowFor(modelName) {
   // Strip [1m] / [200k] suffixes for a lookup fallback.
   const base = modelName.replace(/\[[^\]]*\]$/, "");
   if (CONTEXT_WINDOWS[base]) return CONTEXT_WINDOWS[base];
-  if (modelName.startsWith("qwen3.8")) return 16_384;
+  if (modelName.startsWith("qwen3.8")) return vllmContextLimit();
   return DEFAULT_CONTEXT_WINDOW;
 }
 
@@ -173,24 +182,24 @@ const PROVIDERS = {
     defaultModelEnv: "OLLAMA_CHAT_MODEL",
     setModelEnvVars: true,
   },
-  // Local vLLM OpenAI image. Also serves Anthropic /v1/messages at the
-  // container root (Claude Code appends /v1/messages). Dummy auth is
-  // required by Claude Code and ignored by vLLM unless --api-key is set.
+  // Local vLLM OpenAI image. /v1/* requires Bearer if the serve has
+  // --api-key / VLLM_API_KEY (vLLM 0.27 does on this host). Dummy is
+  // only a fallback for unauthenticated serves.
   vllm: {
-    baseURL: "http://host.docker.internal:8005",
+    baseURL: "http://host.docker.internal:18020",
     baseURLEnv: "VLLM_URL",
+    apiKeyEnv: "VLLM_API_KEY",
     dummyAuth: "dummy",
     defaultModel: "qwen3.8-27b",
     defaultModelEnv: "VLLM_MODEL",
     setModelEnvVars: true,
     setApiKey: true,
     // Claude Code defaults max_completion_tokens to 32000 for unknown
-    // model IDs. vLLM --max-model-len 16384 rejects that (output cannot
-    // exceed the whole window). Cap output; keep context in sync.
+    // model IDs. Cap output; keep context in sync with vLLM --max-model-len.
     maxOutputTokensEnv: "VLLM_MAX_OUTPUT_TOKENS",
-    maxOutputTokensDefault: "2048",
+    maxOutputTokensDefault: "16384",
     maxContextTokensEnv: "VLLM_CONTEXT_WINDOW",
-    maxContextTokensDefault: "16384",
+    maxContextTokensDefault: "65536",
   },
 };
 
@@ -252,13 +261,19 @@ function envFileOrProc(name, fallback) {
   return fallback;
 }
 
+// .env may use BRAVE_API_KEY (docs) or BRAVE_API (what Steve added).
+function braveApiKey() {
+  return (envFileOrProc("BRAVE_API_KEY", "") || envFileOrProc("BRAVE_API", "") || "").trim();
+}
+
 function resolveProviderApiKey(p) {
-  if (p.dummyAuth) {
-    return { apiKey: p.dummyAuth, source: "dummy" };
-  }
   const file = parseEnvFile(GATEWAY_ENV_FILE);
-  const fromFile = (file[p.apiKeyEnv] || (p.apiKeyEnvAlt && file[p.apiKeyEnvAlt]) || "").trim();
-  const fromProc = (process.env[p.apiKeyEnv] || (p.apiKeyEnvAlt && process.env[p.apiKeyEnvAlt]) || "").trim();
+  let fromFile = "";
+  let fromProc = "";
+  if (p.apiKeyEnv) {
+    fromFile = (file[p.apiKeyEnv] || (p.apiKeyEnvAlt && file[p.apiKeyEnvAlt]) || "").trim();
+    fromProc = (process.env[p.apiKeyEnv] || (p.apiKeyEnvAlt && process.env[p.apiKeyEnvAlt]) || "").trim();
+  }
   if (fromFile) {
     if (fromProc && fromFile !== fromProc) {
       console.warn(
@@ -270,6 +285,11 @@ function resolveProviderApiKey(p) {
   }
   if (fromProc) {
     return { apiKey: fromProc, source: "process.env" };
+  }
+  // Unauthenticated vLLM/Ollama still need a Bearer token for some clients;
+  // the server ignores it unless --api-key is set.
+  if (p.dummyAuth) {
+    return { apiKey: p.dummyAuth, source: "dummy" };
   }
   return { apiKey: "", source: "" };
 }
@@ -312,7 +332,7 @@ function applyProviderEnv(overlay) {
     env.CLAUDE_CONFIG_DIR = overlay.configDir;
   }
   Object.assign(env, overlay.env);
-  return env;
+  return withToolPath(env);
 }
 
 function logProviderKeysAtBoot() {
@@ -320,12 +340,8 @@ function logProviderKeysAtBoot() {
     const { apiKey, source } = resolveProviderApiKey(p);
     const model = envFileOrProc(p.defaultModelEnv, p.defaultModel);
     const base = envFileOrProc(p.baseURLEnv, p.baseURL);
-    if (p.dummyAuth) {
-      console.log(`[providers] ${name} ready model=${model} base=${base} auth=dummy`);
-      continue;
-    }
     if (apiKey) {
-      console.log(`[providers] ${name} ready source=${source} last4=${keyLast4(apiKey)} len=${apiKey.length}`);
+      console.log(`[providers] ${name} ready source=${source} last4=${keyLast4(apiKey)} len=${apiKey.length} model=${model} base=${base}`);
     } else {
       const needed = p.apiKeyEnvAlt ? `${p.apiKeyEnv} or ${p.apiKeyEnvAlt}` : p.apiKeyEnv;
       console.log(`[providers] ${name} not configured (no ${needed} in ${GATEWAY_ENV_FILE} or process env)`);
@@ -405,11 +421,49 @@ function buildProviderOverlay(providerName, requestedModel) {
 const GROK_HOME = process.env.GROK_HOME || "/root/.grok";
 const GROK_AUTH = path.join(GROK_HOME, "auth.json");
 
+function withToolPath(base, cwd) {
+  const env = { ...(base || {}) };
+  const extra = [
+    "/usr/local/bin", // wrappers (go → local toolchain, no download)
+    "/usr/local/go/bin",
+    "/root/go/bin",
+    "/root/.claude/local/bin",
+    "/root/.grok/bin",
+  ];
+  const current = String(env.PATH || process.env.PATH || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+  const parts = current.split(":").filter(Boolean);
+  for (let i = extra.length - 1; i >= 0; i--) {
+    const d = extra[i];
+    const idx = parts.indexOf(d);
+    if (idx >= 0) parts.splice(idx, 1);
+    parts.unshift(d);
+  }
+  env.PATH = parts.join(":");
+  env.GOPATH = env.GOPATH || "/root/go";
+  env.GOROOT = env.GOROOT || "/usr/local/go";
+  // Never inherit auto — that downloads a newer patch from go.dev and hangs.
+  env.GOTOOLCHAIN = "local";
+  env.GOSUMDB = "off";
+  env.GOTELEMETRY = "off";
+  env.GIT_TERMINAL_PROMPT = "0";
+  env.CLAUDE_CODE_DISABLE_SANDBOX = "1";
+  env.GOCACHE = env.GOCACHE || process.env.GOCACHE || "/root/.cache/go-build";
+  env.GOMODCACHE = env.GOMODCACHE || process.env.GOMODCACHE || "/root/go/pkg/mod";
+  env.GOFLAGS = vllmGoFlags(cwd || env.PWD);
+  try {
+    const root = cwd || env.PWD;
+    if (root && fs.existsSync(path.join(root, "go.mod")) && fs.existsSync(path.join(root, "vendor"))) {
+      env.GOPROXY = "off";
+    }
+  } catch (_) { /* ignore */ }
+  return env;
+}
+
 function grokSubscriptionEnv() {
   const env = { ...process.env, HOME: "/root", GROK_HOME };
   delete env.XAI_API_KEY;
   delete env.GROK_API_KEY;
-  return env;
+  return withToolPath(env);
 }
 
 function grokBinaryExists() {
@@ -441,14 +495,59 @@ function parseDeviceAuth(text) {
   };
 }
 
-// Only the model's visible answer belongs on Telegram. Grok Build's
-// streaming-json also emits thoughts, tool calls, command menus, usage,
-// and file dumps — those must never be forwarded.
+// Visible answer chunks (final Telegram message). Thoughts are separate.
 function grokVisibleText(ev) {
   if (!ev || typeof ev !== "object") return "";
   if (ev.type !== "text") return "";
   if (typeof ev.data === "string") return ev.data;
   if (typeof ev.text === "string") return ev.text;
+  return "";
+}
+
+function grokThoughtText(ev) {
+  if (!ev || typeof ev !== "object") return "";
+  if (ev.type !== "thought" && ev.type !== "thinking") return "";
+  if (typeof ev.data === "string") return ev.data;
+  if (typeof ev.text === "string") return ev.text;
+  if (typeof ev.thought === "string") return ev.thought;
+  return "";
+}
+
+function sendThinkingProgress(send, text) {
+  // Do not trim: Grok streams leading spaces as part of each token.
+  // Do not prefix 💭 here — callers add it once per thinking burst.
+  if (text == null || text === "") return;
+  send({ type: "progress", text: String(text) });
+}
+
+function stripThinkTags(s) {
+  if (!s) return s;
+  return String(s).replace(/<think>\s*[\s\S]*?<\/think>/gi, "").trim();
+}
+
+// DeepSeek / Claude SDK: thinking lives in assistant content blocks
+// (type=thinking) and sometimes on system events.
+function sdkThinkingText(message) {
+  if (!message || typeof message !== "object") return "";
+  const content = message.content || message.message?.content;
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const b of content) {
+      if (!b || typeof b !== "object") continue;
+      if (b.type === "thinking" || b.type === "reasoning") {
+        const t = b.thinking || b.reasoning || b.text;
+        if (typeof t === "string" && t.trim()) parts.push(t);
+      }
+    }
+    if (parts.length) return parts.join("");
+  }
+  if (message.type === "system") {
+    if (message.subtype === "init" || message.subtype === "compact_boundary") return "";
+    const t = message.thinking || message.reasoning
+      || (typeof message.content === "string" ? message.content : "")
+      || (typeof message.message === "string" ? message.message : "");
+    if (t && !isSdkNoise(t)) return t;
+  }
   return "";
 }
 
@@ -566,19 +665,61 @@ function startGrokLogin() {
 }
 
 // --- Abort tracking ---
-// Maps sessionId -> { aborted: false } for in-flight requests.
-// The abort flag is checked inside the for-await loop to break early.
+// Maps sessionId -> { aborted, child, httpReq } for in-flight requests.
+// Abort must destroy the vLLM HTTP socket; otherwise the 3090 keeps generating
+// after Telegram already thinks the agent finished.
 const activeRequests = new Map();
 
+function killSpawned(child) {
+  if (!child || !child.pid) return;
+  const pid = child.pid;
+  // Immediate SIGKILL — hung `go env` / GOPROXY DNS does not die on SIGTERM,
+  // and a 2s grace left the module-cache lock held for the next tool call.
+  try { process.kill(-pid, "SIGKILL"); } catch (_) {
+    try { child.kill("SIGKILL"); } catch (_) {}
+  }
+}
+
+function markAborted(abortState) {
+  if (!abortState) return;
+  abortState.aborted = true;
+  if (abortState.httpReq && typeof abortState.httpReq.destroy === "function") {
+    try { abortState.httpReq.destroy(); } catch (_) {}
+    abortState.httpReq = null;
+  }
+  if (abortState.child) {
+    killSpawned(abortState.child);
+    abortState.child = null;
+  }
+}
+
 // --- Direct vLLM (Anthropic /v1/messages) --------------------------------
-// Claude Code cannot fit in a 16k context window. This path sends only the
-// user turn plus a short system prompt, and keeps a small rolling history.
+// Claude Code's own system prompt + hooks still blow a local Qwen window.
+// This path sends only the user turn plus a short system prompt, and keeps
+// a rolling history sized for vLLM --max-model-len 65536.
 
 const VLLM_SYSTEM =
-  "You are a coding agent on this machine. Workspace root is /workspace " +
-  "(projects live in /workspace/projects/<name>). Use tools to inspect and " +
-  "edit files. Be concise. Prefer small diffs. Do not dump whole files into " +
-  "chat. After tools finish, give a short summary of what you did.";
+  "You are a coding agent on this machine. " +
+  "If WORKING DIRECTORY is named in the prompt, that is the project — you are already there. " +
+  "Do not glob /workspace, do not ls /workspace/projects, do not search for the project. " +
+  "Otherwise workspace root is /workspace (projects live in /workspace/projects/<name>). " +
+  "Prefer small diffs. Do not dump whole files into chat. " +
+  "Thinking is shown live then discarded — it is NOT the user-facing answer. " +
+  "CHAT vs WORK: if the user is greeting, planning, or saying let's work on a project " +
+  "without naming a file, bug, test, diff, or deploy — answer in plain text and STOP. " +
+  "Do not run git, glob, or a repo tour. Ask what they want next. " +
+  "Only CALL tools (Glob, Grep, Read, Bash, Edit, Write) when the request requires " +
+  "inspecting or changing something concrete. After tools, write a complete visible answer. " +
+  "Never end a turn with empty visible text. " +
+  "Go: no output and exit 0 means SUCCESS. First compile can take ~60s with no logs. " +
+  "Do not run go env/go version/GOPROXY unless go printed an error. " +
+  "GPU queued means another agent is using the model — wait, do not start a toolchain investigation. " +
+  "Google Workspace is available: GmailSearch/GmailThread/GmailSend, " +
+  "CalendarList/CalendarAdd, DriveSearch/DriveLs/DriveDownload/DriveUpload, " +
+  "SheetsRead. The internet is available: WebSearch (find pages) then WebFetch " +
+  "(read a URL). Now returns today's date in Europe/London. ClientsFind searches " +
+  "/clients/current and /clients/past. When asked about email, the web, a URL, " +
+  "or a client job, CALL those tools. Do not say you cannot access email or the internet.";
 
 const VLLM_TOOLS = [
   {
@@ -622,7 +763,7 @@ const VLLM_TOOLS = [
   },
   {
     name: "Bash",
-    description: "Run a shell command in the workspace. 60s timeout. Output truncated.",
+    description: "Run a shell command in the working directory (cwd). 5 minute timeout. Output truncated. Prefer WebFetch/WebSearch over curl for public web pages.",
     input_schema: {
       type: "object",
       properties: {
@@ -633,7 +774,7 @@ const VLLM_TOOLS = [
   },
   {
     name: "Glob",
-    description: "Find files under a path matching a glob (e.g. **/*.go).",
+    description: "Find files under a path matching a glob (e.g. **/*.go). Default path is the working directory. If WORKING DIRECTORY is set, do not pass /workspace.",
     input_schema: {
       type: "object",
       properties: {
@@ -656,7 +797,654 @@ const VLLM_TOOLS = [
       required: ["pattern"],
     },
   },
+  {
+    name: "GmailSearch",
+    description: "Search the user's Gmail. query is Gmail search syntax (e.g. is:unread newer_than:12h, in:sent from:me). max defaults to 10, cap 25. Page long ranges with newer_than/older_than — never pull 12 months in one call. Never say you cannot access email — call this.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        max: { type: "integer" },
+        label: { type: "string" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "GmailThread",
+    description: "Read a full Gmail thread by thread or message id from GmailSearch.",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "GmailSend",
+    description: "Send an email from the user's account. Only when the user explicitly asked to send.",
+    input_schema: {
+      type: "object",
+      properties: {
+        to: { type: "string" },
+        subject: { type: "string" },
+        body: { type: "string" },
+        attach: { type: "string", description: "Optional local file path" },
+      },
+      required: ["to", "subject", "body"],
+    },
+  },
+  {
+    name: "CalendarList",
+    description: "List calendar events. Default is today. days=7 for the next week.",
+    input_schema: {
+      type: "object",
+      properties: {
+        from: { type: "string" },
+        to: { type: "string" },
+        days: { type: "integer" },
+        max: { type: "integer" },
+        query: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "CalendarAdd",
+    description: "Create a calendar event. start like '2026-02-25 14:00', duration like '1h'.",
+    input_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        start: { type: "string" },
+        duration: { type: "string" },
+        description: { type: "string" },
+      },
+      required: ["title", "start"],
+    },
+  },
+  {
+    name: "DriveSearch",
+    description: "Search Google Drive. query is Drive search syntax, e.g. name contains \"report\".",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        max: { type: "integer" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "DriveLs",
+    description: "List files in a Drive folder. Omit parent for root.",
+    input_schema: {
+      type: "object",
+      properties: {
+        parent: { type: "string" },
+        max: { type: "integer" },
+      },
+    },
+  },
+  {
+    name: "DriveDownload",
+    description: "Download a Drive file to a local path under /workspace or /tmp.",
+    input_schema: {
+      type: "object",
+      properties: {
+        file_id: { type: "string" },
+        out: { type: "string" },
+      },
+      required: ["file_id", "out"],
+    },
+  },
+  {
+    name: "DriveUpload",
+    description: "Upload a local file to the one writable Drive folder.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        parent: { type: "string" },
+        name: { type: "string" },
+      },
+      required: ["path", "parent"],
+    },
+  },
+  {
+    name: "SheetsRead",
+    description: "Read a Google Sheets range. Sheets are read-only.",
+    input_schema: {
+      type: "object",
+      properties: {
+        spreadsheet_id: { type: "string" },
+        range: { type: "string" },
+      },
+      required: ["spreadsheet_id", "range"],
+    },
+  },
+  {
+    name: "WebSearch",
+    description: "Search the public internet. Returns titles, URLs, and snippets. Use this instead of saying you cannot access the web. Then WebFetch promising URLs.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        max: { type: "integer", description: "Max results, default 8, cap 12" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "WebFetch",
+    description: "Fetch a public http(s) URL and return extracted text. Use after WebSearch or when the user gives a link. Private/localhost URLs are blocked.",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: { type: "string" },
+        extract: { type: "string", description: "Optional hint of what to focus on (returned as a header; full text still included)" },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "Now",
+    description: "Current date and time in Europe/London and UTC. Use before 'today', 'this morning', or scheduling.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "ClientsFind",
+    description: "Find a Grey & Associates client/job folder under /clients/current and /clients/past by name, road, or abbreviation.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "RunReviewTeam",
+    description: "Run a named review team as isolated agents using this local model (not the claude CLI). Teams: go-dev-team, go-sec-team, fe-dev-team, fe-sec-team, design, integration. Use this instead of spawning `claude`.",
+    input_schema: {
+      type: "object",
+      properties: {
+        team: { type: "string" },
+        task: { type: "string", description: "What to review (paths, diff, feature)" },
+      },
+      required: ["team", "task"],
+    },
+  },
 ];
+
+const HARNESS_SKILLS_DIR = process.env.HARNESS_SKILLS_DIR || "/app/harness/skills";
+const DRIVE_WRITABLE_FOLDER = "1MnC-0QWn1P7bxgUuMZtw2DPq7OhuAgjw";
+
+function parseYAMLBool(v) {
+  const s = String(v || "").trim().replace(/^['"]|['"]$/g, "").toLowerCase();
+  return s === "true" || s === "yes" || s === "1";
+}
+
+function parseSkillMD(content, filename) {
+  const skill = {
+    name: String(filename || "").replace(/^skill-/i, "").replace(/\.md$/i, ""),
+    description: "",
+    always: false,
+    harness: false,
+    content: content,
+  };
+  const trimmed = String(content || "").trim();
+  if (!trimmed.startsWith("---")) return skill;
+  const rest = trimmed.slice(3);
+  const endIdx = rest.indexOf("---");
+  if (endIdx <= 0) return skill;
+  const front = rest.slice(0, endIdx);
+  skill.content = rest.slice(endIdx + 3).trim();
+  for (const raw of front.split("\n")) {
+    const line = raw.trim();
+    const colon = line.indexOf(":");
+    if (colon <= 0) continue;
+    const key = line.slice(0, colon).trim().toLowerCase();
+    const val = line.slice(colon + 1).trim().replace(/^['"]|['"]$/g, "");
+    if (key === "name") skill.name = val;
+    else if (key === "description") skill.description = val;
+    else if (key === "always") skill.always = parseYAMLBool(val);
+    else if (key === "harness") skill.harness = parseYAMLBool(val);
+  }
+  return skill;
+}
+
+function loadHarnessSkills() {
+  let entries;
+  try {
+    entries = fs.readdirSync(HARNESS_SKILLS_DIR);
+  } catch {
+    return [];
+  }
+  const skills = [];
+  for (const name of entries) {
+    if (!/skill/i.test(name) || !name.toLowerCase().endsWith(".md")) continue;
+    try {
+      const raw = fs.readFileSync(path.join(HARNESS_SKILLS_DIR, name), "utf8");
+      skills.push(parseSkillMD(raw, name));
+    } catch (err) {
+      console.warn(`[harness] skip ${name}: ${err.message}`);
+    }
+  }
+  return skills;
+}
+
+function formatHarnessSkillsForVllm() {
+  const skills = loadHarnessSkills();
+  if (!skills.length) return "";
+  const parts = [];
+  const indexLines = skills.map((s) => `- ${s.name}: ${s.description || s.name}`);
+  parts.push(
+    "<harness_skills>\nUse these tools/workflows. Match by intent.\n" +
+    indexLines.join("\n") +
+    "\n</harness_skills>"
+  );
+  for (const s of skills) {
+    if (!s.always || !s.content) continue;
+    parts.push(`<skill name="${s.name}">\n${s.content}\n</skill>`);
+  }
+  return parts.join("\n\n");
+}
+
+function vllmPinnedCwd(cwd) {
+  const p = String(cwd || "").replace(/\/+$/, "");
+  if (p.startsWith("/workspace/projects/") && p.length > "/workspace/projects/".length) {
+    return p;
+  }
+  return "";
+}
+
+function vllmCwdBanner(workDir) {
+  const pinned = vllmPinnedCwd(workDir);
+  if (pinned) {
+    return (
+      `WORKING DIRECTORY is ${pinned}. You are already there. ` +
+      `Do not glob /workspace, do not ls /workspace/projects, do not search for this project, ` +
+      `do not list sibling repos. Read, Glob, Grep, and Bash start from this directory.`
+    );
+  }
+  return "";
+}
+
+function vllmClampSearchRoot(cwd, requested) {
+  const pinned = vllmPinnedCwd(cwd);
+  const root = vllmResolvePath(cwd, requested || cwd || "/workspace");
+  if (!pinned) return root;
+  const norm = String(root || "").replace(/\/+$/, "");
+  if (norm === "/workspace" || norm === "/workspace/projects") {
+    return pinned;
+  }
+  return root;
+}
+
+function vllmSystemForRequest(extra, workDir) {
+  const parts = [];
+  const banner = vllmCwdBanner(workDir);
+  if (banner) parts.push(banner);
+  parts.push(VLLM_SYSTEM);
+  const harness = formatHarnessSkillsForVllm();
+  if (harness) parts.push(harness);
+  const extraTrim = String(extra || "").trim();
+  if (extraTrim && extraTrim !== VLLM_SYSTEM) parts.push(extraTrim);
+  return parts.join("\n\n");
+}
+
+function gogAuthHint(out) {
+  const s = String(out || "");
+  if (/not authenticated|token.*(missing|expired|invalid)|oauth/i.test(s)) {
+    return s + "\nTell the user to run /googleauth in Telegram and paste the code.";
+  }
+  return s;
+}
+
+function gogBannedReason(argsOrCmd) {
+  // Tokenise so a search query containing the word "delete" is not blocked.
+  const tokens = Array.isArray(argsOrCmd)
+    ? argsOrCmd.map((a) => String(a).toLowerCase())
+    : (String(argsOrCmd || "").toLowerCase().match(/[a-z0-9_-]+/g) || []);
+  let i = tokens.indexOf("gog");
+  if (i < 0) i = -1; // named tools pass argv without the binary
+  const svc = tokens[i + 1] || "";
+  const verb = tokens[i + 2] || "";
+  const third = tokens[i + 3] || "";
+  if (verb === "delete" || verb === "trash" || third === "delete" || third === "trash") {
+    return "delete/trash is blocked";
+  }
+  if (svc === "sheets" && ["write", "update", "append", "clear", "create"].includes(verb)) {
+    return "sheets are read-only";
+  }
+  if (svc === "drive" && ["delete", "trash", "move"].includes(verb)) {
+    return "drive delete/trash/move is blocked";
+  }
+  return "";
+}
+
+async function runGog(args, abortState) {
+  const banned = gogBannedReason(args);
+  if (banned) return `error: ${banned}`;
+  // Must be async. spawnSync blocked the Node event loop so WebSocket pongs
+  // stopped and the gateway dropped the session ("socket hang up") mid-Gmail.
+  const result = await spawnAsync("gog", args, {
+    timeout: 90000,
+    maxBuffer: 1024 * 1024,
+    env: { ...process.env, HOME: "/root" },
+  }, abortState);
+  const out = ((result.stdout || "") + (result.stderr || "")).trim() || "(empty)";
+  if (result.status === 1 && /ENOENT|not found/i.test(out)) {
+    return "error: gog binary not found in sidecar — rebuild the sidecar image";
+  }
+  const body = result.status === 0 ? out : `gog exit ${result.status}\n${out}`;
+  return gogAuthHint(vllmTruncate(body, 8000));
+}
+
+const WEB_UA =
+  "Mozilla/5.0 (compatible; ClaudeGateway/1.0; +https://github.com/you/claude-gateway)";
+const WEB_FETCH_TIMEOUT_MS = 20000;
+const WEB_MAX_BYTES = 512 * 1024;
+const WEB_MAX_REDIRECTS = 5;
+
+function isPrivateIP(ip) {
+  const ver = net.isIP(ip);
+  if (ver === 4) {
+    const p = ip.split(".").map((n) => parseInt(n, 10));
+    if (p.length !== 4 || p.some((n) => Number.isNaN(n))) return true;
+    if (p[0] === 0 || p[0] === 10 || p[0] === 127) return true;
+    if (p[0] === 169 && p[1] === 254) return true;
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+    if (p[0] === 192 && p[1] === 168) return true;
+    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return true;
+    if (p[0] >= 224) return true;
+    return false;
+  }
+  if (ver === 6) {
+    const n = ip.toLowerCase();
+    if (n === "::1" || n === "::") return true;
+    if (n.startsWith("fe80:") || n.startsWith("fc") || n.startsWith("fd")) return true;
+    if (n.startsWith("::ffff:")) return isPrivateIP(n.slice(7));
+    return false;
+  }
+  return true;
+}
+
+function hostnameBlocked(host) {
+  const h = String(host || "").toLowerCase().replace(/\.$/, "");
+  if (!h) return true;
+  if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal")) return true;
+  if (h === "host.docker.internal" || h === "sidecar" || h === "gateway" || h === "ollama") return true;
+  if (h === "metadata.google.internal") return true;
+  return false;
+}
+
+async function assertPublicHttpUrl(raw) {
+  let u;
+  try {
+    u = new URL(String(raw || "").trim());
+  } catch {
+    throw new Error("invalid URL");
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error("only http/https URLs are allowed");
+  }
+  if (u.username || u.password) {
+    throw new Error("URLs with credentials are blocked");
+  }
+  if (hostnameBlocked(u.hostname)) {
+    throw new Error(`blocked host ${u.hostname}`);
+  }
+  if (net.isIP(u.hostname) && isPrivateIP(u.hostname)) {
+    throw new Error(`blocked private IP ${u.hostname}`);
+  }
+  if (!net.isIP(u.hostname)) {
+    let answers;
+    try {
+      answers = await dns.lookup(u.hostname, { all: true });
+    } catch (err) {
+      throw new Error(`DNS failed for ${u.hostname}: ${err.message}`);
+    }
+    if (!answers.length) throw new Error(`DNS returned no addresses for ${u.hostname}`);
+    for (const a of answers) {
+      if (isPrivateIP(a.address)) {
+        throw new Error(`blocked private IP ${a.address} for ${u.hostname}`);
+      }
+    }
+  }
+  return u;
+}
+
+function decodeEntities(s) {
+  return String(s || "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => {
+      try { return String.fromCodePoint(parseInt(h, 16)); } catch { return ""; }
+    })
+    .replace(/&#(\d+);/g, (_, n) => {
+      try { return String.fromCodePoint(parseInt(n, 10)); } catch { return ""; }
+    });
+}
+
+function htmlToText(html) {
+  let s = String(html || "");
+  s = s.replace(/<script[\s\S]*?<\/script>/gi, " ");
+  s = s.replace(/<style[\s\S]*?<\/style>/gi, " ");
+  s = s.replace(/<noscript[\s\S]*?<\/noscript>/gi, " ");
+  s = s.replace(/<!--[\s\S]*?-->/g, " ");
+  s = s.replace(/<(br|p|div|h[1-6]|li|tr|section|article|header|footer)[^>]*>/gi, "\n");
+  s = s.replace(/<\/(p|div|h[1-6]|li|tr|section|article)[^>]*>/gi, "\n");
+  s = s.replace(/<[^>]+>/g, " ");
+  s = decodeEntities(s);
+  s = s.replace(/\r/g, "");
+  s = s.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+  s = s.replace(/[ \t]{2,}/g, " ");
+  return s.trim();
+}
+
+function unwrapDdgHref(href) {
+  try {
+    const u = new URL(href, "https://duckduckgo.com");
+    const uddg = u.searchParams.get("uddg");
+    if (uddg) return uddg;
+    return u.href;
+  } catch {
+    return href;
+  }
+}
+
+async function httpGetText(urlObj, remainingRedirects) {
+  const resp = await fetch(urlObj.href, {
+    method: "GET",
+    redirect: "manual",
+    headers: {
+      "user-agent": WEB_UA,
+      accept: "text/html,application/xhtml+xml,application/xml,text/plain,application/json;q=0.9,*/*;q=0.1",
+    },
+    signal: AbortSignal.timeout(WEB_FETCH_TIMEOUT_MS),
+  });
+  if ([301, 302, 303, 307, 308].includes(resp.status)) {
+    const loc = resp.headers.get("location");
+    if (!loc) throw new Error(`redirect ${resp.status} with no Location`);
+    if (remainingRedirects <= 0) throw new Error("too many redirects");
+    const next = await assertPublicHttpUrl(new URL(loc, urlObj.href).href);
+    return httpGetText(next, remainingRedirects - 1);
+  }
+  const ctype = (resp.headers.get("content-type") || "").toLowerCase();
+  if (ctype.startsWith("image/") || ctype.includes("octet-stream") || ctype.includes("pdf")) {
+    throw new Error(`non-text content-type ${ctype || "unknown"}`);
+  }
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => "");
+    throw new Error(`HTTP ${resp.status} ${resp.statusText} ${errBody.slice(0, 200)}`);
+  }
+  const buf = Buffer.from(await resp.arrayBuffer());
+  const sliced = buf.length > WEB_MAX_BYTES ? buf.subarray(0, WEB_MAX_BYTES) : buf;
+  const text = sliced.toString("utf8");
+  return { ctype, text, finalUrl: urlObj.href, truncated: buf.length > WEB_MAX_BYTES };
+}
+
+async function webFetchUrl(rawUrl, extract) {
+  const url = await assertPublicHttpUrl(rawUrl);
+  const got = await httpGetText(url, WEB_MAX_REDIRECTS);
+  let body = got.text;
+  if (got.ctype.includes("html") || /<html/i.test(body.slice(0, 2000))) {
+    body = htmlToText(body);
+  }
+  const header = [
+    `url: ${got.finalUrl}`,
+    got.truncated ? "note: truncated large body" : "",
+    extract ? `extract hint: ${extract}` : "",
+  ].filter(Boolean).join("\n");
+  return vllmTruncate(`${header}\n\n${body}`, 12000);
+}
+
+function parseDdgResults(html, max) {
+  const results = [];
+  const seen = new Set();
+  const re = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html)) && results.length < max) {
+    let href = decodeEntities(m[1]);
+    if (href.startsWith("//")) href = "https:" + href;
+    href = unwrapDdgHref(href);
+    if (!/^https?:\/\//i.test(href)) continue;
+    try {
+      const host = new URL(href).hostname;
+      if (/duckduckgo\.com$/i.test(host) || hostnameBlocked(host)) continue;
+    } catch {
+      continue;
+    }
+    const title = htmlToText(m[2]).replace(/\s+/g, " ").trim();
+    if (!title || title.length < 2) continue;
+    if (seen.has(href)) continue;
+    seen.add(href);
+    results.push({ title, url: href });
+  }
+  return results;
+}
+
+async function braveSearch(query, max, apiKey) {
+  const u = new URL("https://api.search.brave.com/res/v1/web/search");
+  u.searchParams.set("q", query);
+  u.searchParams.set("count", String(max));
+  const resp = await fetch(u.href, {
+    headers: {
+      accept: "application/json",
+      "x-subscription-token": apiKey,
+      "user-agent": WEB_UA,
+    },
+    signal: AbortSignal.timeout(WEB_FETCH_TIMEOUT_MS),
+  });
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(`Brave HTTP ${resp.status}: ${json?.message || json?.error || ""}`.trim());
+  }
+  const rows = Array.isArray(json?.web?.results) ? json.web.results : [];
+  return rows.slice(0, max).map((r) => ({
+    title: r.title || "",
+    url: r.url || "",
+    snippet: r.description || "",
+  })).filter((r) => r.url);
+}
+
+async function duckDuckGoSearch(query, max) {
+  const u = new URL("https://html.duckduckgo.com/html/");
+  const resp = await fetch(u.href, {
+    method: "POST",
+    headers: {
+      "user-agent": WEB_UA,
+      "content-type": "application/x-www-form-urlencoded",
+      accept: "text/html",
+    },
+    body: new URLSearchParams({ q: query, kl: "uk-en" }).toString(),
+    signal: AbortSignal.timeout(WEB_FETCH_TIMEOUT_MS),
+    redirect: "follow",
+  });
+  const html = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`DuckDuckGo HTTP ${resp.status}`);
+  }
+  const rows = parseDdgResults(html, max);
+  if (!rows.length) {
+    throw new Error("DuckDuckGo returned no parseable results");
+  }
+  return rows;
+}
+
+function formatSearchResults(rows) {
+  if (!rows.length) return "No search results.";
+  return rows.map((r, i) => {
+    const snip = r.snippet ? `\n   ${htmlToText(r.snippet).replace(/\s+/g, " ").trim()}` : "";
+    return `${i + 1}. ${r.title}\n   ${r.url}${snip}`;
+  }).join("\n");
+}
+
+async function webSearchQuery(query, maxN) {
+  const q = String(query || "").trim();
+  if (!q) return "error: query required";
+  const max = Math.min(12, Math.max(1, parseInt(maxN, 10) || 8));
+  const braveKey = braveApiKey();
+  // If a Brave key is configured, use it exclusively so a 401 is visible
+  // instead of silently falling back to DuckDuckGo.
+  if (braveKey) {
+    try {
+      const rows = await braveSearch(q, max, braveKey);
+      if (!rows.length) return "source: brave\n\nNo search results.";
+      return vllmTruncate(`source: brave\n\n${formatSearchResults(rows)}`, 6000);
+    } catch (err) {
+      return `error: Brave search failed: ${err.message}`;
+    }
+  }
+  try {
+    const rows = await duckDuckGoSearch(q, max);
+    if (!rows.length) return "source: duckduckgo\n\nNo search results.";
+    return vllmTruncate(`source: duckduckgo\n\n${formatSearchResults(rows)}`, 6000);
+  } catch (err) {
+    return `error: web search failed (${err.message}). Set BRAVE_API or BRAVE_API_KEY in claude-gateway/.env.`;
+  }
+}
+
+function nowStamp() {
+  const d = new Date();
+  const london = d.toLocaleString("en-GB", {
+    timeZone: "Europe/London",
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  });
+  return `UTC: ${d.toISOString()}\nEurope/London: ${london}`;
+}
+
+function clientsFind(query) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return "error: query required";
+  const hits = [];
+  for (const root of ["/clients/current", "/clients/past"]) {
+    let names;
+    try {
+      names = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const d of names) {
+      if (!d.isDirectory() && !d.isSymbolicLink()) continue;
+      if (d.name.toLowerCase().includes(q)) hits.push(`${root}/${d.name}`);
+    }
+  }
+  return hits.slice(0, 40).join("\n") || "(no matching client folders)";
+}
 
 const VLLM_PATH_PREFIXES = ["/workspace", "/clients/current", "/clients/past", "/tmp"];
 
@@ -668,13 +1456,107 @@ function vllmResolvePath(cwd, p) {
   throw new Error(`path not allowed: ${abs}`);
 }
 
+function vllmGoFlags(cwd) {
+  let flags = String(process.env.GOFLAGS || "");
+  if (!/(^|\s)-buildvcs=false(\s|$)/.test(flags)) {
+    flags = `${flags} -buildvcs=false`.trim();
+  }
+  const root = cwd || "/workspace";
+  try {
+    if (fs.existsSync(path.join(root, "go.mod")) && fs.existsSync(path.join(root, "vendor"))) {
+      if (!/(^|\s)-mod=/.test(flags)) flags = `${flags} -mod=vendor`.trim();
+    }
+  } catch (_) { /* ignore */ }
+  return flags;
+}
+
+function vllmToolEnv(cwd) {
+  const root = cwd || "/workspace";
+  return withToolPath({
+    ...process.env,
+    HOME: "/root",
+    PWD: root,
+  }, root);
+}
+
+// spawnSync blocks the Node event loop, so WebSocket pongs stop and the
+// gateway drops the connection after 90s ("websocket connection lost").
+// Phase 5 `go test` routinely exceeds that. Keep the loop free.
+function spawnAsync(command, args, opts, abortState) {
+  return new Promise((resolve) => {
+    const timeoutMs = opts.timeout || 120000;
+    const maxBuf = opts.maxBuffer || 1024 * 1024;
+    const startedAt = Date.now();
+    const child = spawn(command, args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+    if (abortState) abortState.child = child;
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const ping = opts.send
+      ? setInterval(() => {
+          if (settled) return;
+          const secs = Math.round((Date.now() - startedAt) / 1000);
+          const label = String(opts.progressLabel || "").slice(0, 90);
+          opts.send({
+            type: "progress",
+            tool: "Bash",
+            input: label ? `still running ${secs}s: ${label}` : `still running ${secs}s`,
+          });
+        }, 15000)
+      : null;
+    const finish = (status, extraErr) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (ping) clearInterval(ping);
+      if (abortState && abortState.child === child) abortState.child = null;
+      if (extraErr) stderr = (stderr + "\n" + extraErr).trim();
+      resolve({ status, stdout, stderr, elapsedMs: Date.now() - startedAt });
+    };
+    const timer = setTimeout(() => {
+      killSpawned(child);
+      finish(124, `timed out after ${timeoutMs}ms`);
+    }, timeoutMs);
+    const take = (chunk, which) => {
+      if (which === "out") stdout += chunk;
+      else stderr += chunk;
+      if (stdout.length + stderr.length > maxBuf) {
+        killSpawned(child);
+      }
+    };
+    child.stdout.on("data", (d) => take(d.toString(), "out"));
+    child.stderr.on("data", (d) => take(d.toString(), "err"));
+    child.on("error", (err) => finish(1, err.message));
+    child.on("close", (code) => finish(code == null ? 1 : code));
+    if (abortState && abortState.aborted) {
+      killSpawned(child);
+    }
+  });
+}
+
 function vllmTruncate(s, n) {
   const t = String(s ?? "");
   if (t.length <= n) return t;
   return t.slice(0, n) + `\n… truncated ${t.length - n} chars`;
 }
 
-function vllmExecTool(name, input, cwd) {
+function isReportsWritePath(fp) {
+  return /(^|\/)reports\//.test(String(fp || "").replace(/\\/g, "/"));
+}
+
+function reviewWriteOnly(allowedTools) {
+  return Array.isArray(allowedTools) &&
+    allowedTools.includes("Write") &&
+    !allowedTools.includes("Bash") &&
+    !allowedTools.includes("Edit");
+}
+
+async function vllmExecTool(name, input, cwd, abortState, send, allowedTools) {
   const i = input && typeof input === "object" ? input : {};
   try {
     if (name === "Read") {
@@ -689,6 +1571,9 @@ function vllmExecTool(name, input, cwd) {
     }
     if (name === "Write") {
       const fp = vllmResolvePath(cwd, i.file_path);
+      if (reviewWriteOnly(allowedTools) && !isReportsWritePath(fp)) {
+        return `error: review agents may only Write under a reports/ directory (got ${fp})`;
+      }
       fs.mkdirSync(path.dirname(fp), { recursive: true });
       fs.writeFileSync(fp, i.content ?? "");
       return `Wrote ${fp} (${Buffer.byteLength(String(i.content ?? ""), "utf8")} bytes)`;
@@ -711,45 +1596,331 @@ function vllmExecTool(name, input, cwd) {
       return `Edited ${fp}`;
     }
     if (name === "Bash") {
-      const result = spawnSync("bash", ["-lc", String(i.command ?? "")], {
+      const cmd = String(i.command ?? "");
+      if (/\bgog\b/i.test(cmd)) {
+        const banned = gogBannedReason(cmd);
+        if (banned) return `error: ${banned}`;
+        if (/drive\s+upload/i.test(cmd) && !cmd.includes(DRIVE_WRITABLE_FOLDER)) {
+          return `error: Drive uploads only allowed to folder ${DRIVE_WRITABLE_FOLDER}`;
+        }
+      }
+      if (/\b(curl|wget)\b/i.test(cmd) && /(169\.254\.|metadata\.google|host\.docker\.internal|\/\/127\.|\/\/localhost\b)/i.test(cmd)) {
+        return "error: curl/wget to private/metadata addresses is blocked; use WebFetch for public URLs";
+      }
+      let timeout = 300000;
+      if (/\bgo\s+(env|version)\b/.test(cmd)) timeout = 15000;
+      else if (/\bgo\s+(build|test|vet)\b/.test(cmd)) timeout = 180000;
+      const result = await spawnAsync("bash", ["-c", cmd], {
         cwd: cwd || "/workspace",
-        encoding: "utf8",
-        timeout: 60000,
+        timeout,
         maxBuffer: 1024 * 1024,
-        env: { ...process.env, HOME: "/root", PWD: cwd || "/workspace" },
-      });
-      const out = (result.stdout || "") + (result.stderr || "");
+        env: vllmToolEnv(cwd),
+        send,
+        progressLabel: cmd.replace(/\s+/g, " ").slice(0, 90),
+      }, abortState);
+      let out = (result.stdout || "") + (result.stderr || "");
       const code = result.status;
-      return vllmTruncate(`exit ${code}\n${out}`, 8000);
+      const secs = Math.max(1, Math.round((result.elapsedMs || 0) / 1000));
+      if (/\bgo\s+/.test(cmd) && code === 0) {
+        const body = out.replace(/^exit 0\s*/i, "").trim();
+        if (!body) {
+          out += `\n# go exited 0 in ${secs}s with no output. That is SUCCESS, not a hang. Do not run go env/go version/GOPROXY/vendor.\n`;
+        }
+      }
+      if (code === 124 && /\bgo\s+/.test(cmd)) {
+        out += "\n# killed on timeout. Do not diagnose GOPROXY. Next build: go build -o /tmp/out ./cmd/server\n";
+      }
+      return vllmTruncate(`exit ${code} (${secs}s)\n${out}`, 8000);
     }
     if (name === "Glob") {
-      const root = vllmResolvePath(cwd, i.path || cwd || "/workspace");
+      const root = vllmClampSearchRoot(cwd, i.path);
       const pat = String(i.pattern || "*");
-      const result = spawnSync(
-        "bash",
-        ["-lc", `find ${JSON.stringify(root)} -type f | head -n 200`],
-        { encoding: "utf8", timeout: 15000, maxBuffer: 512 * 1024 }
-      );
+      const result = await spawnAsync("bash", ["-c", `find ${JSON.stringify(root)} -type f | head -n 200`], {
+        cwd: cwd || "/workspace",
+        timeout: 15000,
+        maxBuffer: 512 * 1024,
+        env: vllmToolEnv(cwd),
+      }, abortState);
       const files = (result.stdout || "").split("\n").filter(Boolean);
       const re = globToRegExp(pat);
       const matched = files.filter((f) => re.test(f)).slice(0, 80);
       return matched.join("\n") || "(no matches)";
     }
     if (name === "Grep") {
-      const root = vllmResolvePath(cwd, i.path || cwd || "/workspace");
+      const root = vllmClampSearchRoot(cwd, i.path);
       const pat = String(i.pattern || "");
       const glob = i.glob ? ` --glob ${JSON.stringify(i.glob)}` : "";
-      const result = spawnSync(
+      const result = await spawnAsync(
         "bash",
-        ["-lc", `rg -n --no-heading -m 50${glob} ${JSON.stringify(pat)} ${JSON.stringify(root)} || true`],
-        { encoding: "utf8", timeout: 20000, maxBuffer: 512 * 1024 }
+        ["-c", `rg -n --no-heading -m 50${glob} ${JSON.stringify(pat)} ${JSON.stringify(root)} || true`],
+        {
+          cwd: cwd || "/workspace",
+          timeout: 20000,
+          maxBuffer: 512 * 1024,
+          env: vllmToolEnv(cwd),
+        },
+        abortState
       );
       return vllmTruncate(result.stdout || "(no matches)", 6000);
+    }
+    if (name === "GmailSearch") {
+      const query = String(i.query || "newer_than:1d");
+      const args = ["gmail", "search", query];
+      const max = parseInt(i.max, 10);
+      if (max > 0) args.push("--max", String(Math.min(max, 25)));
+      if (i.label) args.push("--label", String(i.label));
+      return await runGog(args, abortState);
+    }
+    if (name === "GmailThread") {
+      const id = String(i.id || "").trim();
+      if (!id) return "error: id required";
+      return await runGog(["gmail", "thread", id], abortState);
+    }
+    if (name === "GmailSend") {
+      const args = ["gmail", "send", "--to", String(i.to || ""), "--subject", String(i.subject || ""), "--body", String(i.body || "")];
+      if (i.attach) args.push("--attach", String(i.attach));
+      return await runGog(args, abortState);
+    }
+    if (name === "CalendarList") {
+      const args = ["calendar", "list"];
+      if (i.from) args.push("--from", String(i.from));
+      if (i.to) args.push("--to", String(i.to));
+      const days = parseInt(i.days, 10);
+      if (days > 0) args.push("--days", String(days));
+      const max = parseInt(i.max, 10);
+      if (max > 0) args.push("--max", String(max));
+      if (i.query) args.push("--query", String(i.query));
+      return await runGog(args, abortState);
+    }
+    if (name === "CalendarAdd") {
+      const args = ["calendar", "add", "--title", String(i.title || ""), "--start", String(i.start || "")];
+      if (i.duration) args.push("--duration", String(i.duration));
+      if (i.description) args.push("--description", String(i.description));
+      return await runGog(args, abortState);
+    }
+    if (name === "DriveSearch") {
+      const args = ["drive", "search", String(i.query || "")];
+      const max = parseInt(i.max, 10);
+      if (max > 0) args.push("--max", String(max));
+      return await runGog(args, abortState);
+    }
+    if (name === "DriveLs") {
+      const args = ["drive", "ls"];
+      if (i.parent) args.push("--parent", String(i.parent));
+      const max = parseInt(i.max, 10);
+      if (max > 0) args.push("--max", String(max));
+      return await runGog(args, abortState);
+    }
+    if (name === "DriveDownload") {
+      const out = vllmResolvePath(cwd, i.out);
+      return await runGog(["drive", "download", String(i.file_id || ""), "--out", out], abortState);
+    }
+    if (name === "DriveUpload") {
+      const parent = String(i.parent || "");
+      if (parent !== DRIVE_WRITABLE_FOLDER) {
+        return `error: Drive uploads only allowed to folder ${DRIVE_WRITABLE_FOLDER}`;
+      }
+      const fp = vllmResolvePath(cwd, i.path);
+      const args = ["drive", "upload", fp, "--parent", parent];
+      if (i.name) args.push("--name", String(i.name));
+      return await runGog(args, abortState);
+    }
+    if (name === "SheetsRead") {
+      const args = ["sheets", "read", String(i.spreadsheet_id || ""), "--range", String(i.range || "")];
+      return await runGog(args, abortState);
+    }
+    if (name === "WebSearch") {
+      return await webSearchQuery(i.query, i.max);
+    }
+    if (name === "WebFetch") {
+      return await webFetchUrl(i.url, i.extract);
+    }
+    if (name === "Now") {
+      return nowStamp();
+    }
+    if (name === "ClientsFind") {
+      return clientsFind(i.query);
+    }
+    if (name === "RunReviewTeam") {
+      return await runReviewTeamIsolated(String(i.team || ""), String(i.task || ""), cwd, send, abortState);
     }
     return `unknown tool: ${name}`;
   } catch (err) {
     return `error: ${err.message}`;
   }
+}
+
+const REVIEW_TEAMS = {
+  "go-dev-team": [
+    { name: "GoPurist", file: "coding/go-dev-team/go-purist.md" },
+    { name: "GoPragmatist", file: "coding/go-dev-team/go-pragmatist.md" },
+    { name: "GoPessimist", file: "coding/go-dev-team/go-pessimist.md" },
+  ],
+  "go-sec-team": [
+    { name: "GoSecurity", file: "coding/go-sec-team/go-security-agent.md" },
+    { name: "GoHacker", file: "coding/go-sec-team/go-hacker-agent.md" },
+  ],
+  "fe-dev-team": [
+    { name: "FEPurist", file: "coding/frontend-team/fe-purist.md" },
+    { name: "FEPragmatist", file: "coding/frontend-team/fe-pragmatist.md" },
+    { name: "FEPessimist", file: "coding/frontend-team/fe-pessimist.md" },
+  ],
+  "fe-sec-team": [
+    { name: "FESecurity", file: "coding/frontend-team/fe-security-agent.md" },
+    { name: "FEHacker", file: "coding/frontend-team/fe-hacker-agent.md" },
+  ],
+  design: [
+    { name: "Security", file: "design/security-agent.md" },
+    { name: "Compliance", file: "design/compliance-agent.md" },
+    { name: "DataIntegrity", file: "design/data-integrity-agent.md" },
+    { name: "Performance", file: "design/performance-agent.md" },
+    { name: "ErrorHandling", file: "design/error-handling-agent.md" },
+  ],
+  integration: [
+    { name: "APIGuardian", file: "coding/integration-team/api-guardian-agent.md" },
+    { name: "CrossLangSecurity", file: "coding/security-review/cross-language-security.md" },
+  ],
+};
+
+function discoverReviewTeamsFromDisk() {
+  const roots = [
+    "/app/teams",
+    "/workspace/.claude/teams",
+    "/app/agents",
+    "/workspace/.claude/agents",
+  ];
+  const skip = new Set(["readme.md", "consensus-protocol.md"]);
+  const claimed = new Set();
+  for (const members of Object.values(REVIEW_TEAMS)) {
+    for (const m of members) claimed.add(m.file);
+  }
+  function mdFiles(dir) {
+    let ents;
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+    return ents.filter((e) => {
+      if (!e.isFile()) return false;
+      const n = e.name.toLowerCase();
+      return n.endsWith(".md") && !skip.has(n) && !n.startsWith("skill-");
+    }).map((e) => path.join(dir, e.name));
+  }
+  function hasTeamSubdirs(dir) {
+    let ents;
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
+    return ents.some((e) => e.isDirectory() && mdFiles(path.join(dir, e.name)).length > 0);
+  }
+  function prettyName(file) {
+    let base = path.basename(file, path.extname(file)).replace(/-agent$/i, "");
+    return base.split(/[-_]/).map((p) => p ? p[0].toUpperCase() + p.slice(1).toLowerCase() : "").join("");
+  }
+  function addMember(team, fileRel, abs) {
+    if (claimed.has(fileRel)) return;
+    claimed.add(fileRel);
+    if (!REVIEW_TEAMS[team]) REVIEW_TEAMS[team] = [];
+    if (REVIEW_TEAMS[team].some((m) => m.file === fileRel)) return;
+    REVIEW_TEAMS[team].push({ name: prettyName(abs), file: fileRel });
+  }
+  function walk(root, dir) {
+    let ents;
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    const files = mdFiles(dir);
+    const kids = hasTeamSubdirs(dir);
+    if (files.length && dir !== root) {
+      const rels = files.map((f) => path.relative(root, f).split(path.sep).join("/"));
+      if (kids) {
+        for (let i = 0; i < files.length; i++) {
+          const base = path.basename(rels[i], path.extname(rels[i])).replace(/-agent$/i, "").toLowerCase();
+          addMember(base, rels[i], files[i]);
+        }
+      } else {
+        const team = path.basename(dir);
+        const alias = { "frontend-team": "fe-dev-team", "kotlin-team": "mobile-review" }[team] || team;
+        for (let i = 0; i < files.length; i++) addMember(alias, rels[i], files[i]);
+      }
+    }
+    for (const e of ents) {
+      if (e.isDirectory()) walk(root, path.join(dir, e.name));
+    }
+  }
+  for (const root of roots) walk(root, root);
+}
+
+discoverReviewTeamsFromDisk();
+
+function normalizeReviewTeam(name) {
+  const n = String(name || "").trim().toLowerCase().replace(/\s+/g, "-");
+  const aliases = {
+    "go-dev": "go-dev-team",
+    "go-sec": "go-sec-team",
+    "gosec": "go-sec-team",
+    "fe-dev": "fe-dev-team",
+    "fe-sec": "fe-sec-team",
+  };
+  return aliases[n] || n;
+}
+
+function readAgentDNA(rel) {
+  const roots = [
+    "/app/teams",
+    "/workspace/.claude/teams",
+    "/app/agents",
+    "/workspace/.claude/agents",
+  ];
+  for (const root of roots) {
+    const p = path.join(root, rel);
+    try {
+      return fs.readFileSync(p, "utf8");
+    } catch {
+      /* try next */
+    }
+  }
+  throw new Error(`agent DNA not found: ${rel}`);
+}
+
+async function runReviewTeamIsolated(teamName, task, cwd, parentSend, abortState) {
+  const team = normalizeReviewTeam(teamName);
+  const members = REVIEW_TEAMS[team];
+  if (!members) {
+    return `unknown team ${teamName}. Available: ${Object.keys(REVIEW_TEAMS).join(", ")}`;
+  }
+  if (!String(task || "").trim()) {
+    return "error: task is required";
+  }
+  const parts = [`# ${team}\nTask: ${task}\n`];
+  for (const m of members) {
+    if (abortState && abortState.aborted) {
+      parts.push(`## ${m.name}\n(aborted)`);
+      break;
+    }
+    if (typeof parentSend === "function") {
+      parentSend({ type: "progress", tool: "RunReviewTeam", input: `${team}/${m.name}` });
+    }
+    let dna;
+    try {
+      dna = readAgentDNA(m.file);
+    } catch (err) {
+      parts.push(`## ${m.name}\nERROR: ${err.message}`);
+      continue;
+    }
+    let text = "";
+    await handleVllmAsk({
+      session_id: `orch-${randomUUID()}`,
+      isolated: true,
+      prompt: task,
+      system_prompt: dna,
+      cwd: cwd || "/workspace",
+      max_turns: 12,
+      allowed_tools: ["Read", "Glob", "Grep", "Write"],
+    }, (obj) => {
+      if (!obj || typeof obj !== "object") return;
+      if (obj.type === "result") text = obj.text || "";
+      else if (obj.type === "error") text = `ERROR: ${obj.error}`;
+      else if (obj.type === "progress" && obj.tool && typeof parentSend === "function") {
+        parentSend({ type: "progress", tool: obj.tool, input: `${m.name}: ${obj.input || ""}` });
+      }
+    }, abortState);
+    parts.push(`## ${m.name}\n${text || "(no output)"}`);
+  }
+  return vllmTruncate(parts.join("\n\n"), 24000);
 }
 
 function globToRegExp(glob) {
@@ -780,18 +1951,343 @@ function vllmContentLen(c) {
   try { return JSON.stringify(c).length; } catch { return 0; }
 }
 
+// Qwen3.8 / vLLM can put chain-of-thought in reasoning_content, reasoning,
+// or <think>...</think> inside content. Telegram should see it; history
+// should only keep the visible answer so the next turn is not polluted.
+function splitVllmMessage(msgOut) {
+  const raw = msgOut && typeof msgOut === "object" ? msgOut : {};
+  let thinking = "";
+  if (typeof raw.reasoning_content === "string") thinking = raw.reasoning_content;
+  else if (typeof raw.reasoning === "string") thinking = raw.reasoning;
+
+  let content = typeof raw.content === "string" ? raw.content : "";
+  const closed = content.match(/<think>\s*([\s\S]*?)\s*<\/think>/i);
+  if (closed) {
+    if (!thinking.trim()) thinking = closed[1];
+    content = content.replace(/<think>\s*[\s\S]*?<\/think>/gi, "").trim();
+  } else {
+    const open = content.match(/<think>\s*([\s\S]*)/i);
+    if (open) {
+      if (!thinking.trim()) thinking = open[1];
+      content = "";
+    }
+  }
+  return { thinking: thinking.trim(), content: content.trim() };
+}
+
+function parseToolArguments(args) {
+  if (args && typeof args === "object" && !Array.isArray(args)) return args;
+  if (typeof args === "string" && args.trim()) {
+    try {
+      const parsed = JSON.parse(args);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch { /* keep empty */ }
+  }
+  return {};
+}
+
+// OpenAI/vLLM ChatCompletionMessageFunctionToolCallParam.arguments is a STRING.
+function stringifyToolArguments(args) {
+  if (typeof args === "string") return args;
+  if (args && typeof args === "object") {
+    try { return JSON.stringify(args); } catch { return "{}"; }
+  }
+  return "{}";
+}
+
+function isToolResponseUser(m) {
+  if (!m || m.role !== "user") return false;
+  const c = typeof m.content === "string" ? m.content.trim() : "";
+  return c.startsWith("<tool_response>") && c.endsWith("</tool_response>");
+}
+
+function isRealUserQuery(m) {
+  return Boolean(m && m.role === "user" && !isToolResponseUser(m) && String(m.content || "").trim());
+}
+
+// Qwen often emits a plan, a "now I will…" stub, or gets cut off mid-sentence
+// (finish_reason=length because thinking ate max_tokens). That is not done.
+function looksLikeUnfinishedAnswer(text, thinking, finishReason) {
+  if (String(finishReason || "") === "length") return true;
+  const t = String(text || "").trim();
+  const th = String(thinking || "").trim();
+  if (!t) return Boolean(th);
+  if (t.length < 1000 && /[:…]$/.test(t)) return true;
+  if (t.length < 220 && !/[.!?]["']?$/.test(t)) return true;
+  // "I found X. I'll fix this by doing Y." — a plan, not a finished edit.
+  if (t.length < 2000 && /\bi(?:'ll| will) (fix|update|rewrite|change|replace|patch|edit|add|wire|refactor|use|restructure)\b/i.test(t)) {
+    return true;
+  }
+  if (t.length < 2000 && /\b(let me|i am going to|i'm going to) (fix|update|rewrite|change|replace|patch|edit|add|wire)\b/i.test(t)) {
+    return true;
+  }
+  if (th.length > 800 && t.length < 800 && !/\b(edited|wrote|committed|tests pass|done)\b/i.test(t)) {
+    return true;
+  }
+  if (t.length > 900) return false;
+  if (/\b(done|completed|here is|here's the|summary:|conclusion:)\b/i.test(t) && t.length > 200) {
+    return false;
+  }
+  return /^(let me|let's|i(?:'ll| will| am going to|'m going to)|i need to|i should|okay[,.]? |ok[,.]? |alright[,.]? |first[,:]|now i|now [a-z]|before (i|we)|to (start|begin)|next[,:]|then (i|'ll|we)|give me a (moment|second)|hold on)/i.test(t);
+}
+
+// "I'll fix this by…" / "Let me rewrite…" — a plan, not a finished answer.
+function looksLikeChatOnly(prompt) {
+  const t = String(prompt || "").trim();
+  if (!t) return true;
+  if (t.length <= 80 && /^(hi|hello|hey|thanks|cheers|ok|okay|yes|no|yo|sup)\b[.!?]*$/i.test(t)) {
+    return true;
+  }
+  const work = /\b(fix|implement|edit|patch|commit|push|deploy|diff|debug|refactor|write file|read file|show me the code|what's uncommitted|git status|go test|go build)\b/i.test(t);
+  if (work) return false;
+  if (t.length < 500 && /\b(work on|working on|continue|pick up|get back|start on|look at (the )?project|what do you think|can we talk|catch me up|where (are|were) we)\b/i.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+function looksLikePlanStub(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (t.length < 2000 && /\bi(?:'ll| will) (fix|update|rewrite|change|replace|patch|edit|add|wire|refactor|use|restructure)\b/i.test(t)) {
+    return true;
+  }
+  if (t.length < 2000 && /\b(let me|i am going to|i'm going to) (fix|update|rewrite|change|replace|patch|edit|add|wire)\b/i.test(t)) {
+    return true;
+  }
+  return /^(let me|let's|i(?:'ll| will| am going to|'m going to)|i need to|i should|okay[,.]? |ok[,.]? |alright[,.]? |first[,:]|now i|now [a-z]|before (i|we)|to (start|begin)|next[,:]|then (i|'ll|we)|give me a (moment|second)|hold on)/i.test(t);
+}
+
+function thinkingExcerpt(thinking, maxChars) {
+  const th = String(thinking || "").trim();
+  if (!th) return "";
+  const cap = maxChars || 1600;
+  if (th.length <= cap) return th;
+  return th.slice(-cap).replace(/^[^\n]*\n/, "").trim();
+}
+
+// Last-resort user-facing text when Qwen produced only thinking / tool_calls.
+// Never return empty — Telegram shows that as "(no output)".
+function composeVllmFallback({ lastSolid, lastVisible, toolsUsed, thinking }) {
+  const solid = String(lastSolid || "").trim();
+  if (solid) return solid;
+  const vis = String(lastVisible || "").trim();
+  if (vis) return vis;
+  const excerpt = thinkingExcerpt(thinking, 1600);
+  if (excerpt) return excerpt;
+  const tools = Array.isArray(toolsUsed) ? toolsUsed.filter(Boolean) : [];
+  if (tools.length) {
+    const names = [];
+    for (const n of tools) {
+      if (names[names.length - 1] !== n) names.push(n);
+    }
+    return `Work ran (${names.slice(-12).join(", ")}) but produced no user-facing summary. Send continue.`;
+  }
+  return "The model returned no user-facing text. Send continue.";
+}
+
+function reseatVllmMessages(openaiMessages, session, prompt, systemContent) {
+  session.messages = sanitizeQwenMessages(
+    openaiMessages.filter((m) => m.role !== "system"),
+    prompt,
+  );
+  session.messages = trimVllmHistory(session.messages, vllmHistoryCharBudget());
+  openaiMessages.length = 0;
+  openaiMessages.push({ role: "system", content: systemContent }, ...session.messages);
+}
+
+// Qwen 3.8's chat template walks messages backwards and raises
+// "No user query found in messages" unless it sees a role=user turn whose
+// content is NOT a <tool_response> wrap. OpenAI role=tool history plus
+// naive front-trimming can leave only tool wraps. arguments stay JSON
+// strings on the wire (vLLM pydantic); the template is applied server-side.
+function sanitizeQwenMessages(messages, currentUserPrompt) {
+  const out = [];
+  for (const m of messages || []) {
+    if (!m || !m.role || m.role === "system") continue;
+    if (m.role === "tool") {
+      const body = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
+      out.push({ role: "user", content: `<tool_response>\n${body}\n</tool_response>` });
+      continue;
+    }
+    if (m.role === "assistant") {
+      const asst = { role: "assistant", content: typeof m.content === "string" ? m.content : "" };
+      if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        asst.tool_calls = m.tool_calls.map((tc) => {
+          const fn = tc.function || tc;
+          return {
+            type: "function",
+            id: tc.id,
+            function: {
+              name: fn.name || "unknown",
+              arguments: stringifyToolArguments(fn.arguments),
+            },
+          };
+        });
+      }
+      out.push(asst);
+      continue;
+    }
+    if (m.role === "user") {
+      out.push({ role: "user", content: typeof m.content === "string" ? m.content : String(m.content ?? "") });
+    }
+  }
+  const prompt = String(currentUserPrompt || "").trim();
+  if (prompt) {
+    const lastReal = [...out].reverse().find(isRealUserQuery);
+    if (!lastReal || lastReal.content !== prompt) {
+      out.push({ role: "user", content: prompt });
+    }
+  }
+  return out;
+}
+
+function vllmContextLimit() {
+  return parseInt(envFileOrProc("VLLM_CONTEXT_WINDOW", "131072"), 10) || 131072;
+}
+
+function vllmMaxOutput() {
+  return parseInt(envFileOrProc("VLLM_MAX_OUTPUT_TOKENS", "16384"), 10) || 16384;
+}
+
+function estimateTokensFromChars(n) {
+  // Code + JSON tools are denser than 4 chars/token. 3 is safer.
+  return Math.ceil(Math.max(0, n) / 3);
+}
+
+function vllmHistoryCharBudget() {
+  const tok = vllmContextLimit();
+  const out = vllmMaxOutput();
+  // tools+system ≈ 12k tokens; keep a 1k safety margin
+  const histTok = Math.max(8000, tok - out - 12000 - 1024);
+  return histTok * 3;
+}
+
+function estimateVllmInputTokens(messages) {
+  let chars = 0;
+  for (const m of messages || []) chars += vllmContentLen(m.content);
+  return estimateTokensFromChars(chars) + 10000;
+}
+
+function vllmFillRatio(messages, maxOut) {
+  const ctx = vllmContextLimit();
+  const usable = Math.max(1024, ctx - maxOut - 512);
+  const inputTok = estimateVllmInputTokens(messages);
+  return { ratio: inputTok / usable, inputTok, usable, ctx };
+}
+
+async function summariseVllmMessages(messages, baseURL, auth, modelName, abortState) {
+  const conv = (messages || []).filter((m) => m.role !== "system");
+  const clipped = conv.slice(-30).map((m) => ({
+    role: m.role === "assistant" ? "assistant" : "user",
+    content: typeof m.content === "string" ? m.content.slice(0, 2500) : "",
+  })).filter((m) => m.content);
+  const json = await vllmChat(baseURL, auth, {
+    model: modelName,
+    messages: [
+      { role: "system", content: SUMMARY_PROMPT },
+      ...clipped,
+      { role: "user", content: "Write the summary now. Output only the summary." },
+    ],
+    max_tokens: 2048,
+    chat_template_kwargs: { enable_thinking: false, reasoning_effort: "low" },
+  }, abortState);
+  const msgOut = json?.choices?.[0]?.message || {};
+  const { content } = splitVllmMessage(msgOut);
+  return (content || "").trim();
+}
+
+async function compactVllmSession(opts) {
+  const {
+    sessionId, messages, systemContent, currentPrompt,
+    baseURL, auth, modelName, usageRatio, contextWindow, tokensAtTrigger,
+  } = opts;
+  try {
+    const summary = await summariseVllmMessages(messages, baseURL, auth, modelName, opts.abortState);
+    if (!summary) {
+      console.warn(`[compact-vllm ${sessionId}] empty summary; skip`);
+      return { ok: false, error: "empty summary", triggered: true, triggered_by: "auto" };
+    }
+    const seed = [
+      { role: "user", content: "[Session summary — continue from here]\n\n" + summary },
+      { role: "assistant", content: "Understood. I will continue from that summary." },
+    ];
+    if (currentPrompt && currentPrompt.trim()) {
+      seed.push({ role: "user", content: currentPrompt });
+    }
+    console.log(`[compact-vllm ${sessionId}] summary ${summary.length} chars, ratio=${(usageRatio * 100).toFixed(1)}%`);
+    return {
+      ok: true,
+      triggered: true,
+      triggered_by: opts.triggeredBy || "auto",
+      reason: opts.reason || `threshold_${Math.round(VLLM_COMPACT_THRESHOLD * 100)}pct`,
+      summary,
+      seed,
+      usage_ratio_pct: Math.round((usageRatio || 0) * 100),
+      context_window: contextWindow || vllmContextLimit(),
+      tokens_at_trigger: tokensAtTrigger || 0,
+      provider: "vllm",
+      model: modelName,
+    };
+  } catch (err) {
+    console.warn(`[compact-vllm ${sessionId}] failed: ${err.message}`);
+    return { ok: false, error: err.message, triggered: true, triggered_by: opts.triggeredBy || "auto" };
+  }
+}
+
+function fitVllmMessages(messages, maxOut) {
+  const ctx = vllmContextLimit();
+  const toolsTok = 10000;
+  const safety = 512;
+  const est = () => {
+    let chars = 0;
+    for (const m of messages) chars += vllmContentLen(m.content);
+    return estimateTokensFromChars(chars) + toolsTok;
+  };
+  while (messages.length > 2 && est() + maxOut + safety > ctx) {
+    let lastUser = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (isRealUserQuery(messages[i])) {
+        lastUser = i;
+        break;
+      }
+    }
+    let dropAt = 0;
+    if (dropAt === lastUser) dropAt++;
+    if (dropAt >= messages.length) break;
+    messages.splice(dropAt, 1);
+  }
+  let out = maxOut;
+  const room = ctx - est() - safety;
+  if (room < out) out = Math.max(1024, room);
+  return { maxOut: out, inputTok: est() };
+}
+
 function trimVllmHistory(messages, maxChars) {
   let total = 0;
   for (const m of messages) total += vllmContentLen(m.content);
   while (messages.length > 2 && total > maxChars) {
-    const dropped = messages.shift();
+    let lastUser = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (isRealUserQuery(messages[i])) {
+        lastUser = i;
+        break;
+      }
+    }
+    let dropAt = 0;
+    if (dropAt === lastUser) dropAt++;
+    if (dropAt >= messages.length) break;
+    const dropped = messages.splice(dropAt, 1)[0];
     total -= vllmContentLen(dropped.content);
   }
   return messages;
 }
 
-function vllmOpenAITools() {
-  return VLLM_TOOLS.map((t) => ({
+function vllmOpenAITools(allowed) {
+  const allow = Array.isArray(allowed) && allowed.length
+    ? new Set(allowed)
+    : null;
+  return VLLM_TOOLS.filter((t) => !allow || allow.has(t.name)).map((t) => ({
     type: "function",
     function: {
       name: t.name,
@@ -801,32 +2297,363 @@ function vllmOpenAITools() {
   }));
 }
 
-async function vllmChat(baseURL, auth, body) {
-  const resp = await fetch(`${baseURL}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${auth}`,
-    },
-    signal: AbortSignal.timeout(180000),
-    body: JSON.stringify(body),
-  });
-  const json = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    const errMsg = json?.error?.message || json?.message || `HTTP ${resp.status}`;
-    throw new Error(errMsg);
+function fetchErrorDetail(err) {
+  const parts = [];
+  for (let e = err, n = 0; e && n < 4; e = e.cause, n++) {
+    if (e.name === "TimeoutError" || e.code === "ABORT_ERR") {
+      parts.push("vLLM request timed out");
+    }
+    if (e.code && !parts.includes(e.code)) parts.push(e.code);
+    if (e.message && !parts.includes(e.message)) parts.push(e.message);
   }
-  return json;
+  return parts.join(": ") || "fetch failed";
 }
 
-async function handleVllmAsk(msg, send) {
-  const { session_id, prompt, cwd, max_turns, model } = msg;
+function isTransientFetch(err) {
+  const s = fetchErrorDetail(err).toLowerCase();
+  if (/maximum context length|input_tokens/.test(s)) return false;
+  if (/headers timeout|und_err_headers_timeout/.test(s)) return false;
+  return /fetch failed|econnreset|econnrefused|etimedout|und_err|socket|timed out|aborted|network/.test(s);
+}
+
+function postJson(urlStr, { headers, body, timeoutMs, abortState }) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try {
+      u = new URL(urlStr);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    if (abortState && abortState.aborted) {
+      reject(new Error("aborted"));
+      return;
+    }
+    const lib = u.protocol === "https:" ? https : http;
+    const payload = Buffer.from(body);
+    const req = lib.request({
+      hostname: u.hostname,
+      port: u.port || (u.protocol === "https:" ? 443 : 80),
+      path: `${u.pathname}${u.search}`,
+      method: "POST",
+      family: 4,
+      headers: {
+        ...headers,
+        "content-length": payload.length,
+      },
+      timeout: timeoutMs,
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        if (abortState && abortState.httpReq === req) abortState.httpReq = null;
+        const raw = Buffer.concat(chunks).toString("utf8");
+        let json = {};
+        try { json = raw ? JSON.parse(raw) : {}; } catch { json = { message: raw.slice(0, 500) }; }
+        resolve({ status: res.statusCode || 0, json });
+      });
+    });
+    if (abortState) abortState.httpReq = req;
+    req.on("timeout", () => {
+      if (abortState && abortState.httpReq === req) abortState.httpReq = null;
+      req.destroy();
+      reject(new Error("vLLM request timed out"));
+    });
+    req.on("error", (err) => {
+      if (abortState && abortState.httpReq === req) abortState.httpReq = null;
+      reject(err);
+    });
+    if (abortState && abortState.aborted) {
+      req.destroy();
+      reject(new Error("aborted"));
+      return;
+    }
+    req.write(payload);
+    req.end();
+  });
+}
+
+// One 27B sequence at a time on the 3090. A second @agent hitting vLLM
+// while another is generating caused "socket hang up" (OOM / dropped HTTP).
+let vllmTail = Promise.resolve();
+const gpuTickets = [];
+
+function gpuAgentName(abortState) {
+  const sid = String((abortState && abortState.sessionId) || "");
+  const bare = sid.replace(/^[a-z0-9]+:/i, "");
+  const m = bare.match(/(?:^|-)ag-([a-z0-9]+)$/i);
+  if (m) return m[1];
+  if (/orch-/i.test(sid)) return "orchestrator";
+  return "default";
+}
+
+// i=0 && !running used to fall through to "queued 1 of 1 behind @self"
+// because names[0] is this ticket. First in line is starting, not queued.
+function gpuQueueLine(i, n, names, running) {
+  const pos = i + 1;
+  const mine = names[i] || "agent";
+  const tag = (x) => "@" + x;
+  if (i === 0) {
+    const verb = running ? "generating" : "starting";
+    if (n <= 1) return `GPU: ${verb} (@${mine})`;
+    return `GPU: ${verb} (@${mine}) — 1 of ${n}; waiting: ${names.slice(1).map(tag).join(", ")}`;
+  }
+  const ahead = names.slice(0, i).map(tag).join(", ") || "another agent";
+  return `GPU: queued ${pos} of ${n} (@${mine}, behind ${ahead})`;
+}
+
+function broadcastGpuQueue() {
+  const n = gpuTickets.length;
+  const names = gpuTickets.map((t) => gpuAgentName(t.abortState));
+  gpuTickets.forEach((t, i) => {
+    const send = t.abortState && t.abortState.send;
+    if (typeof send !== "function" || (t.abortState && t.abortState.aborted)) return;
+    const input = gpuQueueLine(i, n, names, Boolean(t.running));
+    try {
+      send({ type: "progress", tool: "model", input });
+    } catch (_) { /* ignore */ }
+  });
+}
+
+function enqueueVllm(fn, abortState) {
+  const ticket = { abortState, running: false };
+  gpuTickets.push(ticket);
+  broadcastGpuQueue();
+  let release;
+  const slot = new Promise((resolve) => { release = resolve; });
+  const start = vllmTail.catch(() => {});
+  vllmTail = slot;
+  return start.then(async () => {
+    ticket.running = true;
+    broadcastGpuQueue();
+    try {
+      if (abortState && abortState.aborted) {
+        throw new Error("aborted");
+      }
+      return await fn();
+    } finally {
+      const idx = gpuTickets.indexOf(ticket);
+      if (idx >= 0) gpuTickets.splice(idx, 1);
+      broadcastGpuQueue();
+      release();
+    }
+  });
+}
+
+async function vllmChat(baseURL, auth, body, abortState) {
+  return enqueueVllm(() => vllmChatUnlocked(baseURL, auth, body, abortState), abortState);
+}
+
+async function vllmChatUnlocked(baseURL, auth, body, abortState) {
+  // 27B + thinking + a large follow-up routinely exceeds 3 minutes.
+  // Use node:http so we are not bound by undici's 300s headersTimeout
+  // (and so the sidecar boots on Node 20 without node:undici).
+  const timeoutMs = parseInt(process.env.VLLM_FETCH_TIMEOUT_MS || "600000", 10) || 600000;
+  const url = `${baseURL}/v1/chat/completions`;
+  let lastErr;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (abortState && abortState.aborted) {
+      throw new Error("aborted");
+    }
+    try {
+      const resp = await postJson(url, {
+        timeoutMs,
+        abortState,
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${auth}`,
+        },
+        body: JSON.stringify(body),
+      });
+      const json = resp.json || {};
+      if (resp.status < 200 || resp.status >= 300) {
+        if (resp.status === 401) {
+          throw new Error(
+            "HTTP 401 from vLLM — the serve on :18020 requires an API key. " +
+            "Set VLLM_API_KEY in claude-gateway/.env to the same value as vLLM's --api-key / VLLM_API_KEY, then retry (sidecar re-reads .env per request)."
+          );
+        }
+        const errMsg = (typeof json?.error === "string" ? json.error : json?.error?.message) || json?.message || `HTTP ${resp.status}`;
+        throw new Error(errMsg);
+      }
+      return json;
+    } catch (err) {
+      lastErr = err;
+      if (abortState && abortState.aborted) {
+        throw new Error("aborted");
+      }
+      const detail = fetchErrorDetail(err);
+      console.error(`[vllm] ${url} attempt ${attempt}/2 failed: ${detail}`);
+      if (attempt === 1 && isTransientFetch(err) && !String(detail).includes("401")) {
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+      throw new Error(detail);
+    }
+  }
+  throw lastErr;
+}
+
+function vllmChatStream(baseURL, auth, body, abortState, onDelta) {
+  return enqueueVllm(() => vllmChatStreamUnlocked(baseURL, auth, body, abortState, onDelta), abortState);
+}
+
+function vllmChatStreamUnlocked(baseURL, auth, body, abortState, onDelta) {
+  const timeoutMs = parseInt(process.env.VLLM_FETCH_TIMEOUT_MS || "600000", 10) || 600000;
+  const urlStr = `${baseURL}/v1/chat/completions`;
+  return new Promise((resolve, reject) => {
+    if (abortState && abortState.aborted) {
+      reject(new Error("aborted"));
+      return;
+    }
+    let u;
+    try {
+      u = new URL(urlStr);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    const payload = Buffer.from(JSON.stringify({
+      ...body,
+      stream: true,
+    }));
+    const lib = u.protocol === "https:" ? https : http;
+    console.log(`[vllm-stream] POST ${urlStr} bytes=${payload.length}`);
+    const req = lib.request({
+      hostname: u.hostname,
+      port: u.port || (u.protocol === "https:" ? 443 : 80),
+      path: `${u.pathname}${u.search}`,
+      method: "POST",
+      family: 4,
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${auth}`,
+        "content-length": payload.length,
+      },
+      timeout: timeoutMs,
+    }, (res) => {
+      if ((res.statusCode || 0) < 200 || res.statusCode >= 300) {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          if (abortState && abortState.httpReq === req) abortState.httpReq = null;
+          const raw = Buffer.concat(chunks).toString("utf8");
+          let json = {};
+          try { json = raw ? JSON.parse(raw) : {}; } catch { json = { message: raw.slice(0, 500) }; }
+          if (res.statusCode === 401) {
+            reject(new Error(
+              "HTTP 401 from vLLM — the serve on :18020 requires an API key. " +
+              "Set VLLM_API_KEY in claude-gateway/.env to the same value as vLLM's --api-key."
+            ));
+            return;
+          }
+          const errMsg = (typeof json?.error === "string" ? json.error : json?.error?.message) || json?.message || `HTTP ${res.statusCode}`;
+          reject(new Error(errMsg));
+        });
+        return;
+      }
+      let buf = "";
+      let content = "";
+      let thinking = "";
+      const toolAcc = [];
+      let finish = "";
+      let usage = {};
+      let apiModel = body.model || "";
+      const takeDelta = (d) => {
+        if (!d || typeof d !== "object") return;
+        const reason = d.reasoning_content || d.reasoning || d.thinking;
+        if (typeof reason === "string" && reason) {
+          thinking += reason;
+          if (typeof onDelta === "function") onDelta({ thinking: reason });
+        }
+        if (typeof d.content === "string" && d.content) {
+          content += d.content;
+          if (typeof onDelta === "function") onDelta({ content: d.content });
+        }
+        if (Array.isArray(d.tool_calls)) {
+          for (const tc of d.tool_calls) {
+            const idx = Number.isInteger(tc.index) ? tc.index : toolAcc.length;
+            if (!toolAcc[idx]) toolAcc[idx] = { id: "", type: "function", function: { name: "", arguments: "" } };
+            if (tc.id) toolAcc[idx].id = tc.id;
+            const fn = tc.function || {};
+            if (fn.name) toolAcc[idx].function.name += fn.name;
+            if (fn.arguments) toolAcc[idx].function.arguments += fn.arguments;
+          }
+        }
+      };
+      let firstByte = false;
+      res.on("data", (chunk) => {
+        if (!firstByte) {
+          firstByte = true;
+          console.log(`[vllm-stream] first byte after headers status=${res.statusCode}`);
+          if (typeof onDelta === "function") onDelta({ firstByte: true });
+        }
+        buf += chunk.toString("utf8");
+        const lines = buf.split(/\r?\n/);
+        buf = lines.pop() || "";
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith("data:")) continue;
+          const data = t.slice(5).trim();
+          if (!data || data === "[DONE]") continue;
+          let ev;
+          try { ev = JSON.parse(data); } catch { continue; }
+          if (ev.model) apiModel = ev.model;
+          if (ev.usage) usage = ev.usage;
+          const choice = ev.choices && ev.choices[0];
+          if (!choice) continue;
+          if (choice.finish_reason) finish = choice.finish_reason;
+          takeDelta(choice.delta || {});
+        }
+      });
+      res.on("end", () => {
+        if (abortState && abortState.httpReq === req) abortState.httpReq = null;
+        const tool_calls = toolAcc.filter(Boolean);
+        resolve({
+          model: apiModel,
+          usage,
+          choices: [{
+            finish_reason: finish || (tool_calls.length ? "tool_calls" : "stop"),
+            message: {
+              role: "assistant",
+              content,
+              reasoning_content: thinking,
+              ...(tool_calls.length ? { tool_calls } : {}),
+            },
+          }],
+        });
+      });
+    });
+    if (abortState) abortState.httpReq = req;
+    req.on("timeout", () => {
+      if (abortState && abortState.httpReq === req) abortState.httpReq = null;
+      req.destroy();
+      reject(new Error("vLLM request timed out"));
+    });
+    req.on("error", (err) => {
+      if (abortState && abortState.httpReq === req) abortState.httpReq = null;
+      reject(err);
+    });
+    if (abortState && abortState.aborted) {
+      req.destroy();
+      reject(new Error("aborted"));
+      return;
+    }
+    req.write(payload);
+    req.end();
+  });
+}
+
+async function handleVllmAsk(msg, send, sharedAbort) {
+  const { session_id, prompt, cwd, max_turns, model, system_prompt, allowed_tools } = msg;
   if (!prompt) {
     send({ type: "error", error: "prompt is required" });
     return;
   }
 
   const sessionId = session_id || "default";
+  const isolated = /(?:^|:)orch-/.test(String(sessionId)) || Boolean(msg.isolated);
+  const allowedTools = Array.isArray(allowed_tools) && allowed_tools.length ? allowed_tools : null;
   const workDir = cwd || DEFAULT_CWD;
   let overlay;
   try {
@@ -838,49 +2665,170 @@ async function handleVllmAsk(msg, send) {
 
   const baseURL = overlay.env.ANTHROPIC_BASE_URL.replace(/\/$/, "");
   const modelName = overlay.model;
-  const maxOut = parseInt(overlay.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS || "2048", 10) || 2048;
+  const maxOut = parseInt(overlay.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS || "16384", 10) || 16384;
   const auth = overlay.env.ANTHROPIC_AUTH_TOKEN || "dummy";
-  const maxTurns = (max_turns && max_turns > 0) ? max_turns : 20;
+  // Coding tasks (Phase 5, tests, multi-file edits) burn 20 tool rounds easily.
+  // Hitting the cap with a "Let me rewrite:" stub looks like the bot died.
+  let maxTurns = (max_turns && max_turns > 0) ? max_turns : 50;
+  const chatOnly = !isolated && looksLikeChatOnly(prompt);
+  if (chatOnly) {
+    maxTurns = Math.min(maxTurns, 2);
+  }
+  const reasoningEffort = (envFileOrProc("VLLM_REASONING_EFFORT", "medium") || "medium").toLowerCase();
 
-  const session = sessions.get(sessionId) || { messages: [], lastActive: Date.now() };
+  const session = isolated
+    ? { messages: [], lastActive: Date.now() }
+    : (sessions.get(sessionId) || { messages: [], lastActive: Date.now() });
   if (!Array.isArray(session.messages)) session.messages = [];
-  // Drop leftover Anthropic-format turns from the previous /v1/messages path.
-  session.messages = session.messages.filter((m) =>
-    m && (m.role === "system" || m.role === "user" || m.role === "assistant" || m.role === "tool")
-    && (typeof m.content === "string" || m.content == null || Array.isArray(m.tool_calls) || m.role === "tool")
-  );
-  session.messages.push({ role: "user", content: String(prompt) });
-  session.messages = trimVllmHistory(session.messages, 24000);
+  session.messages = sanitizeQwenMessages(session.messages, prompt);
+  session.messages = trimVllmHistory(session.messages, chatOnly ? 8000 : vllmHistoryCharBudget());
 
+  const prior = activeRequests.get(sessionId);
+  if (prior) markAborted(prior);
+  const abortState = sharedAbort || { aborted: false };
+  abortState.send = send;
+  abortState.sessionId = sessionId;
+  send({ type: "progress", tool: "model", input: "starting" });
   const keepalive = setInterval(() => send({ type: "heartbeat" }), 15000);
-  const abortState = { aborted: false };
   activeRequests.set(sessionId, abortState);
+  const timeoutMs = parseInt(msg.timeout_ms, 10) || 0;
+  let timeoutTimer = null;
+  if (timeoutMs > 0) {
+    timeoutTimer = setTimeout(() => {
+      console.log(`[vllm-ask ${sessionId}] aborting after timeout_ms=${timeoutMs}`);
+      markAborted(abortState);
+    }, timeoutMs);
+  }
 
   console.log(
     `[vllm-ask ${sessionId}] agent ${baseURL}/v1/chat/completions model=${modelName} ` +
-    `max_out=${maxOut} cwd=${workDir} history=${session.messages.length}`
+    `max_out=${maxOut} effort=${reasoningEffort} cwd=${workDir} history=${session.messages.length} ` +
+    `roles=${["system", ...session.messages.map((m) => m.role)].join(",")}`
   );
 
   let inTok = 0;
   let outTok = 0;
   let finalText = "";
+  let lastSolid = "";
+  let lastVisible = "";
+  let allThinking = [];
   let apiModel = modelName;
+  let preambleNudges = 0;
+  let summaryNudges = 0;
+  let forceTools = false;
+  let compaction = null;
+  const toolsThisAsk = [];
+  let goToolchainProbes = 0;
+  const systemContent = isolated
+    ? [VLLM_SYSTEM, "You are an isolated review agent. Use only the tools you have. Save a written findings report under reports/ with the Write tool, then return a clear verdict: APPROVE, REJECT, or NEEDS_CHANGES, with findings.", system_prompt].filter(Boolean).join("\n\n")
+    : (chatOnly
+        ? [
+            vllmCwdBanner(workDir),
+            "Reply in a few sentences. Do not call tools. Do not inspect git or the repo unless asked.",
+            String(system_prompt || "").slice(0, 3500),
+          ].filter(Boolean).join("\n\n")
+        : vllmSystemForRequest(system_prompt, workDir));
   const openaiMessages = [
-    { role: "system", content: VLLM_SYSTEM },
+    { role: "system", content: systemContent },
     ...session.messages,
   ];
 
   try {
     for (let turn = 0; turn < maxTurns; turn++) {
       if (abortState.aborted) break;
-      const json = await vllmChat(baseURL, auth, {
-        model: modelName,
-        messages: openaiMessages,
-        tools: vllmOpenAITools(),
-        tool_choice: "auto",
-        max_tokens: maxOut,
-        chat_template_kwargs: { enable_thinking: false },
-      });
+      const requireTools = forceTools;
+      forceTools = false;
+      if (!isolated && !chatOnly && openaiMessages.length > 6) {
+        const fill = vllmFillRatio(openaiMessages, maxOut);
+        if (fill.ratio >= VLLM_COMPACT_THRESHOLD) {
+          send({ type: "progress", tool: "compact", input: `${Math.round(fill.ratio * 100)}% of usable context` });
+          const c = await compactVllmSession({
+            sessionId,
+            messages: openaiMessages,
+            systemContent,
+            currentPrompt: prompt,
+            baseURL,
+            auth,
+            modelName,
+            usageRatio: fill.ratio,
+            contextWindow: fill.ctx,
+            tokensAtTrigger: fill.inputTok,
+            triggeredBy: "auto",
+            reason: `threshold_${Math.round(VLLM_COMPACT_THRESHOLD * 100)}pct`,
+            abortState,
+          });
+          if (c.ok && Array.isArray(c.seed)) {
+            compaction = c;
+            session.messages = c.seed;
+            openaiMessages.length = 0;
+            openaiMessages.push({ role: "system", content: systemContent }, ...c.seed);
+          }
+        }
+      }
+      const fitted = fitVllmMessages(openaiMessages, maxOut);
+      if (fitted.maxOut < maxOut) {
+        console.log(`[vllm-ask ${sessionId}] fit max_out ${maxOut}→${fitted.maxOut} est_in=${fitted.inputTok} msgs=${openaiMessages.length}`);
+      }
+      const call = (choice) => {
+        let thinkBuf = "";
+        let textBuf = "";
+        let flushTimer = null;
+        const flush = () => {
+          flushTimer = null;
+          if (thinkBuf) {
+            send({ type: "progress", text: "💭 " + thinkBuf });
+            thinkBuf = "";
+          }
+          if (textBuf) {
+            send({ type: "progress", text: textBuf });
+            textBuf = "";
+          }
+        };
+        const onDelta = (d) => {
+          if (d.firstByte) {
+            send({ type: "progress", tool: "model", input: "first token" });
+            return;
+          }
+          if (d.thinking) thinkBuf += d.thinking;
+          if (d.content) textBuf += d.content;
+          if (thinkBuf.length + textBuf.length > 24) flush();
+          else if (!flushTimer) flushTimer = setTimeout(flush, 30);
+        };
+        const reqBody = {
+          model: modelName,
+          messages: openaiMessages,
+          max_tokens: chatOnly ? Math.min(fitted.maxOut, 768) : fitted.maxOut,
+        };
+        if (!chatOnly) {
+          reqBody.tools = vllmOpenAITools(allowedTools);
+          reqBody.tool_choice = choice;
+          reqBody.chat_template_kwargs = { enable_thinking: true, reasoning_effort: reasoningEffort };
+        }
+        return vllmChatStream(baseURL, auth, reqBody, abortState, onDelta).finally(() => {
+          if (flushTimer) clearTimeout(flushTimer);
+          flush();
+        });
+      };
+      let json;
+      try {
+        json = await call(requireTools ? "required" : "auto");
+      } catch (err) {
+        const msgErr = String(err.message || "");
+        if (abortState.aborted || /aborted/i.test(msgErr)) {
+          break;
+        }
+        if (/maximum context length|input_tokens/i.test(msgErr)) {
+          fitVllmMessages(openaiMessages, Math.min(fitted.maxOut, 4096));
+          console.warn(`[vllm-ask ${sessionId}] context overflow; trimmed to ${openaiMessages.length} msgs and retry`);
+          json = await call("auto");
+        } else if (requireTools) {
+          console.warn(`[vllm-ask ${sessionId}] tool_choice=required failed (${msgErr}); retry auto`);
+          json = await call("auto");
+        } else {
+          throw err;
+        }
+      }
+      if (!json || abortState.aborted) break;
       inTok += json.usage?.prompt_tokens || 0;
       outTok += json.usage?.completion_tokens || 0;
       if (json.model) apiModel = json.model;
@@ -888,55 +2836,203 @@ async function handleVllmAsk(msg, send) {
       const choice = json.choices && json.choices[0];
       const msgOut = choice?.message || {};
       const toolCalls = Array.isArray(msgOut.tool_calls) ? msgOut.tool_calls : [];
-      const text = typeof msgOut.content === "string" ? msgOut.content.trim() : "";
+      const { thinking, content: text } = splitVllmMessage(msgOut);
+      if (thinking) {
+        allThinking.push(thinking);
+        send({ type: "progress", text: "💭 " + thinking });
+      }
       if (text) {
         send({ type: "progress", text });
-        finalText = text;
       }
 
       openaiMessages.push({
         role: "assistant",
-        content: text || null,
-        ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+        content: text || "",
+        ...(toolCalls.length ? {
+          tool_calls: toolCalls.map((tc) => {
+            const fn = tc.function || tc;
+            return {
+              type: "function",
+              id: tc.id,
+              function: {
+                name: fn.name || "unknown",
+                arguments: stringifyToolArguments(fn.arguments || tc.arguments),
+              },
+            };
+          }),
+        } : {}),
       });
       session.messages = openaiMessages.filter((m) => m.role !== "system");
 
+      const finish = String(choice?.finish_reason || "");
+      const unfinished = looksLikeUnfinishedAnswer(text, thinking, finish);
+      const visible = String(text || "").trim();
+      if (visible) lastVisible = visible;
+      if (visible && !unfinished && visible.length > 60) {
+        lastSolid = visible;
+        finalText = visible;
+      }
+
       if (toolCalls.length === 0) {
+        if (chatOnly && visible) {
+          finalText = visible;
+          break;
+        }
+        if (isolated) {
+          // Review DNA is treated as "unfinished" by the coding-task heuristics
+          // (long thinking + a short verdict). Extending to 60 turns is what
+          // left the 3090 pegged after the agent looked done.
+          const wroteReport = toolsThisAsk.includes("Write");
+          if (visible && wroteReport) {
+            finalText = visible;
+            break;
+          }
+          if (visible && !wroteReport && summaryNudges < 1 && allowedTools && allowedTools.includes("Write")) {
+            summaryNudges++;
+            openaiMessages.push({
+              role: "user",
+              content: "Your review text is done. REQUIRED: Write the findings report under reports/ (create the directory via Write) then stop. Do not edit source files.",
+            });
+            reseatVllmMessages(openaiMessages, session, prompt, systemContent);
+            continue;
+          }
+          if (visible) {
+            finalText = visible;
+            break;
+          }
+          if (summaryNudges < 1) {
+            summaryNudges++;
+            openaiMessages.push({
+              role: "user",
+              content: "Write your final review and verdict now as plain text. If you still need a file, call Read/Glob/Grep. To save the required findings report, Write under reports/ only.",
+            });
+            reseatVllmMessages(openaiMessages, session, prompt, systemContent);
+            continue;
+          }
+          finalText = lastVisible || lastSolid || "";
+          break;
+        }
+        const planOnly = !chatOnly && unfinished && looksLikePlanStub(visible) && toolsThisAsk.length === 0;
+        // A plan with no tools yet still needs Edit/Write/Bash.
+        if (planOnly && preambleNudges < 8) {
+          if (turn >= maxTurns - 1) {
+            maxTurns = Math.min(turn + 6, 60);
+          }
+          preambleNudges++;
+          forceTools = true;
+          const stub = visible.slice(-400);
+          console.log(`[vllm-ask ${sessionId}] unfinished (finish=${finish || "stop"} nudges=${preambleNudges} chars=${visible.length} turn=${turn}/${maxTurns}) — continuing`);
+          send({ type: "progress", tool: "continue", input: finish === "length" ? "output truncated" : "incomplete reply" });
+          openaiMessages.push({
+            role: "user",
+            content: "That was not the final answer (cut off or only a next-step stub). Continue FROM THERE — call Edit/Write/Bash and finish the work. Do not restart the plan." +
+              (stub ? `\nLast visible line:\n${stub}` : ""),
+          });
+          reseatVllmMessages(openaiMessages, session, prompt, systemContent);
+          continue;
+        }
+        // Empty content, thinking-only, or unfinished after tools: ask for a
+        // written answer. Forcing more tools here is how Telegram got "(no output)".
+        if ((!visible || unfinished) && summaryNudges < 2) {
+          if (turn >= maxTurns - 1) {
+            maxTurns = Math.min(turn + 4, 60);
+          }
+          summaryNudges++;
+          forceTools = false;
+          console.log(`[vllm-ask ${sessionId}] empty/unfinished summary nudge ${summaryNudges} (finish=${finish || "stop"} chars=${visible.length} tools=${toolsThisAsk.length})`);
+          send({ type: "progress", tool: "continue", input: "write the user-facing answer" });
+          openaiMessages.push({
+            role: "user",
+            content: "Stop. Write the user-facing answer NOW as plain text (what you changed, what is left, any errors). " +
+              "Do not only think. Call a tool only if something is still broken. Do not restart the plan.",
+          });
+          reseatVllmMessages(openaiMessages, session, prompt, systemContent);
+          continue;
+        }
+        if (!unfinished && visible) finalText = visible;
+        else if (lastSolid) finalText = lastSolid;
+        else if (lastVisible) finalText = lastVisible;
         break;
       }
 
+      // Tools still running — don't treat a "Let me edit:" line as the answer.
+      // Leave one extra model turn after tools so it can write a real close.
+      // Isolated review agents must not grow past the requested cap.
+      if (!isolated && turn >= maxTurns - 1) {
+        maxTurns = Math.min(maxTurns + 3, 60);
+      }
+
       for (const tc of toolCalls) {
+        if (abortState.aborted) break;
         const toolName = tc.function?.name || tc.name || "unknown";
-        let toolInput = {};
-        try {
-          toolInput = JSON.parse(tc.function?.arguments || tc.arguments || "{}");
-        } catch {
-          toolInput = {};
+        const toolInput = parseToolArguments(tc.function?.arguments || tc.arguments);
+        toolsThisAsk.push(toolName);
+        if (toolName === "Bash") {
+          const c = String(toolInput.command || "");
+          if (/\bgo\s+(env|version)\b|GOPROXY|GOMODCACHE|ls vendor|vendor\/modules/.test(c)) {
+            goToolchainProbes++;
+          }
         }
         send({ type: "progress", tool: toolName, input: summarizeInput(toolInput) });
         console.log(`[vllm-ask ${sessionId}] tool ${toolName}`);
-        const out = vllmExecTool(toolName, toolInput, workDir);
+        if (allowedTools && !allowedTools.includes(toolName)) {
+          openaiMessages.push({
+            role: "user",
+            content: `<tool_response>\nerror: tool ${toolName} is not allowed for this agent\n</tool_response>`,
+          });
+          continue;
+        }
+        const out = await vllmExecTool(toolName, toolInput, workDir, abortState, send, allowedTools);
         openaiMessages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: vllmTruncate(out, 8000),
+          role: "user",
+          content: `<tool_response>\n${vllmTruncate(out, 8000)}\n</tool_response>`,
         });
       }
-      session.messages = openaiMessages.filter((m) => m.role !== "system");
-      session.messages = trimVllmHistory(session.messages, 24000);
-      openaiMessages.length = 0;
-      openaiMessages.push({ role: "system", content: VLLM_SYSTEM }, ...session.messages);
+      if (goToolchainProbes >= 2) {
+        openaiMessages.push({
+          role: "user",
+          content: "STOP diagnosing the Go toolchain. Vendor + GOTOOLCHAIN=local are already set. Silent go build is success. Continue the user's actual task. Do not run go env/go version again.",
+        });
+        goToolchainProbes = 0;
+      }
+      reseatVllmMessages(openaiMessages, session, prompt, systemContent);
     }
 
     session.lastActive = Date.now();
     session.ok = true;
-    sessions.set(sessionId, session);
-    evictOldestSession();
+    session.provider = "vllm";
+    session.model = apiModel;
+    session.contextWindow = vllmContextLimit();
+    session.lastTurnTotal = inTok;
+    if (!isolated) {
+      sessions.set(sessionId, session);
+      evictOldestSession();
+    } else {
+      sessions.delete(sessionId);
+    }
 
-    console.log(`[vllm-ask ${sessionId}] done in=${inTok} out=${outTok} chars=${(finalText || "").length}`);
+    if (abortState.aborted) {
+      send({ type: "result", text: finalText || lastVisible || "(Stopped by user)", session_id: sessionId });
+      return;
+    }
+
+    const thinkingText = allThinking.join("\n\n").trim();
+    let answer = (finalText || lastSolid || lastVisible || "").trim();
+    if (!answer) {
+      answer = composeVllmFallback({
+        lastSolid,
+        lastVisible,
+        toolsUsed: toolsThisAsk,
+        thinking: thinkingText,
+      });
+    } else if (!isolated && looksLikeUnfinishedAnswer(answer, "", "stop")) {
+      answer = (lastSolid || answer) + "\n\n(Cut off mid-edit — send \"continue\".)";
+    }
+    console.log(`[vllm-ask ${sessionId}] done in=${inTok} out=${outTok} chars=${answer.length} thinking=${thinkingText.length}`);
     send({
       type: "result",
-      text: finalText || "(no output)",
+      text: answer,
+      thinking: thinkingText || undefined,
       session_id: sessionId,
       api_model: apiModel,
       usage: {
@@ -945,6 +3041,12 @@ async function handleVllmAsk(msg, send) {
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
       },
+      context: {
+        tokens_used: inTok,
+        context_window: vllmContextLimit(),
+        usage_ratio_pct: Math.round((inTok / Math.max(1, vllmContextLimit() - maxOut)) * 100),
+      },
+      ...(compaction && compaction.ok ? { compaction } : {}),
     });
   } catch (err) {
     if (abortState.aborted) {
@@ -955,6 +3057,7 @@ async function handleVllmAsk(msg, send) {
     }
   } finally {
     clearInterval(keepalive);
+    if (timeoutTimer) clearTimeout(timeoutTimer);
     activeRequests.delete(sessionId);
   }
 }
@@ -975,7 +3078,7 @@ async function handleAsk(msg, send) {
   }
 
   // Claude Code's own system prompt + hooks + CLAUDE.md cannot fit in
-  // vLLM's 16k window. Talk to /v1/messages directly.
+  // vLLM window. Talk to /v1/chat/completions directly.
   if (provider === "vllm") {
     await handleVllmAsk(msg, send);
     return;
@@ -1020,17 +3123,41 @@ async function handleAsk(msg, send) {
 
     if (max_turns && max_turns > 0) options.maxTurns = max_turns;
     const localGpu = provider === "vllm" || provider === "ollama";
-    // vLLM's 16k window cannot afford WebFetch/WebSearch schemas, extra
-    // CLAUDE.md trees, or SessionStart hook dumps.
+    const isolated = /(?:^|:)orch-/.test(String(sessionId)) || Boolean(msg.isolated);
+    // Telegram (every @agent and @default) must work like Qwen @default:
+    // no Task/subagents, no SessionStart workspace dump, no go-compile hook
+    // that hangs `go vet` after every Edit. Isolated orchestrator reviews
+    // keep the full Claude Code tool set.
+    const telegramTools = allowed_tools && allowed_tools.length
+      ? allowed_tools
+      : ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebFetch", "WebSearch"];
+    const noSubagents = [
+      "Task", "TaskOutput", "TaskStop", "Agent", "TodoWrite",
+      "Skill", "NotebookEdit", "Sleep", "BashOutput", "KillShell",
+      "ExitPlanMode", "EnterPlanMode",
+    ];
     if (localGpu) {
       options.allowedTools = allowed_tools || [
         "Read", "Write", "Edit", "Bash", "Glob", "Grep",
       ];
+      options.disallowedTools = noSubagents;
       options.settingSources = [];
       options.systemPrompt =
         "You are a coding assistant running locally (Qwen3.8-27B). " +
-        "The context window is 16384 tokens. Be concise. Prefer small diffs. " +
-        "Do not dump whole files. Answer directly, no long chain-of-thought.";
+        "The context window is 65536 tokens. Prefer small diffs. " +
+        "Do not dump whole files. Thinking is discarded; put the full analysis in the final answer.";
+    } else if (!isolated) {
+      options.additionalDirectories = ["/clients/current", "/clients/past"];
+      options.allowedTools = telegramTools;
+      options.disallowedTools = noSubagents;
+      options.settingSources = [];
+      options.systemPrompt = [
+        "Work like the main Telegram assistant: edit the files, small diffs, then answer. ",
+        "Never use Task, Agent, or background compiles. Never diagnose GOPROXY, go env, go version, or vendor. ",
+        "Do not run go build/vet unless Steve asked or the compiler error is the task. ",
+        "Cwd is already the project if WORKING DIRECTORY is set — do not cd or search /workspace.",
+        system_prompt ? "\n\n" + system_prompt : "",
+      ].join("");
     } else {
       options.additionalDirectories = ["/clients/current", "/clients/past"];
       options.allowedTools = allowed_tools || [
@@ -1058,6 +3185,18 @@ async function handleAsk(msg, send) {
     } else if (model) {
       options.model = model;
     }
+    options.env = withToolPath({
+      ...(options.env || process.env),
+      HOME: "/root",
+      PWD: workDir,
+      CLAUDE_CODE_DISABLE_SANDBOX: "1",
+    }, workDir);
+    if (!isolated) {
+      options.env.CLAUDE_GATEWAY_SKIP_GO_HOOK = "1";
+    }
+    // Claude Code's default sandbox isolates GOCACHE and still uses
+    // GOTOOLCHAIN=auto against go.dev — `go test` then "hangs" at startup.
+    options.sandbox = { enabled: false };
 
     // vLLM: only resume after a successful turn. Failed 400s left an SDK
     // session whose prompt only grows. Other providers resume unless we
@@ -1093,9 +3232,9 @@ async function handleAsk(msg, send) {
         continue;
       }
 
-      // DeepSeek (and other reasoning models) emit thinking as system
-      // events. Those are not user-facing — keep them in the sidecar log.
       if (type === "system") {
+        const thought = sdkThinkingText(message);
+        if (thought) sendThinkingProgress(send, thought.startsWith("💭") ? thought : "💭 " + thought);
         continue;
       }
 
@@ -1106,6 +3245,8 @@ async function handleAsk(msg, send) {
           apiModel = msgModel;
           console.log(`[ws-ask ${sessionId}]   api-model: ${apiModel}`);
         }
+        const thought = sdkThinkingText(message);
+        if (thought) sendThinkingProgress(send, thought.startsWith("💭") ? thought : "💭 " + thought);
         const content = message.content
           || (message.message && message.message.content)
           || [];
@@ -1126,7 +3267,7 @@ async function handleAsk(msg, send) {
 
       if (type === "result") {
         resultText = message.subtype === "success"
-          ? (message.result || "")
+          ? stripThinkTags(message.result || "")
           : ((message.errors || []).join("\n") || message.error || `Error: ${message.subtype}`);
         usage = message.usage || {};
         sdkSessionId = sdkSessionId || message.session_id;
@@ -1292,8 +3433,9 @@ async function handleAsk(msg, send) {
 }
 
 async function handleGrokAsk(msg, send) {
-  const { session_id, prompt, cwd, system_prompt, model } = msg;
+  const { session_id, prompt, cwd, system_prompt, model, allowed_tools } = msg;
   const sessionId = session_id || "default";
+  const isolated = /(?:^|:)orch-/.test(String(sessionId)) || Boolean(msg.isolated);
   const workDir = cwd || DEFAULT_CWD;
   const effectiveModel = model && !String(model).startsWith("claude-") ? model : "grok-4.5";
 
@@ -1307,8 +3449,14 @@ async function handleGrokAsk(msg, send) {
   }
 
   let effectivePrompt = prompt;
+  if (isolated && Array.isArray(allowed_tools) && allowed_tools.length) {
+    effectivePrompt =
+      `You are an isolated review agent. Use only: ${allowed_tools.join(", ")}. ` +
+      `Do not edit files. Return APPROVE, REJECT, or NEEDS_CHANGES with findings.\n\n` +
+      effectivePrompt;
+  }
   if (system_prompt) {
-    effectivePrompt = system_prompt + "\n\n---\n\n" + prompt;
+    effectivePrompt = system_prompt + "\n\n---\n\n" + effectivePrompt;
   }
 
   const keepalive = setInterval(() => {
@@ -1318,6 +3466,9 @@ async function handleGrokAsk(msg, send) {
   const abortState = { aborted: false, child: null };
   activeRequests.set(sessionId, abortState);
 
+  if (isolated) {
+    resetGrokSession(sessionId);
+  }
   const sess = grokSessionFlags(sessionId);
   // The gateway injects bootstrap + profile + history — far too large for
   // argv (spawn E2BIG). Grok accepts the same payload via --prompt-file.
@@ -1354,6 +3505,7 @@ async function handleGrokAsk(msg, send) {
       let assembled = "";
       let stderrRaw = "";
       let lineBuf = "";
+      let thoughtOpen = false;
 
       const handleLine = (line) => {
         if (!line) return;
@@ -1363,13 +3515,26 @@ async function handleGrokAsk(msg, send) {
         } catch {
           return;
         }
+        const thought = grokThoughtText(ev);
+        if (thought) {
+          if (!thoughtOpen) {
+            sendThinkingProgress(send, "💭 " + String(thought).replace(/^\s+/, ""));
+            thoughtOpen = true;
+          } else {
+            sendThinkingProgress(send, thought);
+          }
+          return;
+        }
         const chunk = grokVisibleText(ev);
         if (chunk) {
           assembled += chunk;
+          send({ type: "progress", text: thoughtOpen ? "\n" + chunk : chunk });
+          thoughtOpen = false;
           return;
         }
         const tool = grokToolLabel(ev);
         if (tool) {
+          thoughtOpen = false;
           send({ type: "progress", tool, input: "" });
         }
       };
@@ -1446,7 +3611,15 @@ async function handleRunAgent(msg, send) {
     return;
   }
   if (provider === "vllm") {
-    await handleVllmAsk(msg, send);
+    const isolated = {
+      ...msg,
+      session_id: msg.session_id || `orch-${randomUUID()}`,
+      isolated: true,
+      max_turns: msg.max_turns || 12,
+    };
+    sessions.delete(isolated.session_id);
+    await handleVllmAsk(isolated, send);
+    sessions.delete(isolated.session_id);
     return;
   }
 
@@ -1473,7 +3646,10 @@ async function handleRunAgent(msg, send) {
     args.push("--allowedTools", allowed_tools.join(","));
   }
 
-  const childEnv = overlay ? applyProviderEnv(overlay) : { ...process.env, HOME: "/root" };
+  const childEnv = withToolPath(
+    overlay ? applyProviderEnv(overlay) : { ...process.env, HOME: "/root" },
+    workDir,
+  );
   childEnv.PWD = workDir;
 
   console.log(`[ws-agent] Spawning isolated process (cwd: ${workDir}, model: ${effectiveModel || "default"}, provider: ${provider || "claude"}, timeout: ${timeoutMs}ms)`);
@@ -1633,6 +3809,37 @@ async function handleCompact(msg, send) {
   const sessionId = msg.session_id || "default";
   const sess = sessions.get(sessionId);
 
+  if (sess && (sess.provider === "vllm" || (Array.isArray(sess.messages) && sess.messages.length && !sess.sdkSessionId))) {
+    let overlay;
+    try {
+      overlay = buildProviderOverlay("vllm", msg.model || sess.model);
+    } catch (e) {
+      send({ type: "compact-result", session_id: sessionId, ok: false, error: e.message });
+      return;
+    }
+    const baseURL = overlay.env.ANTHROPIC_BASE_URL.replace(/\/$/, "");
+    const result = await compactVllmSession({
+      sessionId,
+      messages: [{ role: "system", content: VLLM_SYSTEM }, ...sess.messages],
+      currentPrompt: "",
+      baseURL,
+      auth: overlay.env.ANTHROPIC_AUTH_TOKEN || "dummy",
+      modelName: overlay.model,
+      usageRatio: sess.contextWindow ? (sess.lastTurnTotal || 0) / sess.contextWindow : 0,
+      contextWindow: sess.contextWindow || vllmContextLimit(),
+      tokensAtTrigger: sess.lastTurnTotal || 0,
+      triggeredBy: "manual",
+      reason: "manual",
+    });
+    if (result.ok && Array.isArray(result.seed)) {
+      sess.messages = result.seed;
+      sess.lastTurnTotal = 0;
+      sessions.set(sessionId, sess);
+    }
+    send({ type: "compact-result", session_id: sessionId, ok: !!result.ok, compaction: result });
+    return;
+  }
+
   if (!sess || !sess.sdkSessionId) {
     send({ type: "compact-result", session_id: sessionId, ok: false, error: "no active session to compact" });
     return;
@@ -1775,13 +3982,22 @@ wss.on("connection", (ws) => {
             const sid = msg.session_id || "default";
             const target = activeRequests.get(sid);
             if (target) {
-              target.aborted = true;
-              if (target.child && typeof target.child.kill === "function") {
-                try { target.child.kill("SIGTERM"); } catch (_) {}
-              }
+              markAborted(target);
               console.log(`[ws-abort] Abort flag set for session ${sid}`);
             } else {
               console.log(`[ws-abort] No active request for session ${sid}`);
+            }
+            // Isolated review agents use orch-* (sidecar) or vllm:orch-*
+            // (gateway). Only cascade from the main chat session (tg-123),
+            // not from a named agent thread (tg-123-ag-seoagent).
+            if (/(^|:)tg-\d+$/.test(sid)) {
+              for (const [id, st] of activeRequests) {
+                if (id === sid) continue;
+                if (/(^|:)orch-/.test(id)) {
+                  markAborted(st);
+                  console.log(`[ws-abort] also aborted isolated ${id}`);
+                }
+              }
             }
             send({ type: "ack" });
             break;
@@ -1796,7 +4012,13 @@ wss.on("connection", (ws) => {
     handle();
   });
 
-  ws.on("close", () => { console.log("Gateway disconnected"); });
+  ws.on("close", () => {
+    console.log("Gateway disconnected");
+    for (const [sid, st] of activeRequests) {
+      markAborted(st);
+      console.log(`[ws-close] aborted in-flight ${sid}`);
+    }
+  });
   ws.on("error", (err) => { console.error("WebSocket error:", err.message); });
 });
 
@@ -1831,6 +4053,14 @@ httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`  WebSocket: ws://0.0.0.0:${PORT}/ws`);
   console.log(`  Work dir:  ${DEFAULT_CWD}`);
   logProviderKeysAtBoot();
+  const hs = loadHarnessSkills();
+  console.log(`[harness] ${hs.length} skill(s) from ${HARNESS_SKILLS_DIR} always=${hs.filter((s) => s.always).map((s) => s.name).join(",") || "none"}`);
+  const bk = braveApiKey();
+  console.log(
+    bk
+      ? `[harness] web search=brave source=${GATEWAY_ENV_FILE} last4=${keyLast4(bk)} len=${bk.length}`
+      : `[harness] web search=duckduckgo (no BRAVE_API_KEY or BRAVE_API in ${GATEWAY_ENV_FILE})`
+  );
 });
 
 httpServer.timeout = 3600000;

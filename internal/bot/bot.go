@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -17,9 +18,9 @@ import (
 	"github.com/you/claude-gateway/internal/agent"
 	"github.com/you/claude-gateway/internal/agentsync"
 	"github.com/you/claude-gateway/internal/config"
+	"github.com/you/claude-gateway/internal/cron"
 	"github.com/you/claude-gateway/internal/ctxbuilder"
 	"github.com/you/claude-gateway/internal/db"
-	"github.com/you/claude-gateway/internal/cron"
 	"github.com/you/claude-gateway/internal/gworkspace"
 	"github.com/you/claude-gateway/internal/journal"
 	"github.com/you/claude-gateway/internal/memory"
@@ -45,6 +46,47 @@ type SessionUsage struct {
 // maxConcurrentHandlers limits how many message handlers run simultaneously.
 const maxConcurrentHandlers = 10
 
+type runSnapshot struct {
+	Display string
+	Started time.Time
+	Actions int
+	Lines   []string
+	Preview string
+	GPU     string // last GPU queue line from sidecar, e.g. "GPU: queued 2 of 3"
+}
+
+type reqCancel struct {
+	id        uint64
+	cancel    context.CancelFunc
+	Framework string
+	mu        sync.Mutex
+	snap      runSnapshot
+}
+
+func (e *reqCancel) copySnap() (runSnapshot, bool) {
+	if e == nil {
+		return runSnapshot{}, false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.snap.Started.IsZero() {
+		return runSnapshot{}, false
+	}
+	s := e.snap
+	s.Lines = append([]string(nil), e.snap.Lines...)
+	return s, true
+}
+
+func (e *reqCancel) setSnap(s runSnapshot) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	s.Lines = append([]string(nil), s.Lines...)
+	e.snap = s
+	e.mu.Unlock()
+}
+
 // Bot wraps the Telegram bot with gateway integrations.
 type Bot struct {
 	api        *tgbotapi.BotAPI
@@ -60,14 +102,28 @@ type Bot struct {
 	// handlerWg tracks in-flight handler goroutines for clean shutdown.
 	handlerWg sync.WaitGroup
 
-	// activeReqs maps chat ID → cancel function for the in-flight request,
-	// allowing /stop to interrupt a running Claude session.
-	activeReqs   map[int64]context.CancelFunc
-	activeReqsMu sync.Mutex
+	// activeReqs maps "chatID:slot" → in-flight cancel so /stop can abort
+	// one agent without killing the others.
+	activeReqs     map[string]*reqCancel
+	activeReqsMu   sync.Mutex
+	activeReqSeq   atomic.Uint64
+	currentAgent   map[int64]agentSlot
+	currentAgentMu sync.RWMutex
+
+	// slotFW is a per-chat per-agent runtime framework override (qwen/deepseek/grok).
+	// Empty / missing means inherit DNA YAML then the gateway default (Switcher.Active).
+	slotFW   map[string]string
+	slotFWMu sync.RWMutex
 
 	// lastAPIModel tracks the most recent API-reported model per chat.
 	lastAPIModel   map[int64]string
 	lastAPIModelMu sync.RWMutex
+
+	// skipQwenHistory: after /reset, do not re-inject the 30-turn DB dump
+	// on the next Qwen message (that overflowed the 131k window).
+	// Keyed by sidecar session ID so named agents do not share the flag.
+	skipQwenHistory   map[string]bool
+	skipQwenHistoryMu sync.Mutex
 	// bgWg tracks fire-and-forget background goroutines (RecordExchange, fact
 	// extraction, profile update) so shutdown waits for them to finish before
 	// closing the database.
@@ -187,15 +243,18 @@ func New(cfg *config.Config, agentClient agent.Backend, limiter *ratelimiter.Lim
 	}
 
 	b := &Bot{
-		api:        api,
-		agent:      agentClient,
-		limiter:    limiter,
-		cfg:        cfg,
-		database:   database,
-		sessions:     make(map[int64]*SessionUsage),
-		sem:          make(chan struct{}, maxConcurrentHandlers),
-		activeReqs:   make(map[int64]context.CancelFunc),
-		lastAPIModel: make(map[int64]string),
+		api:             api,
+		agent:           agentClient,
+		limiter:         limiter,
+		cfg:             cfg,
+		database:        database,
+		sessions:        make(map[int64]*SessionUsage),
+		sem:             make(chan struct{}, maxConcurrentHandlers),
+		activeReqs:      make(map[string]*reqCancel),
+		currentAgent:    make(map[int64]agentSlot),
+		slotFW:          make(map[string]string),
+		lastAPIModel:    make(map[int64]string),
+		skipQwenHistory: make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(b)
@@ -324,6 +383,15 @@ func (b *Bot) handleCallbackQuery(_ context.Context, cq *tgbotapi.CallbackQuery)
 			log.Printf("Failed to delete models keyboard: %v", err)
 		}
 
+	case strings.HasPrefix(data, "agent:"):
+		handle := strings.TrimPrefix(data, "agent:")
+		fake := &tgbotapi.Message{Chat: cq.Message.Chat, From: cq.From, Text: "@" + handle}
+		b.handleMessage(context.Background(), fake)
+		del := tgbotapi.NewDeleteMessage(chatID, cq.Message.MessageID)
+		if _, err := b.api.Request(del); err != nil {
+			log.Printf("Failed to delete agent picker: %v", err)
+		}
+
 	case strings.HasPrefix(data, "menu:"):
 		// Delete the menu message to keep chat clean
 		del := tgbotapi.NewDeleteMessage(chatID, cq.Message.MessageID)
@@ -350,74 +418,20 @@ func (b *Bot) handleCallbackQuery(_ context.Context, cq *tgbotapi.CallbackQuery)
 	}
 }
 
-// registerTelegramCommands registers bot commands with Telegram so users
-// get autocomplete in the command menu. Includes both built-in commands
-// and skill commands (skills with a non-empty Command field).
+// registerTelegramCommands publishes the / menu Telegram shows when you type /.
+// Agents are included as slash commands because Telegram's @ picker is only
+// for usernames, not bot-defined specialists.
 func (b *Bot) registerTelegramCommands() {
-	commands := []tgbotapi.BotCommand{
-		{Command: "bootstrapset", Description: "Add/update bootstrap instruction"},
-		{Command: "contactadd", Description: "Add contact detail to person"},
-		{Command: "context", Description: "Current context layers"},
-		{Command: "cost", Description: "Token usage this session"},
-		{Command: "cronadd", Description: "Add cron job: name \"schedule\" prompt"},
-		{Command: "crondel", Description: "Remove a cron job"},
-		{Command: "crondisable", Description: "Disable a cron job"},
-		{Command: "cronenable", Description: "Enable a cron job"},
-		{Command: "cronlist", Description: "List scheduled jobs"},
-		{Command: "dbcheck", Description: "Check PostgreSQL conversations"},
-		{Command: "framework", Description: "Show/switch AI framework"},
-		{Command: "grokauth", Description: "Sign in SuperGrok (subscription)"},
-		{Command: "journal", Description: "View daily journal"},
-		{Command: "journalsearch", Description: "Search journal entries"},
-		{Command: "memorieslist", Description: "List curated memories"},
-		{Command: "model", Description: "Show actual API model in use"},
-		{Command: "models", Description: "Switch DeepSeek / Grok"},
-		{Command: "memoryforget", Description: "Remove a memory by text match"},
-		{Command: "memorylist", Description: "List memories by category"},
-		{Command: "memoryremember", Description: "Save a memory"},
-		{Command: "peoplelist", Description: "List all people"},
-		{Command: "personadd", Description: "Add person to contacts"},
-		{Command: "persondel", Description: "Remove a person"},
-		{Command: "personfind", Description: "Find person by name"},
-		{Command: "profile", Description: "View user profile"},
-		{Command: "profiledel", Description: "Delete profile aspect"},
-		{Command: "profileset", Description: "Set profile aspect"},
-		{Command: "reset", Description: "Clear conversation session"},
-		{Command: "skills", Description: "List loaded skills"},
-		{Command: "start", Description: "Show available commands"},
-		{Command: "status", Description: "Gateway health & rate limits"},
-		{Command: "stop", Description: "Stop the current request"},
-		{Command: "sync", Description: "Sync agents/commands Claude ↔ OpenCode"},
+	commands := buildTelegramCommandList(b.skillsManager)
+	if len(commands) == 0 {
+		return
 	}
-
-	builtinCount := len(commands)
-
-	if b.skillsManager != nil {
-		for _, s := range b.skillsManager.GetActiveSkills() {
-			if s.Command != "" {
-				desc := s.Description
-				if desc == "" {
-					desc = s.Name
-				}
-				// Telegram limits description to 256 characters (UTF-8 runes, not bytes)
-				if utf8.RuneCountInString(desc) > 256 {
-					runes := []rune(desc)
-					desc = string(runes[:253]) + "..."
-				}
-				commands = append(commands, tgbotapi.BotCommand{
-					Command:     s.Command,
-					Description: desc,
-				})
-			}
-		}
-	}
-
 	cfg := tgbotapi.NewSetMyCommands(commands...)
 	if _, err := b.api.Request(cfg); err != nil {
 		log.Printf("Failed to register Telegram commands: %v", err)
-	} else {
-		log.Printf("Registered %d Telegram commands (%d from skills)", len(commands), len(commands)-builtinCount)
+		return
 	}
+	log.Printf("Registered %d Telegram / commands (cap %d)", len(commands), telegramMaxCommands)
 }
 
 // --- helpers ---

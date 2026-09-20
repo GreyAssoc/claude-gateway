@@ -20,15 +20,15 @@ import (
 
 // Builder assembles context from PostgreSQL for injection into Claude prompts.
 type Builder struct {
-	db            *pgdb.DB
-	embedder      *ollama.Client
-	peopleMgr     *people.Manager
-	profiler      *profile.Profiler
-	journalMgr    *journal.Manager
-	recentTurns   int
+	db             *pgdb.DB
+	embedder       *ollama.Client
+	peopleMgr      *people.Manager
+	profiler       *profile.Profiler
+	journalMgr     *journal.Manager
+	recentTurns    int
 	replayMessages int
-	semanticHits  int
-	minSimilarity float64
+	semanticHits   int
+	minSimilarity  float64
 }
 
 // NewBuilder creates a new context builder. Panics if db is nil because
@@ -53,7 +53,7 @@ func NewBuilder(db *pgdb.DB, embedder *ollama.Client, peopleMgr *people.Manager,
 // BuildSystemPrompt assembles the full system prompt from DB-backed memory.
 // Called only when the SDK session is dead/new.
 // Includes: bootstrap, self, preferences, user profile, and last N messages.
-func (b *Builder) BuildSystemPrompt(ctx context.Context) (string, error) {
+func (b *Builder) BuildSystemPrompt(ctx context.Context, sessionID string) (string, error) {
 	var parts []string
 
 	// 1. User profile aspects (confidence >= 0.4)
@@ -81,8 +81,14 @@ func (b *Builder) BuildSystemPrompt(ctx context.Context) (string, error) {
 		}
 	}
 
-	// 3. Last N messages (count-based replay for continuity)
-	recentConvs, err := b.db.RecentConversationsAllSessions(ctx, b.replayMessages)
+	// 3. Last N messages (count-based replay for continuity).
+	// Scoped to this agent/session so @SEOagent cannot see @YouTubeagent turns.
+	var recentConvs []pgdb.Conversation
+	if sessionID != "" {
+		recentConvs, err = b.db.RecentConversations(ctx, sessionID, b.replayMessages)
+	} else {
+		recentConvs, err = b.db.RecentConversationsAllSessions(ctx, b.replayMessages)
+	}
 	if err != nil {
 		log.Printf("Context builder: failed to load recent conversations: %v", err)
 	} else {
@@ -116,11 +122,58 @@ func (b *Builder) BuildSystemPrompt(ctx context.Context) (string, error) {
 // Prevents unbounded growth from concatenating many sections.
 const maxEnrichedPromptChars = 32000
 
+// EnrichmentOptions controls how much conversation is packed into the
+// per-message prompt. DeepSeek/Grok use the defaults; Qwen uses Wide
+// because it has no Claude Code session to remember prior turns.
+type EnrichmentOptions struct {
+	Budget         int
+	RecentTurns    int
+	KeepFullTurns  int
+	FullTurnChars  int
+	OlderTurnChars int
+}
+
+func defaultEnrichment() EnrichmentOptions {
+	return EnrichmentOptions{
+		Budget:         maxEnrichedPromptChars,
+		KeepFullTurns:  4,
+		FullTurnChars:  3000,
+		OlderTurnChars: 500,
+	}
+}
+
+// QwenWideEnrichment: vLLM max_model_len is 131072 and 16k is reserved
+// for output, so input must stay under ~114k tokens. Keep recent chat
+// small enough that tools+system still fit.
+func QwenWideEnrichment() EnrichmentOptions {
+	return EnrichmentOptions{
+		Budget:         40000,
+		RecentTurns:    16,
+		KeepFullTurns:  6,
+		FullTurnChars:  2000,
+		OlderTurnChars: 600,
+	}
+}
+
 func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessage string, peopleNames []string, sessionAlive bool) (string, error) {
-	// Short follow-ups (yes, ok, do it) need minimal context — just recent
-	// turns so Claude can see what it asked. Saves significant latency.
-	budget := maxEnrichedPromptChars
-	if len(userMessage) < 50 {
+	return b.BuildEnrichedPromptWith(ctx, sessionID, userMessage, peopleNames, sessionAlive, defaultEnrichment())
+}
+
+func (b *Builder) BuildEnrichedPromptWith(ctx context.Context, sessionID, userMessage string, peopleNames []string, sessionAlive bool, opts EnrichmentOptions) (string, error) {
+	if opts.Budget <= 0 {
+		opts.Budget = maxEnrichedPromptChars
+	}
+	if opts.KeepFullTurns <= 0 {
+		opts.KeepFullTurns = 4
+	}
+	if opts.FullTurnChars <= 0 {
+		opts.FullTurnChars = 3000
+	}
+	if opts.OlderTurnChars <= 0 {
+		opts.OlderTurnChars = 500
+	}
+	budget := opts.Budget
+	if len(userMessage) < 50 && budget > 8000 && opts.Budget == maxEnrichedPromptChars {
 		budget = 8000
 	}
 
@@ -144,7 +197,11 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 	// This saves ~5,850 tokens per message on alive sessions.
 
 	// 1. Recent conversation turns (current session)
-	recentConvs, err := b.db.RecentConversations(ctx, sessionID, b.recentTurns)
+	nRecent := opts.RecentTurns
+	if nRecent <= 0 {
+		nRecent = b.recentTurns
+	}
+	recentConvs, err := b.db.RecentConversations(ctx, sessionID, nRecent)
 	if err != nil {
 		log.Printf("Context builder: failed to load recent turns: %v", err)
 	} else if len(recentConvs) > 0 {
@@ -152,14 +209,11 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 		convBuf.WriteString("<conversation_history>\n")
 		for i, c := range recentConvs {
 			timestamp := c.CreatedAt.Format("15:04")
-			// Keep the most recent 4 turns at 3000 chars so short follow-ups
-			// ("yes", "do it", "send them") retain enough context from
-			// the previous exchange. Older turns stay at 500 chars.
 			// TruncateTail keeps the END of the message — questions,
 			// action items, and "shall I do X?" are always at the end.
-			limit := 500
-			if i >= len(recentConvs)-4 {
-				limit = 3000
+			limit := opts.OlderTurnChars
+			if i >= len(recentConvs)-opts.KeepFullTurns {
+				limit = opts.FullTurnChars
 			}
 			content := format.TruncateTail(c.Content, limit)
 			fmt.Fprintf(&convBuf, "<turn role=\"%s\" time=\"%s\">%s</turn>\n",
@@ -170,7 +224,7 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 	}
 
 	// 2. Semantic search (older relevant messages, excluding recency window)
-	if totalLen < maxEnrichedPromptChars && b.embedder != nil && userMessage != "" {
+	if totalLen < budget && b.embedder != nil && userMessage != "" {
 		emb, err := b.embedder.Embed(ctx, userMessage)
 		if err == nil {
 			// Collect IDs from recency window to exclude
@@ -179,7 +233,7 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 				excludeIDs = append(excludeIDs, c.ID)
 			}
 
-			hits, err := b.db.SearchSimilar(ctx, emb, excludeIDs, b.semanticHits, b.minSimilarity)
+			hits, err := b.db.SearchSimilar(ctx, emb, excludeIDs, b.semanticHits, b.minSimilarity, sessionID)
 			if err == nil && len(hits) > 0 {
 				var hitBuf strings.Builder
 				hitBuf.WriteString("<related_past_conversations>\n")
@@ -196,7 +250,7 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 	}
 
 	// 3. People context (from names extracted by triager)
-	if totalLen < maxEnrichedPromptChars && b.peopleMgr != nil && len(peopleNames) > 0 {
+	if totalLen < budget && b.peopleMgr != nil && len(peopleNames) > 0 {
 		matches, err := b.peopleMgr.FindPeople(ctx, peopleNames)
 		if err != nil {
 			log.Printf("Context builder: people lookup partial failure: %v", err)
@@ -229,7 +283,7 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 	// 4. Relevant facts (keyword match against user message)
 	// The db is guaranteed non-nil by the constructor, so this section
 	// always runs when v2 is active — no embedder dependency needed.
-	if totalLen < maxEnrichedPromptChars && userMessage != "" {
+	if totalLen < budget && userMessage != "" {
 		factEntries, err := b.db.GetMemoryByCategory(ctx, "fact")
 		if err == nil && len(factEntries) > 0 {
 			// Simple keyword matching for relevant facts (cheaper than embedding each)
@@ -274,7 +328,7 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 	}
 
 	// 5. Profile documents (full reference docs, injected when topically relevant)
-	if totalLen < maxEnrichedPromptChars && userMessage != "" {
+	if totalLen < budget && userMessage != "" {
 		profileDocs, err := b.db.GetMemoryByCategory(ctx, "profile_doc")
 		if err == nil && len(profileDocs) > 0 {
 			msgLower := strings.ToLower(userMessage)
@@ -325,7 +379,7 @@ func (b *Builder) BuildEnrichedPrompt(ctx context.Context, sessionID, userMessag
 	}
 
 	// 6. Recent journal entries (last 3 days)
-	if totalLen < maxEnrichedPromptChars && b.journalMgr != nil {
+	if totalLen < budget && b.journalMgr != nil {
 		entries, err := b.journalMgr.GetRecentEntries(ctx, 3)
 		if err == nil && len(entries) > 0 {
 			if section := journal.FormatJournalForContext(entries); section != "" {

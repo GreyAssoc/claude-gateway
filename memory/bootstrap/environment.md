@@ -60,9 +60,14 @@ psql "$POSTGRES_URL" -c "\dt"          # List tables
 psql "$POSTGRES_URL" -c "\d tablename" # Describe table
 ```
 
-## Google Workspace (gog CLI)
+## Google Workspace (harness skill)
 
-Use the **Bash tool** to run `gog` commands for Google Workspace access (Gmail, Calendar, Drive, Sheets). The `gog` binary is built in-tree (cmd/gog/) and authenticates via a token JSON file at `/root/.config/gog/token.json` on a Docker volume shared with the gateway. Auth is pre-configured for `steve.w@greyandassociates.co.uk` — no setup needed, just run the commands.
+This is a **harness-level** capability: every connected model can use it.
+
+- **Claude / Grok / DeepSeek:** Bash `gog` (below). Same OAuth token.
+- **Local Qwen (vLLM):** first-class tools `GmailSearch`, `GmailThread`, `GmailSend`, `CalendarList`, `CalendarAdd`, `DriveSearch`, `DriveLs`, `DriveDownload`, `DriveUpload`, `SheetsRead`. Use those instead of inventing a CLI.
+
+The `gog` binary is built in-tree (`cmd/gog/`) and authenticates via `/root/.config/gog/token.json` on a Docker volume shared with the gateway. Auth is pre-configured for `steve.w@greyandassociates.co.uk` — no setup needed, just run the commands.
 
 **If `gog` reports "not authenticated"** (e.g. after a fresh deploy or revoked token): tell Steve to run `/googleauth` in Telegram, follow the URL, and paste the resulting code back as `/googleauth <code>`. The token is then auto-refreshed on every API call and atomically saved on rotation, so this should rarely be needed.
 
@@ -150,6 +155,7 @@ gog sheets read <spreadsheet_id> 'Sheet1!A1:Z100'  # Read cell range
 Skills are loaded into your context below (in `<skills>` tags). When Steve sends a natural language message, detect whether it matches a skill and follow that skill's full workflow.
 
 **Available Skills:**
+- `skill-google-workspace.md` — **Harness (every model):** Gmail, Calendar, Drive, Sheets
 - `skill-notices.md` — Generate party wall notices
 - `skill-schedule-of-condition.md` — Transcribe surveys and create schedules of condition
 - `skill-data-spreadsheet.md` — Work with DATA spreadsheets in party wall projects
@@ -176,7 +182,10 @@ find /clients/current/ -maxdepth 1 -iname "*redan*" -type d
 
 ## Web Browsing & Research
 
-You have full internet access. Use these tools to find information online:
+You have full internet access. This is a **harness-level** capability.
+
+- **Claude / Grok / DeepSeek:** Claude Code `WebSearch` / `WebFetch` (below). Playwright MCP for JS-heavy pages.
+- **Local Qwen (vLLM):** sidecar tools `WebSearch` `{query}` then `WebFetch` `{url}`. Same job, no Anthropic web tool. Private/localhost URLs are blocked.
 
 ### Quick Lookups (preferred — fast and lightweight)
 - **WebFetch** — Fetch and read any web page. Give it a URL and describe what to extract.

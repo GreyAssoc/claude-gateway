@@ -39,6 +39,8 @@ docker compose build sidecar && docker compose up -d sidecar
 | `docker-compose.yml` | `docker compose down && docker compose up -d` |
 | `configs/gateway.yaml` | `docker compose restart gateway` |
 | `skills/*.md` | Nothing — hot-reloaded automatically |
+| `harness/skills/*.md` | Nothing — gateway watches; sidecar re-reads per request |
+| Sidecar harness tools (`WebSearch`, `GmailSearch`, …) | `docker compose build sidecar && docker compose up -d sidecar` |
 | `memory/bootstrap/*.md` | `docker compose restart gateway` |
 | Go code (`internal/`, `cmd/`) | `docker compose build gateway && docker compose up -d gateway` |
 | `Dockerfile.gateway` | `docker compose build gateway && docker compose up -d gateway` |

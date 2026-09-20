@@ -115,11 +115,38 @@ func (s *Switcher) RunIsolatedAgent(ctx context.Context, opts RunAgentOptions) (
 }
 
 func (s *Switcher) AbortSession(sessionID string) {
-	s.get().AbortSession(sessionID)
+	s.AbortSessionEverywhere(sessionID)
+}
+
+// AbortSessionEverywhere cancels the session on every backend. Per-agent
+// framework pins mean the in-flight run may not be on the global active one.
+func (s *Switcher) AbortSessionEverywhere(sessionID string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, b := range s.backends {
+		if b != nil {
+			b.AbortSession(sessionID)
+		}
+	}
 }
 
 func (s *Switcher) ResetSession(ctx context.Context, sessionID string) error {
 	return s.get().ResetSession(ctx, sessionID)
+}
+
+func (s *Switcher) ResetSessionEverywhere(ctx context.Context, sessionID string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var first error
+	for _, b := range s.backends {
+		if b == nil {
+			continue
+		}
+		if err := b.ResetSession(ctx, sessionID); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 func (s *Switcher) CheckSession(ctx context.Context, sessionID string) (*SessionStatus, error) {
@@ -153,6 +180,34 @@ func (s *Switcher) Close() error {
 
 func (s *Switcher) Name() string {
 	return s.get().Name()
+}
+
+// Get returns the named backend, or nil if it is not registered.
+func (s *Switcher) Get(name string) Backend {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.backends[name]
+}
+
+// Durable returns a backend for unattended jobs (cron, watchers).
+// Those must not follow Telegram /framework switches. Cron is pinned to
+// Qwen (CRON_FRAMEWORK, default "qwen") so scheduled jobs stay on the
+// local GPU even if the chat backend is Grok or Claude.
+// Preference: prefer (if registered), then qwen, then grok, then claude, then active.
+func (s *Switcher) Durable(prefer string) Backend {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if prefer != "" {
+		if b := s.backends[prefer]; b != nil {
+			return b
+		}
+	}
+	for _, name := range []string{"qwen", "grok", "claude"} {
+		if b := s.backends[name]; b != nil {
+			return b
+		}
+	}
+	return s.backends[s.active]
 }
 
 // GetOpenCodeClient returns the OpenCode backend if registered, or nil.

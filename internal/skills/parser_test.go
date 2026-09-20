@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -114,6 +115,22 @@ Body.`,
 			wantEnabled: true,
 		},
 		{
+			name: "harness always flags",
+			content: `---
+name: google-workspace
+description: Check Gmail inbox
+always: true
+harness: true
+---
+Use GmailSearch.`,
+			sourcePath:  "/harness/skills/skill-google-workspace.md",
+			precedence:  0,
+			wantName:    "google-workspace",
+			wantDesc:    "Check Gmail inbox",
+			wantBody:    "Use GmailSearch.",
+			wantEnabled: true,
+		},
+		{
 			name:       "empty content with no name returns error",
 			content:    "",
 			sourcePath: "/skills/.md",
@@ -172,6 +189,149 @@ This has no closing delimiter.`,
 	}
 }
 
+func TestScanAgentsAndMatchPurist(t *testing.T) {
+	dir := "/workspace/.claude/agents"
+	if _, err := os.Stat(dir); err != nil {
+		t.Skip("workspace agents not mounted")
+	}
+	m := NewManager(nil, nil)
+	m.SetAgentDirs([]string{dir})
+	if err := m.scanAgentTree(dir); err != nil {
+		t.Fatal(err)
+	}
+	m.scanChatAgents()
+	agents := m.GetAgents()
+	if len(agents) < 10 {
+		t.Fatalf("expected many agents, got %d", len(agents))
+	}
+	got := m.BuildLibraryPrompt("review this with the go purist", 20000)
+	if strings.Contains(got, "skill-youtube") || strings.Contains(strings.ToLower(got), "transcriptapi") {
+		t.Fatal("youtube skill must not leak into the default library")
+	}
+	if _, ok := m.GetChatAgent("go-purist"); !ok {
+		t.Fatal("expected go-purist folder chat agent")
+	}
+	for _, a := range agents {
+		if strings.HasPrefix(a.Name, "gateway-system") {
+			t.Fatalf("generated gateway-system file leaked: %s", a.Name)
+		}
+	}
+}
+
+func TestGoogleWorkspaceSkillFile(t *testing.T) {
+	data, err := os.ReadFile("../../harness/skills/skill-google-workspace.md")
+	if err != nil {
+		t.Fatalf("harness skill missing: %v", err)
+	}
+	skill, err := ParseSkillMD(string(data), "skill-google-workspace.md", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skill.Name != "google-workspace" || !skill.Always || !skill.Harness {
+		t.Fatalf("name=%q always=%v harness=%v", skill.Name, skill.Always, skill.Harness)
+	}
+	if !strings.Contains(strings.ToLower(skill.Description), "gmail") {
+		t.Fatalf("description should mention gmail: %q", skill.Description)
+	}
+	matched := MatchSkills([]Skill{*skill}, "check my emails")
+	if len(matched) != 1 {
+		t.Fatalf("expected 'check my emails' to match google-workspace, got %d", len(matched))
+	}
+}
+
+func TestHarnessWebAndLocalContextSkillFiles(t *testing.T) {
+	webRaw, err := os.ReadFile("../../harness/skills/skill-web.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	web, err := ParseSkillMD(string(webRaw), "skill-web.md", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if web.Name != "web" || !web.Always || !web.Harness {
+		t.Fatalf("web skill flags: %#v", web)
+	}
+	if len(MatchSkills([]Skill{*web}, "search the web for the rust book")) != 1 {
+		t.Fatal("expected 'search the web' to match web skill")
+	}
+	if len(MatchSkills([]Skill{*web}, "read this website")) != 1 {
+		t.Fatal("expected website phrasing to match web skill")
+	}
+
+	locRaw, err := os.ReadFile("../../harness/skills/skill-local-context.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc, err := ParseSkillMD(string(locRaw), "skill-local-context.md", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc.Name != "local-context" || !loc.Always {
+		t.Fatalf("local-context flags: %#v", loc)
+	}
+	if len(MatchSkills([]Skill{*loc}, "what client folder is redan")) != 1 {
+		t.Fatal("expected client-folder phrasing to match local-context")
+	}
+}
+
+func TestCatalogNameHit(t *testing.T) {
+	if !catalogNameHit("use the go purist on this file", "go-purist") {
+		t.Fatal("go purist should match go-purist")
+	}
+	if !catalogNameHit("draft as elon musk", "elon-musk") {
+		t.Fatal("elon musk should match elon-musk")
+	}
+	if catalogNameHit("write some go code", "go-purist") {
+		t.Fatal("generic 'go' must not match go-purist")
+	}
+}
+
+func TestParseSkillMD_HarnessAlways(t *testing.T) {
+	skill, err := ParseSkillMD(`---
+name: google-workspace
+description: Check Gmail inbox
+always: true
+harness: true
+---
+Use GmailSearch.`, "/harness/skills/skill-google-workspace.md", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !skill.Always || !skill.Harness {
+		t.Fatalf("Always=%v Harness=%v, want both true", skill.Always, skill.Harness)
+	}
+}
+
+func TestMatchSkillsPreferHarness(t *testing.T) {
+	skills := []Skill{
+		{Name: "emails", Description: "Check starred emails and draft", Enabled: true, Content: "use Task tool"},
+		{Name: "google-workspace", Description: "Check Gmail inbox, read email threads, send mail, list calendar", Always: true, Harness: true, Enabled: true, Content: "use GmailSearch"},
+	}
+	got := MatchSkillsPreferHarness(skills, "check my emails")
+	if len(got) != 1 || got[0].Name != "google-workspace" {
+		t.Fatalf("prefer harness: got %#v", got)
+	}
+}
+
+func TestBuildHarnessPromptSkipsAlwaysOn(t *testing.T) {
+	m := NewManager(nil, nil)
+	m.skills["google-workspace"] = &Skill{
+		Name: "google-workspace", Description: "Check Gmail inbox, read email threads",
+		Always: true, Harness: true, Enabled: true, Content: "use GmailSearch",
+	}
+	m.skills["emails"] = &Skill{
+		Name: "emails", Description: "Check starred emails and draft",
+		Enabled: true, Content: "use Task tool",
+	}
+	got := m.BuildHarnessPrompt("check my emails", 8000)
+	if !strings.Contains(got, "google-workspace") {
+		t.Fatalf("index should list google-workspace, got: %s", got)
+	}
+	if strings.Contains(got, "use GmailSearch") {
+		t.Fatal("always-on body should be skipped (sidecar injects it)")
+	}
+}
+
 func TestFormatSkillsXML_CDATAInjection(t *testing.T) {
 	// Ensure ]]> in content is safely escaped in CDATA sections.
 	skills := []Skill{
@@ -193,4 +353,3 @@ func TestFormatSkillsXML_Empty(t *testing.T) {
 		t.Errorf("Expected empty string for nil skills, got: %q", xml)
 	}
 }
-

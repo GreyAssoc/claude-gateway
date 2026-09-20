@@ -19,12 +19,16 @@ import (
 // NotifyFunc is called with the cron output to send to the user.
 type NotifyFunc func(text string)
 
+// RecordFunc persists a cron exchange to PostgreSQL (session_id cron-<job>).
+type RecordFunc func(ctx context.Context, sessionID, userMessage, assistantResponse string)
+
 // Scheduler manages cron jobs that invoke Claude.
 type Scheduler struct {
 	cron    *cron.Cron
 	agent   agent.Backend
 	limiter *ratelimiter.Limiter
 	notify  NotifyFunc
+	record  RecordFunc
 	workDir string
 
 	mu   sync.RWMutex
@@ -54,6 +58,11 @@ func New(agentClient agent.Backend, limiter *ratelimiter.Limiter, notify NotifyF
 		jobs:    make(map[string]*jobInfo),
 		done:    make(chan struct{}),
 	}
+}
+
+// SetRecorder stores cron prompt/reply pairs in PostgreSQL under agent "cron".
+func (s *Scheduler) SetRecorder(fn RecordFunc) {
+	s.record = fn
 }
 
 // LoadJobs registers cron jobs from config.
@@ -109,15 +118,15 @@ const internalPrefix = "__INTERNAL_"
 // cron jobs. Without this, Claude doesn't know about the gog CLI or other
 // tools available in the sidecar container.
 const cronSystemPrompt = `You are executing a scheduled cron job for the user's personal gateway.
-You have access to these tools via Bash:
-- gog: Google Workspace CLI (Gmail, Calendar, Drive, Sheets)
-  Examples:
-    gog gmail search --query "is:unread newer_than:12h" --max 20
-    gog gmail read <message-id>
-    gog calendar list --days 1
-    gog calendar list --days 7
-    gog drive list --folder "Projects"
-    gog sheets read <spreadsheet-id> <range>
+Google Workspace is a harness skill — use it. Prefer named tools if you have them
+(GmailSearch, GmailThread, CalendarList, DriveSearch, SheetsRead). Otherwise Bash gog:
+    gog gmail search 'is:unread newer_than:12h' --max 20
+    gog gmail thread <message-id>
+    gog calendar list
+    gog calendar list --from tomorrow --to +7d
+    gog drive search 'name contains "Projects"'
+    gog sheets read <spreadsheet-id> --range 'Sheet1!A1:Z100'
+Never delete or trash mail. If gog says not authenticated, tell the user to run /googleauth.
 
 Keep your response concise and well-formatted for Telegram. Use bullet points.
 If a tool is unavailable or returns an error, note it briefly and continue with what you can do.`
@@ -188,9 +197,34 @@ func (s *Scheduler) executeJob(name, prompt string) {
 		text = "(no output)"
 	}
 
+	if looksLikeClaudeLogin(text) {
+		log.Printf("Cron %s failed: Claude Code not logged in", name)
+		if s.notify != nil {
+			s.notify(fmt.Sprintf(
+				"❌ Cron job *%s* failed: Claude Code in the sidecar is not logged in.\n\n"+
+					"`/login` is a *Claude CLI* command, not Telegram. Cron jobs are pinned to Qwen "+
+					"(`CRON_FRAMEWORK`, not `/framework`). If this job hit Claude instead, check "+
+					"`CRON_FRAMEWORK=qwen` and that vLLM is running.",
+				name,
+			))
+		}
+		return
+	}
+
+	if s.record != nil {
+		s.record(ctx, sessionID, prompt, text)
+	}
+
 	if s.notify != nil {
 		s.notify(fmt.Sprintf("🕐 *%s*\n\n%s", name, text))
 	}
+}
+
+func looksLikeClaudeLogin(text string) bool {
+	t := strings.ToLower(text)
+	return strings.Contains(t, "not logged in") ||
+		strings.Contains(t, "please run /login") ||
+		strings.Contains(t, "please run `/login`")
 }
 
 // Start begins the cron scheduler.
@@ -291,6 +325,23 @@ func (s *Scheduler) EnableJob(name string) error {
 	job.Enabled = true
 	s.mu.Unlock()
 	log.Printf("Cron job %q enabled", name)
+	return nil
+}
+
+// RunJob fires a configured job immediately in a goroutine. Disabled jobs
+// can still be run this way. Internal sentinel jobs are rejected.
+func (s *Scheduler) RunJob(name string) error {
+	s.mu.RLock()
+	job, ok := s.jobs[name]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("unknown job %q — try /cronlist", name)
+	}
+	if strings.HasPrefix(job.Prompt, internalPrefix) {
+		return fmt.Errorf("job %q is internal and cannot be run from Telegram", name)
+	}
+	log.Printf("Cron %s triggered manually", name)
+	go s.executeJob(job.Name, job.Prompt)
 	return nil
 }
 

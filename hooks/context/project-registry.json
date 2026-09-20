@@ -146,14 +146,6 @@
       "server": null,
       "git": null
     },
-    "Charts": {
-      "path": "/workspace/projects/Charts",
-      "aliases": ["charts legacy"],
-      "status": "legacy",
-      "tech": "Go + TwelveData + WebSocket",
-      "server": null,
-      "git": null
-    },
     "MetaTrader5": {
       "path": "/workspace/projects/MetaTrader5",
       "aliases": ["metatrader", "mt5", "metatrader5", "metatrader 5"],
@@ -195,12 +187,221 @@
       "tech": "Python + Google Workspace",
       "server": null,
       "git": null
+    },
+    "forex-trading": {
+      "path": "/workspace/projects/forex-trading",
+      "aliases": ["forex-trading", "forex trading", "forex", "ctrader dashboard"],
+      "status": "active",
+      "tech": "Go + cTrader Open API + Vanilla JS",
+      "server": {
+        "prod": { "ip": "129.212.163.180", "user": "claude_code", "deploy_path": "~/projects/forex-trading/", "url": "https://forex.st3v3.me", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" }
+      },
+      "database": null,
+      "git": null
+    },
+    "forex-ideas": {
+      "path": "/workspace/projects/forex-ideas",
+      "aliases": ["forex-ideas", "forex ideas", "strategy ideas"],
+      "status": "scratch",
+      "tech": "Markdown research notes",
+      "server": null,
+      "git": null
+    },
+    "cog": {
+      "path": "/workspace/projects/cog",
+      "aliases": ["cog", "cog engine", "agent engine"],
+      "status": "active",
+      "tech": "Go + PostgreSQL/pgvector + Docker Compose",
+      "server": null,
+      "git": null
+    },
+    "cogai": {
+      "path": "/workspace/projects/cogai",
+      "aliases": ["cogai", "cog public", "cog distribution"],
+      "status": "development",
+      "tech": "Docs + Docker (public dist of cog; source in cog/)",
+      "server": null,
+      "git": null
+    },
+    "cog-website": {
+      "path": "/workspace/projects/cog-website",
+      "aliases": ["cog-website", "cog site", "getcog"],
+      "status": "development",
+      "tech": "Go net/http + html/template + Vanilla JS",
+      "server": {
+        "prod": { "url": "https://getcog.ai" }
+      },
+      "git": null
+    },
+    "grey-pm": {
+      "path": "/workspace/projects/grey-pm",
+      "aliases": ["grey-pm", "grey pm", "grey projects", "grey project management"],
+      "status": "development",
+      "tech": "Go + HTML5/Vanilla JS (project management)",
+      "server": null,
+      "git": null
+    },
+    "grey-docs-mcp-maria": {
+      "path": "/workspace/projects/grey-docs-mcp-maria",
+      "aliases": ["grey-docs-mcp-maria", "grey docs mcp maria", "mcp maria"],
+      "status": "production",
+      "tech": "Python MCP server (wraps grey-docs; serves Maria's Hermes, Docker)",
+      "server": null,
+      "git": null
+    },
+    "grey-docs-mcp-steve": {
+      "path": "/workspace/projects/grey-docs-mcp-steve",
+      "aliases": ["grey-docs-mcp-steve", "grey docs mcp steve", "mcp steve"],
+      "status": "production",
+      "tech": "Python MCP server (wraps grey-docs; serves Steve's Hermes, Docker)",
+      "server": null,
+      "git": null
+    },
+    "thesaltwatersauna": {
+      "path": "/workspace/projects/thesaltwatersauna",
+      "aliases": ["saltwater sauna", "sauna", "sauna booking"],
+      "status": "scratch",
+      "tech": "Python browser-automation scripts",
+      "server": null,
+      "git": null
+    },
+    "sandmartins": {
+      "path": "/workspace/projects/sandmartins",
+      "aliases": ["sandmartins", "sand martins"],
+      "status": "scratch",
+      "tech": "Markdown plan + legacy site copy",
+      "server": null,
+      "git": null
+    },
+    "social-media": {
+      "path": "/workspace/projects/social-media",
+      "aliases": ["social-media", "social media", "facebook", "x account"],
+      "status": "scratch",
+      "tech": "Content/asset folders",
+      "server": null,
+      "git": null
+    },
+    "marketing-pipeline": {
+      "path": "/workspace/projects/marketing-pipeline",
+      "aliases": ["marketing-pipeline", "marketing pipeline", "ad pipeline", "virtual focus group"],
+      "status": "utility",
+      "tech": "Python + Gemini/DeepSeek/Anthropic LLM APIs (local CLI)",
+      "server": null,
+      "git": null
+    },
+    "manage-by-text": {
+      "path": "/workspace/projects/manage-by-text",
+      "aliases": ["manage-by-text", "manage by text", "mbt"],
+      "status": "planning",
+      "tech": "Go + WhatsApp API (pre-build research & design)",
+      "server": null,
+      "git": null
+    },
+    "trade-by-text-test": {
+      "path": "/workspace/projects/trade-by-text-test",
+      "aliases": ["trade-by-text-test", "tbt test", "tbt harness", "whatsapp test harness"],
+      "status": "production",
+      "tech": "Node.js + Playwright (live e2e harness for trade-by-text, Docker)",
+      "server": null,
+      "git": null
+    },
+    "hermes-steve": {
+      "path": "/workspace/projects/hermes-steve",
+      "aliases": ["hermes-steve", "hermes steve", "hermes (steve)"],
+      "status": "utility",
+      "tech": "Docker Compose (Steve's Hermes instance)",
+      "server": null,
+      "git": null
+    },
+    "hermes-maria": {
+      "path": "/workspace/projects/hermes-maria",
+      "aliases": ["hermes-maria", "hermes maria", "hermes (maria)"],
+      "status": "utility",
+      "tech": "Docker Compose (Maria's Hermes instance)",
+      "server": null,
+      "git": null
+    },
+    "infra-monitor": {
+      "path": "/workspace/projects/infra-monitor",
+      "aliases": ["infra-monitor", "infra monitor", "uptime monitor", "health monitor"],
+      "status": "production",
+      "tech": "Go (systemd service on the Gotenberg droplet; monitors trade-by-text infra)",
+      "server": {
+        "prod": { "ip": "139.59.203.111", "user": "claude_code", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" }
+      },
+      "git": null
+    },
+    "harness-evals": {
+      "path": "/workspace/projects/harness-evals",
+      "aliases": ["harness-evals", "harness evals", "harness benchmark", "eval runner"],
+      "status": "utility",
+      "tech": "Go (benchmarks claude-gateway / andy / cog against GAIA)",
+      "server": null,
+      "git": null
+    },
+    "transcriptions": {
+      "path": "/workspace/projects/transcriptions",
+      "aliases": ["transcriptions", "transcription", "audio transcription"],
+      "status": "utility",
+      "tech": "Go daemon + Gemini 2.5 Flash (watch folder -> RTF)",
+      "server": null,
+      "git": null
+    },
+    "autoresearch": {
+      "path": "/workspace/projects/autoresearch",
+      "aliases": ["autoresearch", "auto research"],
+      "status": "scratch",
+      "tech": "Docker Compose research container",
+      "server": null,
+      "git": null
+    },
+    "alice": {
+      "path": "/workspace/projects/alice",
+      "aliases": ["alice", "alice bot"],
+      "status": "scratch",
+      "tech": "Docker Compose (Alice agent instance)",
+      "server": null,
+      "git": null
+    },
+    "andy": {
+      "path": "/workspace/projects/andy",
+      "aliases": ["andy", "andy bot"],
+      "status": "scratch",
+      "tech": "Docker Compose (Andy agent instance)",
+      "server": null,
+      "git": null
+    },
+    "epstein-download": {
+      "path": "/workspace/projects/epstein-download",
+      "aliases": ["epstein-download", "epstein download", "epstein files"],
+      "status": "scratch",
+      "tech": "Shell + Python (DOJ file downloader/OCR)",
+      "server": null,
+      "git": null
+    },
+    "business-opportunities": {
+      "path": "/workspace/projects/business-opportunities",
+      "aliases": ["business-opportunities", "business opportunities", "research notes"],
+      "status": "scratch",
+      "tech": "Markdown research notes",
+      "server": null,
+      "git": null
+    },
+    "polycell": {
+      "path": "/workspace/projects/polycell",
+      "aliases": ["polycell", "poly cell", "grounding engine"],
+      "status": "development",
+      "tech": "Python (Neo4j + tree-sitter + LLM grounding/verification engine)",
+      "server": null,
+      "git": null
     }
   },
   "servers": {
     "209.38.168.80": { "name": "dev-server", "purpose": "PTP development", "user": "claude_code", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" },
     "68.183.252.237": { "name": "prod-server", "purpose": "PTP production", "user": "claude_code", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" },
-    "129.212.162.77": { "name": "personal-server", "purpose": "grey-website, calendar, gann, ptp-charts, tvc", "user": "claude_code", "ssh_key": "/workspace/.ssh/grey_deploy_key" }
+    "129.212.162.77": { "name": "personal-server", "purpose": "grey-website, calendar, gann, ptp-charts, tvc", "user": "claude_code", "ssh_key": "/workspace/.ssh/grey_deploy_key" },
+    "129.212.163.180": { "name": "forex-droplet", "purpose": "forex-trading", "user": "claude_code", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" },
+    "139.59.203.111": { "name": "gotenberg-host", "purpose": "Gotenberg + infra-monitor (trade-by-text)", "user": "claude_code", "ssh_key": "/workspace/.ssh/id_rsa_claude_code" }
   },
   "database": {
     "host": "db-postgresql-lon1-84981-do-user-8222989-0.f.db.ondigitalocean.com",
@@ -208,6 +409,6 @@
     "name": "tvc",
     "user": "claude_code",
     "ssl": "require",
-    "projects": ["ptp-dev", "ptp", "grey-website", "cTrader", "MetaTrader5", "Charts", "ptp-charts"]
+    "projects": ["ptp-dev", "ptp", "grey-website", "cTrader", "MetaTrader5", "ptp-charts"]
   }
 }

@@ -147,7 +147,7 @@ func TestRecentConversationsAllSessionsLimitGuard(t *testing.T) {
 func TestSearchSimilarLimitGuard(t *testing.T) {
 	d := &DB{}
 	emb := []float32{0.1, 0.2}
-	hits, err := d.SearchSimilar(context.Background(), emb, nil, 0, 0.5)
+	hits, err := d.SearchSimilar(context.Background(), emb, nil, 0, 0.5, "")
 	if err != nil {
 		t.Errorf("expected nil error, got: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestSearchSimilarLimitGuard(t *testing.T) {
 		t.Errorf("expected nil result for limit=0, got %d hits", len(hits))
 	}
 
-	hits, err = d.SearchSimilar(context.Background(), emb, nil, -1, 0.5)
+	hits, err = d.SearchSimilar(context.Background(), emb, nil, -1, 0.5, "")
 	if err != nil {
 		t.Errorf("expected nil error, got: %v", err)
 	}

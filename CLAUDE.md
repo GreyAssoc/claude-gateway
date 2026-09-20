@@ -8,8 +8,17 @@ Run from `/workspace/projects/claude-gateway/`:
 # Restart entire stack (recreates containers — picks up mount/compose changes)
 docker compose down && docker compose up -d
 
-# Restart sidecar only (e.g. after sidecar code change, no mount changes)
+# Restart sidecar only (e.g. after sidecar/index.js change — bind-mounted)
 docker compose restart sidecar
+
+# Rebuild sidecar (Go wrapper, Dockerfile.sidecar, apt/npm)
+docker compose up -d --build sidecar
+
+# Recreating sidecar alone STOPS gateway (depends_on) and does not start it
+# again. Always bring the whole stack back:
+docker compose up -d
+# or recreate both:
+docker compose up -d --build --force-recreate gateway sidecar
 
 # Full rebuild + restart (after Dockerfile or dependency changes)
 docker compose down && docker compose build && docker compose up -d
@@ -19,6 +28,21 @@ docker compose logs -f              # all services
 docker compose logs -f sidecar      # sidecar only
 docker compose logs -f gateway      # gateway only
 ```
+
+### Cron (Telegram)
+
+All jobs run on Qwen (`CRON_FRAMEWORK`). Times are `TZ=Europe/London`.
+
+```
+/cronlist                                          # name, schedule, next run
+/cronadd standup "30 9 * * 1-5" Check calendar and summarise today's meetings
+/cronrun standup
+/crondisable morning_briefing
+/cronenable morning_briefing
+/crondel standup
+```
+
+`/cronadd` is in-memory only (lost on gateway restart). Permanent jobs go in `configs/gateway.yaml` under `cron:` then recreate the gateway. Full examples: `USER_GUIDE.md` §10.
 
 > **Note:** `docker compose restart` reuses existing containers and will NOT pick up
 > changes to volumes/mounts in `docker-compose.yml` **or** env vars interpolated at
@@ -44,7 +68,7 @@ Telegram User
 Go Gateway (port 8080 dashboard)
 ├── Telegram Bot (polling)
 ├── Rate Limiter (RPM/ITPM/OTPM)
-├── Skills Manager (auto-loads from skills/)
+├── Skills Manager (auto-loads harness/skills + skills/)
 ├── Memory Manager (bootstrap + curated + daily)
 ├── Cron Scheduler (morning briefing, EOD, weekly)
 ├── Watchers (Gmail, Calendar polling)
@@ -91,7 +115,8 @@ configs/
 memory/
 ├── bootstrap/                Static context (injected every request)
 └── daily/                    Auto-generated daily summaries
-skills/                       Auto-loaded skill prompts
+harness/skills/               Framework-agnostic skills (every model)
+skills/                       Workspace / Claude Code skill prompts (mounted)
 ```
 
 ## Build & Run
@@ -150,13 +175,41 @@ session resume all keep working.
 Currently registered: `claude` (native), `deepseek` (when `DEEPSEEK_API_KEY`
 is set), `grok` (SuperGrok subscription via Grok Build CLI), `qwen` (local
 vLLM on the host GPU when `VLLM_MODEL` / `VLLM_URL` is set; Ollama is the
-fallback if only `OLLAMA_CHAT_MODEL` is set). Switch at runtime with
-`/framework deepseek`, `/framework grok`, `/framework qwen`, or the
-`/models` picker. Grok uses `/grokauth` (device-code login) — not
-`XAI_API_KEY`. Local Qwen via vLLM uses Anthropic Messages API at
-`http://host.docker.internal:8005` (`ANTHROPIC_AUTH_TOKEN=dummy`,
-`--served-model-name` must match `VLLM_MODEL`).
-These do not go through OpenCode.
+fallback if only `OLLAMA_CHAT_MODEL` is set).
+
+**Default is Qwen** (`FRAMEWORK=qwen` in `.env`). Cron stays on Qwen
+(`CRON_FRAMEWORK`). Telegram `/models` and `/framework` apply **only to the
+focused agent**, not the process default.
+
+```
+@forex-trading
+/models deepseek          # this agent only; DeepSeek V4 Pro
+/models deepseek-flash    # this agent only; DeepSeek V4.1 Flash (`deepseek-flash`)
+@grey-email
+/models qwen              # this agent only
+/models inherit           # drop chat override (YAML pin remains)
+/framework inherit
+```
+
+Pin in the specialist YAML (gateway rescan / restart):
+
+```yaml
+---
+name: forex-trading
+project: /workspace/projects/forex-trading
+framework: deepseek
+---
+```
+
+`framework:` = `qwen` | `deepseek` | `grok` | `claude`. Omit to inherit Qwen.
+
+Grok uses `/grokauth` (device-code login) — not `XAI_API_KEY`. Local Qwen via
+vLLM uses Anthropic Messages API at `http://host.docker.internal:18020`
+(`VLLM_API_KEY` if the serve has `--api-key`, else dummy, `--served-model-name`
+must match `VLLM_MODEL`). These do not go through OpenCode.
+
+Concurrent specialists: `/who`, `/progress`, `/progress all` (GPU queue
+position), `/stop @Name`. A new message to a busy agent does not cancel it.
 
 To add another vendor with an Anthropic-compatible endpoint, append to the
 `PROVIDERS` map in `sidecar/index.js` and register a backend in

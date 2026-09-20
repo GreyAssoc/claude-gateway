@@ -127,7 +127,8 @@ Ollama (host, port 11434)
     |
     v
 PostgreSQL (host, port 5432)
-├── conversations ........... Every exchange with embeddings for semantic search
+├── agents .................. @handles (folder specialists + default/cron/watcher)
+├── conversations ........... Every exchange, keyed by session_id **and** agent_id
 ├── memory_entries .......... Bootstrap instructions, preferences, auto-learned facts
 ├── people .................. Contact database with trigram + vector indexes
 ├── contact_details ......... Phone, email, address for each person
@@ -227,6 +228,122 @@ If nothing is running, `/stop` replies "Nothing running to stop."
 
 Responses over 4,000 characters are automatically split into multiple Telegram messages at natural line breaks.
 
+### Go builds (`go test` / `go build`)
+
+Agents run inside the sidecar, which ships **Go 1.25** with `GOTOOLCHAIN=local`. They must never download a toolchain from go.dev (that is the hang that looks like `go test` stuck at startup with empty caches).
+
+The sidecar `go` wrapper, process env, and Claude Code settings all force:
+
+| Var | Value | Why |
+|-----|--------|-----|
+| `GOTOOLCHAIN` | `local` | Do not fetch go1.25.x from go.dev |
+| `GOSUMDB` | `off` | Do not block on sum.golang.org |
+| `GOFLAGS` | `-buildvcs=false` (+ `-mod=vendor` when `vendor/` exists) | No git stamp hang |
+| `CLAUDE_CODE_DISABLE_SANDBOX` | `1` | Sandbox emptied GOCACHE and used `auto` |
+
+After changing the wrapper or Dockerfile: `docker compose up -d --build sidecar` (bind-mounted `index.js` only needs `restart sidecar`).
+
+If `go test` still prints `go.mod requires go >= 1.26 (running go 1.25.x; GOTOOLCHAIN=local)`, the module needs a newer image — do not set `GOTOOLCHAIN=auto`.
+
+### Named agents (`@Handle`)
+
+Specialists live in `/workspace/.claude/agents/<handle>/`. Address one with `@Name` (or `/agents` and tap). Each has its own session, cwd, skills, and model. Messages without `@` go to whoever you last focused. `/default` or `@default` returns to the main assistant.
+
+Every folder under `.claude/agents/` is **registered in PostgreSQL `agents`** on gateway start and again when the folder is created or changed (agent-creator, `/sync`, a new directory). Each Telegram / cron / watcher exchange is saved to `conversations` with that `agent_id`. `/dbcheck` lists agent ids and the last messages tagged `@handle`. Existing rows are backfilled from `session_id` (`tg-<chat>-ag-<handle>`).
+
+```
+@forex-trading what's uncommitted
+@grey-email check my emails
+@default
+/who
+```
+
+Several agents can work at once (tools in parallel; Qwen GPU is one generation at a time). A new message to a busy agent does **not** cancel it — peek instead.
+
+| Command | What it does | Example |
+|---------|----------------|---------|
+| `@Handle` (nothing else) | Focus that agent. If it is working, dump live progress without cancelling. If it is idle, say so. | `@forex-trading` |
+| `/who` | Who you are chatting with, plus **Working now**. | `/who` |
+| `/progress` | Peek at the focused agent (idle or working). | `/progress` |
+| `/progress @Handle` | Peek at that agent from another conversation. | `/progress @forex-trading` |
+| `/progress all` | Queue summary of **in-flight** agents only, then each busy agent's last actions. Idle specialists are omitted. | `/progress all` |
+| `/stop` | Stop the focused agent. | `/stop` |
+| `/stop @Handle` | Stop that agent only. | `/stop @grey-email` |
+| `/stop all` | Stop every in-flight agent in this chat. | `/stop all` |
+| `/reset` | Clear **this agent's** session (poisoned toolchain loops, etc.). | focus `@forex-trading` then `/reset` |
+
+`/progress all` only lists agents that currently have a running task (`activeReqs`). An idle specialist (including the one you just focused) will **not** appear. If the focused agent is idle, the summary says so explicitly (`@grey-website (this chat) is idle — not listed above`). A new question starts a **new** run — that is not a hidden leftover process.
+
+`/progress all` GPU lines:
+
+| Line | Meaning |
+|------|---------|
+| `GPU: starting (@greywebsite)` | First in line, about to generate (not queued behind itself) |
+| `GPU: generating (@forextrading) — 1 of 2; waiting: @greyemail` | Using the 3090 now |
+| `GPU: queued 2 of 2 (@greyemail, behind @forextrading)` | Waiting for that model turn |
+| `tools (not on GPU)` | Bash/Read/Gmail — not in the GPU line |
+
+### Per-agent models
+
+The gateway **opens on Qwen**. Cron stays on Qwen (`CRON_FRAMEWORK`). Each specialist can use a different backend; `/models` and `/framework` apply **only to the agent you are chatting with**.
+
+**Pin in YAML** (sticky default for that folder):
+
+```yaml
+---
+name: grey-email
+framework: qwen
+---
+```
+
+```yaml
+---
+name: forex-trading
+project: /workspace/projects/forex-trading
+framework: deepseek
+---
+```
+
+`framework:` values: `qwen` | `deepseek` | `grok` | `claude`. Omit the key to inherit gateway Qwen.
+
+**Swap in chat** (this agent only):
+
+```
+@forex-trading
+/models deepseek
+```
+
+```
+@grey-email
+/models
+```
+
+then tap **Qwen3.8 (local)**. `@forex-trading` stays on DeepSeek.
+
+```
+@forex-trading
+/models inherit
+```
+
+or `/framework inherit` — drops the chat override (YAML pin remains if set).
+
+| Command | Scope | Example |
+|---------|--------|---------|
+| `/models` | Picker for the **focused** agent | while on `@forex-trading`, tap DeepSeek |
+| `/models deepseek` | That agent → DeepSeek V4 Pro | `@forex-trading` then `/models deepseek` |
+| `/models deepseek-flash` | That agent → DeepSeek V4.1 Flash (`deepseek-flash`) | `/models flash` also works |
+| `/models grok` | That agent → Grok 4.5 | needs `/grokauth` once |
+| `/models qwen` | That agent → local Qwen | `@grey-email` then `/models qwen` |
+| `/models inherit` | Drop chat override | `/models inherit` |
+| `/framework` | Show this agent + gateway default | `/framework` |
+| `/framework deepseek` | Same as `/models deepseek` | `/framework grok` |
+| `/framework inherit` | Same as `/models inherit` | `/framework inherit` |
+| `/model` | Framework, configured id, YAML vs override vs default | `/model` |
+
+The “Now chatting with @…” line shows `Model: … (this chat only | pinned in agent YAML | gateway default)`.
+
+Switching `@forex-trading` does **not** change `@grey-email`, `@default`, cron, or the process default. Gateway default stays Qwen unless you change `FRAMEWORK=` in `.env` (startup only).
+
 ---
 
 ## 4. Commands Reference
@@ -236,11 +353,18 @@ Responses over 4,000 characters are automatically split into multiple Telegram m
 | Command | Description |
 |---------|-------------|
 | `/start` | Show all available commands |
-| `/stop` | Stop the current in-progress request (also works as plain text "stop") |
+| `/stop` | Stop the focused agent (`/stop @Name`, `/stop all`) |
 | `/status` | Gateway health, rate limits, queue depth |
 | `/cost` | Token usage for current session (requests, input/output tokens) |
-| `/reset` | Clear Claude session and start fresh |
-| `/cron` | List active scheduled jobs and their status |
+| `/reset` | Clear **this agent's** session and start fresh |
+| `/who` | Focused agent, model, and who is working |
+| `/agents` | Folder specialists (tap to switch). Orchestrator `/agents` is the review-agent list in §14 |
+| `/progress` | Peek without cancelling (`/progress @Name`, `/progress all`) |
+| `/default` | Leave specialist; chat with the main assistant |
+| `/models` | Model for **this agent only** (Qwen / DeepSeek / Grok). `/models inherit` drops the override |
+| `/framework` | Same as `/models`, by backend name. `/framework inherit` to inherit gateway Qwen |
+| `/model` | Show this agent's framework and last API model |
+| `/cronlist` | List all scheduled jobs (schedule, enabled, next run) |
 | `/context` | Show current memory context layers |
 | `/dbcheck` | Check PostgreSQL conversation storage (recent messages) |
 
@@ -284,11 +408,12 @@ Responses over 4,000 characters are automatically split into multiple Telegram m
 
 | Command | Description |
 |---------|-------------|
-| `/cron` | List all scheduled jobs with status |
-| `/cronadd <name> "<schedule>" <prompt>` | Add a new cron job at runtime |
-| `/crondel <name>` | Remove a cron job |
-| `/cronenable <name>` | Enable a disabled cron job |
-| `/crondisable <name>` | Disable (pause) a cron job |
+| `/cronlist` | List all jobs: name, cron expression, next run (or disabled) |
+| `/cronadd <name> "<schedule>" <prompt>` | Add a job now (enabled immediately). Schedule must be in double quotes |
+| `/cronrun <name>` | Run that job once, now (still uses Qwen) |
+| `/crondel <name>` | Remove a job |
+| `/cronenable <name>` | Resume a paused job |
+| `/crondisable <name>` | Pause without deleting |
 
 ### Skills
 
@@ -616,12 +741,25 @@ You can manually set any profile aspect at 100% confidence. This creates a "pinn
 
 ## 9. Skills
 
-Skills are prompt templates that teach Claude specialized workflows. They're auto-loaded from the `skills/` directory.
+Skills are prompt templates that teach specialized workflows.
+
+**Harness skills** (`harness/skills/` in this repo) are framework-agnostic.
+Claude, Grok, DeepSeek, OpenCode, **and local Qwen** all see them. Capabilities
+that need a CLI (Gmail, Calendar, Drive, Sheets) also get first-class sidecar
+tools so Qwen does not have to know about `gog`. Put anything every model
+should be able to do here. See `harness/README.md`.
+
+**Workspace skills** (`/workspace/.claude/skills/`, mounted as `/app/skills`)
+are Claude-oriented workflows (notices, awards, Task-tool agents). They still
+load for Claude/Grok; Qwen gets a compact index plus a match when relevant.
 
 ### Current Skills
 
 | Skill | Command | Purpose |
 |-------|---------|---------|
+| **Google Workspace** | (harness, always-on) | Gmail, Calendar, Drive, Sheets — every model |
+| **Web** | (harness, always-on) | WebSearch + WebFetch — every model including Qwen |
+| **Local context** | (harness, always-on) | `Now` (London time) + `ClientsFind` |
 | **YouTube Research** | `/youtube <query>` | Fetch transcripts, search videos/channels |
 | **Notices** | `/notices <project>` | Generate party wall legal notice documents |
 | **Schedule of Condition** | `/soc <project>` | Transcribe recorded surveys into standardized documents |
@@ -656,7 +794,7 @@ When a skill command is invoked, the gateway:
 
 ### Adding Custom Skills
 
-Create a `.md` file in `skills/` with YAML frontmatter:
+Create a `.md` file in `harness/skills/` (every model) or `skills/` (Claude-oriented) with YAML frontmatter:
 
 ```markdown
 ---
@@ -676,25 +814,82 @@ The file is auto-detected by the file watcher. No restart required.
 
 ## 10. Scheduled Jobs (Cron)
 
-Cron jobs run Claude at specified times and send the output to your Telegram notification chat.
+Cron jobs fire a prompt on a schedule and send the result to your Telegram **notification** chat. They always run on **Qwen** (`CRON_FRAMEWORK`, default `qwen`). Telegram `/framework` / `/models` never apply to cron.
 
-### Default Jobs
+Times use the container timezone (`TZ=Europe/London` in compose).
 
-| Job | Schedule | What It Does |
-|-----|----------|--------------|
-| **Morning Briefing** | 7:00 AM Mon-Fri | Checks Gmail (last 12h) + calendar (today) + top 3 priorities |
-| **End of Day** | 6:00 PM Mon-Fri | Summarizes emails, calendar events, action items for tomorrow |
-| **Weekly Review** | 9:00 AM Monday | Checks Google Drive for files modified in the last week |
-| **Memory Compaction** | Midnight daily | Internal: compacts memories, generates daily journal |
+If a job replies `Please run /login`, that is Claude Code in the sidecar, not a Telegram command. Check that vLLM is up and `CRON_FRAMEWORK=qwen`.
 
-### Configuration
+### List every job
 
-Jobs are defined in `configs/gateway.yaml`:
+```
+/cronlist
+```
+
+You can also type a normal sentence such as `what cron jobs do I have?` — the gateway answers that itself.
+
+Output looks like:
+
+```
+📋 Scheduled Jobs
+
+✅ morning_briefing — `0 7 * * 1-5` → next: Mon 07:00
+   Check my Gmail for urgent unread messages…
+⏸️ weekly_review — `0 9 * * 1` (disabled)
+   Check my Google Drive for files modified…
+```
+
+`✅` = enabled (with next run). `⏸️` = paused.
+
+### Add a job from Telegram
+
+```
+/cronadd <name> "<minute hour day month weekday>" <prompt>
+```
+
+The **schedule must be in double quotes**. Name: letters/digits/underscores, no spaces, unique.
+
+| Example | Meaning |
+|---------|---------|
+| `/cronadd standup "30 9 * * 1-5" Check my calendar and summarise today's meetings` | 09:30 weekdays |
+| `/cronadd inbox_pulse "0 12,16 * * 1-5" Check unread Gmail from the last 4 hours. Bullet anything that needs a reply.` | Noon and 16:00 weekdays |
+| `/cronadd friday_wrap "0 16 * * 5" Summarise this week's Drive changes and open calendar items for next week.` | Friday 16:00 |
+| `/cronadd my_check "*/30 9-17 * * 1-5" Check for new support tickets and summarise` | Every 30 minutes, 09:00–17:00 weekdays |
+
+The job is **enabled immediately**. It does **not** write to `gateway.yaml` — `/cronadd` jobs live in memory and **disappear on gateway restart**. For a job that must survive restarts, add it in YAML (below) then recreate the gateway.
+
+### Run, pause, resume, delete
+
+```
+/cronrun standup              # fire once now (does not wait for the clock)
+/crondisable morning_briefing # pause, keep the definition
+/cronenable morning_briefing  # resume
+/crondel standup              # remove (YAML jobs come back on next restart unless you edit YAML)
+```
+
+### Schedule syntax
+
+`minute hour day-of-month month weekday` (same as Unix cron). Weekday: `0`/`7` = Sunday, `1` = Monday.
+
+| Expression | When |
+|------------|------|
+| `0 7 * * 1-5` | 07:00 Monday–Friday |
+| `30 9 * * 1-5` | 09:30 Monday–Friday |
+| `0 18 * * 1-5` | 18:00 Monday–Friday |
+| `0 9 * * 1` | 09:00 Mondays |
+| `0 12,16 * * 1-5` | 12:00 and 16:00 weekdays |
+| `0 0 * * *` | midnight every day |
+| `*/30 * * * *` | every 30 minutes |
+| `*/30 9-17 * * 1-5` | every 30 minutes between 09:00 and 17:00, weekdays |
+
+### Jobs that survive restart (YAML)
+
+Edit `configs/gateway.yaml` under `cron:`, then `docker compose up -d --force-recreate gateway`.
 
 ```yaml
 cron:
   morning_briefing:
-    schedule: "0 7 * * 1-5"       # 7 AM, Mon-Fri
+    schedule: "0 7 * * 1-5"
     prompt: >
       Check my Gmail for urgent unread messages from the last 12 hours,
       check my calendar for today's events, and give me a concise morning
@@ -702,57 +897,20 @@ cron:
     enabled: true
 ```
 
-### Schedule Syntax
-
-Format: `minute hour day month weekday`
-
-| Example | Meaning |
-|---------|---------|
-| `0 7 * * 1-5` | 7:00 AM, Monday through Friday |
-| `0 18 * * 1-5` | 6:00 PM, Monday through Friday |
-| `0 9 * * 1` | 9:00 AM, Monday only |
-| `0 0 * * *` | Midnight, every day |
-| `*/30 * * * *` | Every 30 minutes |
-
-### Template Variables
-
-The `{since}` placeholder is replaced with the timestamp of the last successful run:
+`{since}` in a prompt is replaced with the last successful run time:
 
 ```yaml
 prompt: "Check Gmail for messages since {since}"
 ```
 
-### Dynamic Cron Management (Telegram)
+### Built-in jobs (from YAML)
 
-You can add, remove, enable, and disable cron jobs at runtime from Telegram without restarting the gateway.
-
-**Adding a job:**
-```
-/cronadd my_check "*/30 9-17 * * 1-5" Check for new support tickets and summarize
-```
-
-Format: `/cronadd <name> "<schedule>" <prompt text>`
-- The schedule must be quoted (double quotes)
-- The name must be unique (no spaces)
-- The job starts immediately in enabled state
-
-**Removing a job:**
-```
-/crondel my_check
-```
-
-**Pausing/resuming a job:**
-```
-/crondisable morning_briefing    — Pause without removing
-/cronenable morning_briefing     — Resume
-```
-
-**Listing jobs:**
-```
-/cron
-```
-
-Shows all jobs with their schedule, enabled status, and next run time.
+| Job | Schedule | What it does |
+|-----|----------|----------------|
+| `morning_briefing` | 07:00 Mon–Fri | Unread Gmail (12h) + today's calendar + top 3 priorities |
+| `end_of_day` | 18:00 Mon–Fri | Emails, events, follow-ups for tomorrow |
+| `weekly_review` | 09:00 Monday | Drive files changed in the last week |
+| `memory_compaction` | midnight daily | Internal compact + daily journal (cannot `/cronrun`) |
 
 ---
 
@@ -803,7 +961,14 @@ Watchers respect the global rate limits. If the limit is hit, the check is silen
 
 ## 12. Google Workspace
 
-Claude has authenticated access to Gmail, Calendar, Google Drive, and Google Sheets via the `gog` CLI tool. All commands run through the sidecar using your own OAuth credentials.
+This is a **harness skill**. Every connected model can check Gmail and Calendar.
+
+- **Claude / Grok / DeepSeek:** Bash `gog` (below). Same OAuth token.
+- **Local Qwen (vLLM):** named tools `GmailSearch`, `GmailThread`, `GmailSend`, `CalendarList`, `CalendarAdd`, `DriveSearch`, `DriveLs`, `DriveDownload`, `DriveUpload`, `SheetsRead`. The sidecar wraps `gog`; Qwen never has to discover the CLI.
+
+Daily morning briefing (`CRON_FRAMEWORK=qwen`) uses the same `gog` token (named Gmail/Calendar tools on Qwen). Switching Telegram away from Qwen does not change cron.
+
+Auth: `/googleauth` writes `/root/.config/gog/token.json` on the shared `gog-tokens` volume.
 
 ### Gmail
 
@@ -862,15 +1027,23 @@ Restrictions are enforced at two layers:
 
 ## 13. Web Browsing
 
-Claude has full internet access via three tools, ordered by preference:
+Internet access is a **harness skill**. Claude, Grok, DeepSeek, **and local Qwen** can search and read the public web.
 
 ### WebSearch
 
 Search the web for information. Returns titles, snippets, and URLs. Best for quick lookups and finding current information.
 
+- Claude / Grok: Claude Code `WebSearch` (Anthropic-hosted).
+- Qwen: sidecar `WebSearch`. Uses `BRAVE_API_KEY` or `BRAVE_API` from `.env` if set, otherwise DuckDuckGo HTML.
+
 ### WebFetch
 
-Fetch and read any web page. Converts HTML to markdown. Best for reading specific URLs, documentation pages, or articles.
+Fetch and read any web page. Converts HTML to text. Best for reading specific URLs, documentation pages, or articles.
+
+- Claude / Grok: Claude Code `WebFetch`.
+- Qwen: sidecar `WebFetch`. SSRF-guarded (no localhost, RFC1918, or cloud metadata).
+
+Optional: add `BRAVE_API_KEY=` or `BRAVE_API=` to `claude-gateway/.env` for better Qwen search quality (https://brave.com/search/api/). The sidecar reads the file per request.
 
 ### Playwright (Browser Automation)
 
@@ -889,7 +1062,7 @@ The Playwright MCP server is configured in `claude-code-settings.json`:
 }
 ```
 
-**Preference order:** Always use WebFetch/WebSearch first (faster, lighter). Use Playwright only when pages require JavaScript rendering or interactive workflows.
+**Preference order:** Always use WebFetch/WebSearch first (faster, lighter). Use Playwright only when pages require JavaScript rendering or interactive workflows. Playwright MCP is **Claude-only** (Qwen has WebSearch/WebFetch, not a headed browser).
 
 ---
 
@@ -1124,7 +1297,7 @@ heartbeat:
 | `OLLAMA_EMBED_MODEL` | No | Embedding model (default: nomic-embed-text) |
 | `OLLAMA_LLM_MODEL` | No | LLM model for triage (default: qwen2.5:7b) |
 | `OLLAMA_CHAT_MODEL` | No | Fallback local chat model (Ollama) if vLLM is not configured. |
-| `VLLM_URL` | No | vLLM Anthropic/OpenAI endpoint (container: `http://host.docker.internal:8005`). |
+| `VLLM_URL` | No | vLLM OpenAI endpoint (container: `http://host.docker.internal:18020`). Sidecar appends `/v1`. |
 | `VLLM_MODEL` | No | vLLM `--served-model-name` for `/framework qwen` (e.g. `qwen3.8-27b`). |
 | `CLAUDE_CONFIG_DIR` | Yes | Path to Claude OAuth credentials |
 | `DASHBOARD_TOKEN` | No | Bearer token for remote dashboard access |
@@ -1228,14 +1401,15 @@ vLLM must be started with tool calling (already in your compose):
 --served-model-name qwen3.8-27b
 --enable-auto-tool-choice
 --tool-call-parser qwen3_coder
---port 8000          # published as host 8005
+--port 8000          # published as host 18020
 ```
 
 Gateway `.env`:
 
 ```bash
-VLLM_URL=http://host.docker.internal:8005
+VLLM_URL=http://host.docker.internal:18020
 VLLM_MODEL=qwen3.8-27b
+VLLM_API_KEY=          # required if vLLM was started with --api-key
 ```
 
 `VLLM_MODEL` must match `--served-model-name`. Then recreate (gateway registers the backend at startup; sidecar JS is in the image):
@@ -1248,20 +1422,19 @@ cd /workspace/projects/claude-gateway
 docker compose down && docker compose build && docker compose up -d
 ```
 
-Check from the host that the Anthropic endpoint answers:
+Check from the host that the OpenAI-compat endpoint answers:
 
 ```bash
-curl -s http://127.0.0.1:8005/v1/models
-curl -s http://127.0.0.1:8005/v1/messages \
+curl -s http://127.0.0.1:18020/v1/models
+curl -s http://127.0.0.1:18020/v1/chat/completions \
   -H 'content-type: application/json' \
-  -H 'x-api-key: dummy' \
-  -H 'anthropic-version: 2023-06-01' \
+  -H 'authorization: Bearer dummy' \
   -d '{"model":"qwen3.8-27b","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Switch in Telegram with `/framework qwen` or `/models` → **Qwen3.8 (local)**.
+Gateway default is Qwen. Per-agent: `/models qwen` while chatting with that specialist, or YAML `framework: qwen`. See [Per-agent models](#per-agent-models).
 
-`--max-model-len 16384` is the context window the sidecar uses for auto-compact. If you raise it in vLLM, raise the map in `sidecar/index.js` to match.
+`--max-model-len 65536` is the context window the sidecar uses (must match vLLM). If you change it in vLLM, raise `VLLM_CONTEXT_WINDOW` and the map in `sidecar/index.js` to match.
 
 Triage/embeddings still use host Ollama (`qwen2.5:7b` + `nomic-embed-text`) if that stack is running. The 3090 is dedicated to vLLM.
 
@@ -1324,8 +1497,8 @@ Triage/embeddings still use host Ollama (`qwen2.5:7b` + `nomic-embed-text`) if t
 | Claude doesn't know about tools/skills | Bootstrap memory not loaded or stale session | Check logs for "Bootstrap sync", then send `/reset` |
 | Go code changes not taking effect | Container not rebuilt | Run `docker compose up -d --build` |
 | DeepSeek 401 `Your api key: ****xxxx is invalid` | Host-shell `DEEPSEEK_API_KEY` or cached Claude creds overriding `.env` | Unset host `DEEPSEEK_API_KEY`, confirm `.env`, rebuild sidecar (see below) |
-| `/framework qwen` unknown / connection refused | vLLM not running, wrong port, or `VLLM_MODEL` ≠ `--served-model-name` | `curl :8005/v1/models`, set `VLLM_URL`/`VLLM_MODEL` in `.env`, recreate gateway+sidecar |
-| Qwen 400 context length | Claude Code cannot fit in vLLM 16k | Sidecar talks to `/v1/messages` directly (chat, no Claude Code tools). Rebuild sidecar. Raise `--max-model-len` to 32768 for agent mode. |
+| `/framework qwen` HTTP 401 | vLLM `--api-key` set; sidecar was sending `Bearer dummy` | Set `VLLM_API_KEY` in `.env` to the same key; sidecar re-reads `.env` per request after rebuild |
+| Qwen 400 context length | Prompt/history exceeds vLLM `--max-model-len` | Sidecar talks to `/v1/chat/completions` directly. Set `VLLM_CONTEXT_WINDOW` to match the serve (currently 65536). |
 | Triage not working / model not found | Wrong Ollama model name in config | Verify model with `ollama list`; check `OLLAMA_LLM_MODEL` in `.env` |
 
 ### DeepSeek 401 — wrong API key suffix
@@ -1424,8 +1597,14 @@ docker compose logs gateway 2>&1 | grep -i "bootstrap sync"
 # Conversation count
 psql -U gateway -d gateway -c "SELECT COUNT(*) FROM conversations;"
 
-# Recent conversations
-psql -U gateway -d gateway -c "SELECT role, LEFT(content, 80), created_at FROM conversations ORDER BY created_at DESC LIMIT 10;"
+# Registered agents (auto-upserted from .claude/agents/ plus default/cron/watcher)
+psql -U gateway -d gateway -c "SELECT id, handle, source, is_active FROM agents ORDER BY id;"
+
+# Recent conversations with agent
+psql -U gateway -d gateway -c "SELECT a.handle, c.role, LEFT(c.content, 80), c.created_at FROM conversations c LEFT JOIN agents a ON a.id = c.agent_id ORDER BY c.created_at DESC LIMIT 10;"
+
+# Messages for one specialist
+psql -U gateway -d gateway -c "SELECT c.role, LEFT(c.content, 80), c.created_at FROM conversations c JOIN agents a ON a.id = c.agent_id WHERE a.handle = 'grey-website' ORDER BY c.created_at DESC LIMIT 20;"
 
 # Active memories
 psql -U gateway -d gateway -c "SELECT category, key, LEFT(content, 60), importance, source FROM active_memory LIMIT 20;"

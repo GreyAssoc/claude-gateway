@@ -69,18 +69,51 @@ RUN chmod +x /usr/local/bin/gog && gog --version
 RUN npm install -g @playwright/mcp@latest && \
     npx playwright install --with-deps chromium
 
-# Go toolchain — agents run `go test` / `go build` against /workspace.
-# Copied from the official bookworm image so glibc matches node:20-slim.
-COPY --from=golang:1.25-bookworm /usr/local/go /usr/local/go
-ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}" \
-    GOPATH="/root/go" \
-    GOTOOLCHAIN=local
-RUN go version
-
-# Sidecar app
+# Sidecar app deps first so Go PATH/symlink tweaks do not bust this layer.
+# npm EAI_AGAIN is a DNS blip to registry.npmjs.org — retry instead of failing the build.
 WORKDIR /app
 COPY sidecar/package.json sidecar/package-lock.json* ./
-RUN npm install --production
+# npm's default fetch-timeout is 300s, so a DNS blip looks like a stall.
+# ipv4first avoids AAAA hangs; --network host on `compose build` if this still EAI_AGAIN.
+RUN NODE_OPTIONS=--dns-result-order=ipv4first \
+    npm config set fetch-timeout 20000 && \
+    npm config set fetch-retries 2 && \
+    npm config set fetch-retry-mintimeout 1000 && \
+    npm config set fetch-retry-maxtimeout 5000 && \
+    for i in 1 2 3; do \
+      timeout 90 npm install --omit=dev && break; \
+      echo "npm install attempt $i failed, retrying in 5s..."; \
+      sleep 5; \
+    done && \
+    test -d node_modules/@anthropic-ai/claude-agent-sdk
+
+# Go toolchain — agents run `go test` / `go build` against /workspace.
+# Copied from the official bookworm image so glibc matches node:20-slim.
+# The real binary is go.real; both PATH copies are wrappers that force
+# GOTOOLCHAIN=local so Claude Code cannot `exec` the raw go and hang on
+# a toolchain download from go.dev.
+COPY --from=golang:1.25-bookworm /usr/local/go /usr/local/go
+COPY sidecar/bin-wrappers/go /tmp/go-wrapper
+ENV PATH="/usr/local/bin:/usr/local/go/bin:/root/go/bin:${PATH}" \
+    GOPATH="/root/go" \
+    GOROOT="/usr/local/go" \
+    GOTOOLCHAIN=local \
+    GOSUMDB=off \
+    GOTELEMETRY=off \
+    GOFLAGS=-buildvcs=false \
+    GIT_TERMINAL_PROMPT=0
+RUN mv /usr/local/go/bin/go /usr/local/go/bin/go.real && \
+    cp /tmp/go-wrapper /usr/local/go/bin/go && \
+    cp /tmp/go-wrapper /usr/local/bin/go && \
+    chmod 755 /usr/local/go/bin/go /usr/local/bin/go /usr/local/go/bin/go.real && \
+    /usr/local/go/bin/go.real version && \
+    go version
+
+# cgo / race detector (go test -race). Late layer so npm cache stays intact.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc libc6-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY sidecar/index.js .
 
 # Hooks: SessionStart (context injection), PostToolUse (anti-pattern checker,
@@ -109,5 +142,6 @@ CMD ["sh", "-c", "\
   mkdir -p /root/.claude && cp -a /root/.claude-ro/. /root/.claude/ && echo 'Claude OAuth creds copied OK' && \
   cp /root/.config/claude-code/settings.json /root/.claude/settings.json && echo 'Claude Code settings applied' && \
   mkdir -p /root/.config/gog && echo 'gog token dir ready' && \
+  git config --global --add safe.directory '*' || true; \
   if [ -d /root/.ssh-ro ]; then mkdir -p /root/.ssh && cp -a /root/.ssh-ro/. /root/.ssh/ && chmod 700 /root/.ssh && chmod 600 /root/.ssh/id_* 2>/dev/null; chmod 644 /root/.ssh/*.pub 2>/dev/null; echo 'SSH keys copied OK'; fi && \
   exec node index.js"]

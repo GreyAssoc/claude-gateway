@@ -1,0 +1,35 @@
+#!/bin/sh
+# Every agent Bash (Qwen, DeepSeek, Grok, Claude) must use the Go that
+# shipped in the sidecar image. GOTOOLCHAIN=auto downloads go1.25.x from
+# go.dev and hangs for minutes with empty GOCACHE — looks like a dead test.
+export GOTOOLCHAIN=local
+export GOSUMDB=off
+export GOTELEMETRY=off
+export GIT_TERMINAL_PROMPT=0
+case " ${GOFLAGS-} " in
+  *" -buildvcs=false "*) ;;
+  *) GOFLAGS="${GOFLAGS:+$GOFLAGS }-buildvcs=false"; export GOFLAGS ;;
+esac
+if [ -f go.mod ] && [ -d vendor ]; then
+  case " ${GOFLAGS-} " in
+    *" -mod="*) ;;
+    *) GOFLAGS="${GOFLAGS} -mod=vendor"; export GOFLAGS ;;
+  esac
+  export GOPROXY="${GOPROXY:-off}"
+fi
+
+REAL=/usr/local/go/bin/go.real
+if [ -x "$REAL" ]; then
+  exec "$REAL" "$@"
+fi
+
+# Older images: this wrapper is only at /usr/local/bin/go and the real
+# binary is still /usr/local/go/bin/go. Do not exec ourselves.
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+OTHER=/usr/local/go/bin/go
+OTHER_RES=$(readlink -f "$OTHER" 2>/dev/null || echo "$OTHER")
+if [ -x "$OTHER" ] && [ "$SELF" != "$OTHER_RES" ]; then
+  exec "$OTHER" "$@"
+fi
+echo "go wrapper: no toolchain at $REAL" >&2
+exit 127

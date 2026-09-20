@@ -13,14 +13,55 @@ import (
 	"github.com/you/claude-gateway/internal/format"
 )
 
-// reviewToolsOnly returns a fresh copy of the read-only tool list.
-// Returns a new slice each call to prevent accidental mutation of shared state.
+// reviewToolsOnly returns tools for review agents. Write is included so
+// agents can save a findings report under reports/; Bash/Edit are omitted
+// so they cannot rewrite the code under review.
 func reviewToolsOnly() []string {
-	return []string{"Read", "Glob", "Grep"}
+	return []string{"Read", "Glob", "Grep", "Write"}
 }
 
 // maxDNAFileSize is the maximum size for an agent DNA file (100 KB).
 const maxDNAFileSize = 100 * 1024
+
+func resolveDNAFile(dirs []string, rel string) (string, error) {
+	if rel == "" {
+		return "", fmt.Errorf("DNA not found: empty path")
+	}
+	clean := filepath.Clean(rel)
+	if filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
+		return "", fmt.Errorf("DNA path traversal blocked: %s", rel)
+	}
+	var lastErr error
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		absDir, err := filepath.Abs(dir)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		absDNA, err := filepath.Abs(filepath.Join(absDir, clean))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		sep := string(filepath.Separator)
+		if absDNA != absDir && !strings.HasPrefix(absDNA, absDir+sep) {
+			lastErr = fmt.Errorf("DNA path traversal blocked: %s", rel)
+			continue
+		}
+		if _, err := os.Stat(absDNA); err != nil {
+			lastErr = err
+			continue
+		}
+		return absDNA, nil
+	}
+	if lastErr != nil {
+		return "", fmt.Errorf("DNA not found: %s (%v)", rel, lastErr)
+	}
+	return "", fmt.Errorf("DNA not found: %s", rel)
+}
 
 // errorVerdict creates an ERROR verdict for an agent with timing info.
 func errorVerdict(ag Agent, errMsg string, start time.Time) Verdict {
@@ -37,24 +78,12 @@ func errorVerdict(ag Agent, errMsg string, start time.Time) Verdict {
 
 // RunAgent executes a single agent via the sidecar and returns its verdict.
 // Each agent gets a unique session so they can't see each other's output.
-func RunAgent(ctx context.Context, agentClient agent.Backend, ag Agent, task, agentDNADir, workspaceDir string, timeout time.Duration) Verdict {
+func RunAgent(ctx context.Context, agentClient agent.Backend, ag Agent, task string, agentDNADirs []string, workspaceDir string, timeout time.Duration) Verdict {
 	start := time.Now()
 
-	// Load DNA file — read first, then check size to avoid TOCTOU race.
-	dnaPath := filepath.Join(agentDNADir, ag.DNAFile)
-
-	// Validate the resolved path stays within the agent DNA directory
-	// to prevent directory traversal if team definitions become configurable.
-	absDir, err := filepath.Abs(agentDNADir)
+	dnaPath, err := resolveDNAFile(agentDNADirs, ag.DNAFile)
 	if err != nil {
-		return errorVerdict(ag, fmt.Sprintf("invalid DNA dir: %v", err), start)
-	}
-	absDNA, err := filepath.Abs(dnaPath)
-	if err != nil {
-		return errorVerdict(ag, fmt.Sprintf("invalid DNA path: %v", err), start)
-	}
-	if !strings.HasPrefix(absDNA, absDir+string(filepath.Separator)) {
-		return errorVerdict(ag, fmt.Sprintf("DNA path traversal blocked: %s", ag.DNAFile), start)
+		return errorVerdict(ag, err.Error(), start)
 	}
 
 	dna, err := os.ReadFile(dnaPath)

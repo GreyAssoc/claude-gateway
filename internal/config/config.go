@@ -34,6 +34,7 @@ type Config struct {
 	OllamaChatModel  string // local /framework qwen via Ollama (OLLAMA_CHAT_MODEL)
 	VLLMURL          string
 	VLLMModel        string // local /framework qwen via vLLM (VLLM_MODEL)
+	CronFramework    string // backend for cron/watchers (CRON_FRAMEWORK); default qwen; does not follow /framework
 	Context          ContextConfig
 	Triage           TriageConfig
 	AgentSync        AgentSync
@@ -119,7 +120,8 @@ type Database struct {
 }
 
 type Skills struct {
-	Dirs []string `yaml:"dirs"`
+	Dirs      []string `yaml:"dirs"`
+	AgentDirs []string `yaml:"agent_dirs"`
 }
 
 type Memory struct {
@@ -132,8 +134,33 @@ type Memory struct {
 }
 
 type Orchestrator struct {
-	AgentDNADir string `yaml:"agent_dna_dir"`
-	Timeout     int    `yaml:"timeout_seconds"`
+	AgentDNADir  string   `yaml:"agent_dna_dir"`
+	AgentDNADirs []string `yaml:"agent_dna_dirs"`
+	Timeout      int      `yaml:"timeout_seconds"`
+}
+
+// DNARoots is the search path for orchestrator team files.
+// Coding teams live under .claude/teams/; design/research DNA may still be under .claude/agents/.
+func (o Orchestrator) DNARoots() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	add(o.AgentDNADir)
+	for _, d := range o.AgentDNADirs {
+		add(d)
+	}
+	add("/app/teams")
+	add("/workspace/.claude/teams")
+	add("/app/agents")
+	add("/workspace/.claude/agents")
+	return out
 }
 
 type Dashboard struct {
@@ -212,6 +239,9 @@ func Load(yamlPath string) (*Config, error) {
 	if cfg.Framework == "" {
 		cfg.Framework = "claude"
 	}
+	if cfg.CronFramework == "" {
+		cfg.CronFramework = "qwen"
+	}
 
 	// OpenCode defaults
 	if cfg.OpenCode.Binary == "" {
@@ -249,8 +279,9 @@ func Load(yamlPath string) (*Config, error) {
 	if cfg.Database.Path == "" {
 		cfg.Database.Path = "data/gateway.db"
 	}
-	if len(cfg.Skills.Dirs) == 0 {
-		cfg.Skills.Dirs = []string{"skills"}
+	cfg.Skills.Dirs = normalizeSkillsDirs(cfg.Skills.Dirs)
+	if len(cfg.Skills.AgentDirs) == 0 {
+		cfg.Skills.AgentDirs = []string{"/app/agents", "/workspace/.claude/agents"}
 	}
 	if cfg.Memory.BootstrapDir == "" {
 		cfg.Memory.BootstrapDir = "memory/bootstrap"
@@ -268,7 +299,7 @@ func Load(yamlPath string) (*Config, error) {
 		cfg.Memory.MaxDailyDays = 7
 	}
 	if cfg.Orchestrator.AgentDNADir == "" {
-		cfg.Orchestrator.AgentDNADir = "/app/agents"
+		cfg.Orchestrator.AgentDNADir = "/app/teams"
 	}
 	if cfg.Orchestrator.Timeout <= 0 {
 		cfg.Orchestrator.Timeout = 600
@@ -466,6 +497,9 @@ func loadEnv(cfg *Config) {
 	if v := os.Getenv("VLLM_MODEL"); v != "" {
 		cfg.VLLMModel = v
 	}
+	if v := os.Getenv("CRON_FRAMEWORK"); v != "" {
+		cfg.CronFramework = v
+	}
 }
 
 // resolveInt converts val to int, returning fallback if val is nil or unconvertible.
@@ -508,4 +542,20 @@ func resolveInt(val any, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// harnessSkillsDir is the framework-agnostic skill corpus. Always scanned,
+// even if gateway.yaml only lists the Claude workspace skills/ mount.
+const harnessSkillsDir = "harness/skills"
+
+func normalizeSkillsDirs(dirs []string) []string {
+	if len(dirs) == 0 {
+		dirs = []string{"skills"}
+	}
+	for _, d := range dirs {
+		if strings.Trim(d, "./") == harnessSkillsDir {
+			return dirs
+		}
+	}
+	return append([]string{harnessSkillsDir}, dirs...)
 }

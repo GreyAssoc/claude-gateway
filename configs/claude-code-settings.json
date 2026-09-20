@@ -1,4 +1,12 @@
 {
+  "env": {
+    "GOTOOLCHAIN": "local",
+    "GOSUMDB": "off",
+    "GOTELEMETRY": "off",
+    "GOFLAGS": "-buildvcs=false",
+    "GIT_TERMINAL_PROMPT": "0",
+    "CLAUDE_CODE_DISABLE_SANDBOX": "1"
+  },
   "permissions": {
     "deny": [
       "Bash(*gog gmail*delete*)",

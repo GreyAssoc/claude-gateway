@@ -6,7 +6,11 @@ database:
 
 skills:
   dirs:
-    - "skills"
+    - "harness/skills"   # framework-agnostic (Gmail, Calendar, …) — every model
+    - "skills"           # workspace / Claude Code skills (mounted from .claude/skills)
+  agent_dirs:
+    - "/app/agents"      # .claude/agents (folder chat agents + leftover DNA)
+    - "/workspace/.claude/agents"
 
 memory:
   bootstrap_dir: "memory/bootstrap"
@@ -19,13 +23,17 @@ memory:
     - "/workspace/projects/CLAUDE.md"
 
 orchestrator:
-  agent_dna_dir: "/app/agents"
+  # Coding review teams: workspace/.claude/teams/coding/…
+  # Design/research DNA may still live under .claude/agents/.
+  agent_dna_dir: "/app/teams"
   timeout_seconds: 3600
 
 dashboard:
   enabled: true
   port: 8080
 
+# All cron jobs (YAML and /cronadd) run on CRON_FRAMEWORK (default qwen),
+# not the Telegram /framework switch.
 cron:
   morning_briefing:
     schedule: "0 7 * * 1-5"

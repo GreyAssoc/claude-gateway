@@ -22,24 +22,45 @@ var ErrSkillNotFound = errors.New("skill not found")
 
 // Manager loads, watches, and serves skills from disk and SQLite.
 type Manager struct {
-	db   *db.DB
-	dirs []string
+	db        *db.DB
+	dirs      []string
+	agentDirs []string
 
-	mu       sync.RWMutex
-	skills   map[string]*Skill
-	watcher  *fsnotify.Watcher
-	done     chan struct{}
-	stopOnce sync.Once
+	mu         sync.RWMutex
+	skills     map[string]*Skill
+	agents     map[string]*Skill     // orchestrator DNA (coding/, design/, …)
+	chatAgents map[string]*ChatAgent // folder agents with private skills
+	onChat     func([]ChatAgent)     // fired after each folder scan (Postgres register)
+	watcher    *fsnotify.Watcher
+	done       chan struct{}
+	stopOnce   sync.Once
 }
 
 // NewManager creates a skills manager.
 func NewManager(database *db.DB, dirs []string) *Manager {
 	return &Manager{
-		db:     database,
-		dirs:   dirs,
-		skills: make(map[string]*Skill),
-		done:   make(chan struct{}),
+		db:         database,
+		dirs:       dirs,
+		skills:     make(map[string]*Skill),
+		agents:     make(map[string]*Skill),
+		chatAgents: make(map[string]*ChatAgent),
+		done:       make(chan struct{}),
 	}
+}
+
+// SetAgentDirs sets extra trees to scan for on-demand agent/persona prompts
+// (.claude/agents). Call before Start.
+func (m *Manager) SetAgentDirs(dirs []string) {
+	m.agentDirs = dirs
+}
+
+// SetChatAgentsListener is called after every folder scan (startup and fsnotify).
+// Used to upsert Telegram specialists into PostgreSQL. Must not call back into
+// the manager while holding its lock — scanChatAgents releases the lock first.
+func (m *Manager) SetChatAgentsListener(fn func([]ChatAgent)) {
+	m.mu.Lock()
+	m.onChat = fn
+	m.mu.Unlock()
 }
 
 // Start loads skills from DB and disk, then starts watching for changes.
@@ -61,8 +82,19 @@ func (m *Manager) Start() error {
 		log.Printf("Skills: warning starting watcher: %v", err)
 	}
 
+	for _, dir := range m.agentDirs {
+		if err := m.scanAgentTree(dir); err != nil {
+			log.Printf("Skills: warning scanning agents %s: %v", dir, err)
+		}
+	}
+	m.scanChatAgents()
+
 	count := len(m.GetActiveSkills())
-	log.Printf("Skills: %d active skills loaded", count)
+	m.mu.RLock()
+	nAgents := len(m.agents)
+	nChat := len(m.chatAgents)
+	m.mu.RUnlock()
+	log.Printf("Skills: %d global skills, %d orchestrator DNA files, %d chat agents", count, nAgents, nChat)
 	return nil
 }
 
@@ -165,11 +197,27 @@ func (m *Manager) GetSkillByCommand(cmd string) (Skill, bool) {
 	if cmd == "" {
 		return Skill{}, false
 	}
+	alts := []string{cmd, strings.ReplaceAll(cmd, "_", "-"), strings.ReplaceAll(cmd, "-", "_")}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	match := func(got string) bool {
+		for _, a := range alts {
+			if got == a {
+				return true
+			}
+		}
+		return false
+	}
 	for _, s := range m.skills {
-		if s.Command == cmd && s.Enabled {
+		if s.Enabled && match(s.Command) {
 			return *s, true
+		}
+	}
+	for _, ag := range m.chatAgents {
+		for _, s := range ag.Skills {
+			if match(s.Command) {
+				return s, true
+			}
 		}
 	}
 	return Skill{}, false
@@ -210,18 +258,97 @@ func (m *Manager) BuildSkillIndex() string {
 // This keeps prompt size small (~200 tokens) when no skills match,
 // and only injects full content for relevant skills (0-3 matches).
 func (m *Manager) BuildMatchedSkillsSection(message string) string {
+	return m.BuildLibraryPrompt(message, 0)
+}
+
+// BuildHarnessPrompt is kept for callers; it now uses the shared library
+// injector (skills + agents/personas, skip always-on bodies).
+func (m *Manager) BuildHarnessPrompt(message string, maxChars int) string {
+	return m.BuildLibraryPrompt(message, maxChars)
+}
+
+// BuildLibraryPrompt returns a name index of skills and agents plus full
+// content for items that match the user message (max 3). Always-on harness
+// skill bodies are omitted (the sidecar already injects those).
+func (m *Manager) BuildLibraryPrompt(message string, maxChars int) string {
+	return m.buildLibrary(message, maxChars)
+}
+
+func (m *Manager) GetAgents() []Skill {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]Skill, 0, len(m.agents))
+	for _, s := range m.agents {
+		out = append(out, *s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func (m *Manager) buildLibrary(message string, maxChars int) string {
 	active := m.GetActiveSkills()
-	if len(active) == 0 {
+	chat := m.GetChatAgents()
+	if len(active) == 0 && len(chat) == 0 {
 		return ""
 	}
 
 	index := FormatSkillIndex(active)
+	if len(chat) > 0 {
+		if index != "" {
+			index += "\n\n"
+		}
+		index += FormatChatAgentIndex(chat)
+	}
+
 	matched := MatchSkills(active, message)
-	if len(matched) == 0 {
+	var extra []Skill
+	seen := map[string]bool{}
+	for _, s := range matched {
+		if s.Always {
+			continue
+		}
+		if seen[s.Kind+"/"+s.Name] {
+			continue
+		}
+		seen[s.Kind+"/"+s.Name] = true
+		extra = append(extra, s)
+	}
+	if len(extra) > maxMatchedSkills {
+		extra = extra[:maxMatchedSkills]
+	}
+	if len(extra) == 0 {
 		return index
 	}
 
-	return index + "\n\n" + FormatSkillsXML(matched)
+	xml := FormatSkillsXML(extra)
+	if maxChars > 0 && len(xml) > maxChars {
+		xml = xml[:maxChars] + "\n<!-- truncated library content -->"
+	}
+	return index + "\n\n" + xml
+}
+
+func FormatAgentIndex(agents []Skill) string {
+	if len(agents) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("<agents>\n")
+	sb.WriteString("<agent_index>\n")
+	sb.WriteString("<!-- Injected on demand when the user names one. Do not dump this tree. -->\n")
+	for _, s := range agents {
+		desc := s.Description
+		if desc == "" {
+			desc = s.Kind
+			if desc == "" {
+				desc = "agent"
+			}
+		}
+		sb.WriteString(fmt.Sprintf("- %s (%s): %s\n", s.Name, s.Kind, desc))
+	}
+	sb.WriteString("</agent_index>\n")
+	sb.WriteString("When the user asks to use one of these (e.g. \"go purist\", \"elon musk\", \"surveyor email drafter\"), follow that file's instructions for this turn.\n")
+	sb.WriteString("</agents>")
+	return sb.String()
 }
 
 func (m *Manager) loadFromDB(ctx context.Context) error {
@@ -279,6 +406,80 @@ func (m *Manager) scanDir(dir string, precedence int) error {
 		}
 	}
 
+	return nil
+}
+
+func (m *Manager) scanAgentTree(dir string) error {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(absDir); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return filepath.Walk(absDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			rel, relErr := filepath.Rel(absDir, path)
+			if relErr == nil && rel != "." && !strings.Contains(rel, string(filepath.Separator)) && isChatAgentDir(info.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !isAgentPromptFile(path, info.Name()) {
+			return nil
+		}
+		if info.Size() > maxSkillFileSize {
+			log.Printf("Skills: skip oversized agent %s", path)
+			return nil
+		}
+		if err := m.loadAgentFile(path); err != nil {
+			log.Printf("Skills: error loading agent %s: %v", path, err)
+		}
+		return nil
+	})
+}
+
+func isAgentPromptFile(path, name string) bool {
+	lower := strings.ToLower(name)
+	if !strings.HasSuffix(lower, ".md") {
+		return false
+	}
+	if lower == "readme.md" || lower == "consensus-protocol.md" {
+		return false
+	}
+	if strings.HasPrefix(lower, "gateway-system-") || strings.HasPrefix(lower, "andy-system-") {
+		return false
+	}
+	if isSkillFilename(name) {
+		return false
+	}
+	return true
+}
+
+func (m *Manager) loadAgentFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	skill, err := ParseSkillMD(string(data), path, 2)
+	if err != nil {
+		return err
+	}
+	kind := "agent"
+	if strings.Contains(filepath.ToSlash(path), "/personas/") {
+		kind = "persona"
+	}
+	skill.Kind = kind
+	skill.Enabled = true
+	m.mu.Lock()
+	m.agents[skill.Name] = skill
+	m.mu.Unlock()
 	return nil
 }
 
@@ -379,9 +580,70 @@ func (m *Manager) startWatcher() error {
 		}
 		log.Printf("Skills: watching %s (precedence %d)", absDir, i)
 	}
+	for _, dir := range m.agentDirs {
+		m.watchTree(dir)
+	}
 
 	go m.watchLoop()
 	return nil
+}
+
+func (m *Manager) watchTree(root string) {
+	if m.watcher == nil {
+		return
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return
+	}
+	_ = filepath.Walk(abs, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || !info.IsDir() {
+			return nil
+		}
+		if err := m.watcher.Add(path); err != nil {
+			log.Printf("Skills: cannot watch agent dir %s: %v", path, err)
+		}
+		return nil
+	})
+}
+
+func (m *Manager) isChatAgentOwnedFile(path string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		absPath = path
+	}
+	for _, dir := range m.agentDirs {
+		absDir, err := filepath.Abs(dir)
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(absDir, absPath)
+		if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		first, _, _ := strings.Cut(rel, string(filepath.Separator))
+		if first != "" && isChatAgentDir(first) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) pathInAgentDirs(path string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		absPath = path
+	}
+	for _, dir := range m.agentDirs {
+		absDir, err := filepath.Abs(dir)
+		if err != nil {
+			continue
+		}
+		if absPath == absDir || strings.HasPrefix(absPath, absDir+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) watchLoop() {
@@ -392,6 +654,27 @@ func (m *Manager) watchLoop() {
 		case event, ok := <-m.watcher.Events:
 			if !ok {
 				return
+			}
+			if m.pathInAgentDirs(event.Name) {
+				if event.Op&fsnotify.Create != 0 {
+					if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+						_ = m.watcher.Add(event.Name)
+					}
+				}
+				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
+					log.Printf("Skills: agent tree change: %s", event.Name)
+					m.scanChatAgents()
+					base := filepath.Base(event.Name)
+					// Folder specialists live in chatAgents. Do not also load their
+					// .md into m.agents — that made @forex-trading match twice and
+					// bind neither ("No unique agent folder matched").
+					if isAgentPromptFile(event.Name, base) && !m.isChatAgentOwnedFile(event.Name) && event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
+						if err := m.loadAgentFile(event.Name); err != nil {
+							log.Printf("Skills: error reloading DNA %s: %v", event.Name, err)
+						}
+					}
+				}
+				continue
 			}
 			if !isSkillFile(filepath.Base(event.Name)) {
 				continue
@@ -490,7 +773,7 @@ func (m *Manager) StatusText() string {
 	}
 
 	var lines []string
-	lines = append(lines, fmt.Sprintf("*Skills* (%d loaded)\n", len(all)))
+	lines = append(lines, fmt.Sprintf("*Global skills* (%d)\n", len(all)))
 
 	for _, s := range all {
 		icon := "ON"
@@ -506,6 +789,26 @@ func (m *Manager) StatusText() string {
 			cmdInfo = fmt.Sprintf(" (/%s)", s.Command)
 		}
 		lines = append(lines, fmt.Sprintf("[%s] *%s*%s — %s", icon, s.Name, cmdInfo, desc))
+	}
+
+	chat := m.GetChatAgents()
+	if len(chat) > 0 {
+		lines = append(lines, "\n*Per-agent skills*")
+		for _, a := range chat {
+			if len(a.Skills) == 0 {
+				lines = append(lines, fmt.Sprintf("@%s — (no skills yet)", prettyFolderHandle(a.Handle)))
+				continue
+			}
+			names := make([]string, 0, len(a.Skills))
+			for _, s := range a.Skills {
+				if s.Command != "" {
+					names = append(names, s.Name+" (/"+s.Command+")")
+				} else {
+					names = append(names, s.Name)
+				}
+			}
+			lines = append(lines, fmt.Sprintf("@%s — %s", prettyFolderHandle(a.Handle), strings.Join(names, ", ")))
+		}
 	}
 
 	return strings.Join(lines, "\n")

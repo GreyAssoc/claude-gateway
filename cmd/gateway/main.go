@@ -61,6 +61,7 @@ func main() {
 		log.Fatalf("PostgreSQL connection failed: %v", err)
 	}
 	defer pgDB.Close()
+	log.Printf("PostgreSQL ready (agent_id column=%v)", pgDB.HasAgentColumn())
 
 	// --- Ollama ---
 	ollamaClient := ollama.NewClient(cfg.OllamaURL, cfg.OllamaEmbedModel, cfg.OllamaLLMModel)
@@ -110,7 +111,7 @@ func main() {
 	backends = append(backends, grokBackend)
 	log.Println("Grok backend registered (SuperGrok / Grok Build CLI)")
 
-	// Local Qwen on the host GPU via vLLM (Anthropic /v1/messages on :8005).
+	// Local Qwen on the host GPU via vLLM (OpenAI /v1/chat/completions on :18020).
 	// Always registered like grok — first request fails loudly if vLLM is down.
 	// Sidecar reads VLLM_URL / VLLM_MODEL from .env at request time.
 	qwenBackend := agent.NewClientWithProvider("qwen", "vllm", cfg.Sidecar.URL, timeout)
@@ -164,6 +165,16 @@ func main() {
 
 	// --- Skills Manager ---
 	skillsMgr := skills.NewManager(database, cfg.Skills.Dirs)
+	skillsMgr.SetAgentDirs(cfg.Skills.AgentDirs)
+	skillsMgr.SetChatAgentsListener(func(agents []skills.ChatAgent) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := pgDB.SyncChatAgents(ctx, chatAgentSpecs(agents)); err != nil {
+			log.Printf("PostgreSQL agent sync: %v", err)
+			return
+		}
+		log.Printf("PostgreSQL: registered %d folder agents", len(agents))
+	})
 	if err := skillsMgr.Start(); err != nil {
 		log.Printf("Warning: skills manager: %v", err)
 	}
@@ -212,7 +223,7 @@ func main() {
 	ctxBuilder := ctxbuilder.NewBuilder(pgDB, ollamaClient, peopleMgr, profiler, journalMgr, cfg.Context)
 
 	// --- Orchestrator Engine ---
-	orchEngine := orchestrator.NewEngine(database, agentClient, cfg.Orchestrator.AgentDNADir, cfg.WorkDir, cfg.Orchestrator.Timeout)
+	orchEngine := orchestrator.NewEngine(database, agentClient, cfg.Orchestrator.DNARoots(), cfg.WorkDir, cfg.Orchestrator.Timeout)
 
 	// --- Google Workspace OAuth service ---
 	// Shared with the sidecar's `gog` binary via a Docker volume mounted at
@@ -262,7 +273,16 @@ func main() {
 	// --- Cron Scheduler ---
 	// Created after bot because it needs tgBot.SendNotification for alerts.
 	// CronStatus is wired back via SetCronStatus to resolve the circular dependency.
-	cronScheduler := cron.New(agentClient, limiter, tgBot.SendNotification, cfg.WorkDir)
+	cronBackend := agentClient.Durable(cfg.CronFramework)
+	log.Printf("Cron/watchers pinned to %s (Telegram /framework is %s)", cronBackend.Name(), agentClient.Active())
+	cronScheduler := cron.New(cronBackend, limiter, tgBot.SendNotification, cfg.WorkDir)
+	cronScheduler.SetRecorder(func(ctx context.Context, sessionID, user, assistant string) {
+		saveCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		if _, err := ctxBuilder.RecordExchangeSync(saveCtx, sessionID, user, assistant); err != nil {
+			log.Printf("cron save exchange %s: %v", sessionID, err)
+		}
+	})
 	if cfg.Cron != nil {
 		if err := cronScheduler.LoadJobs(cfg.Cron); err != nil {
 			log.Fatalf("Failed to load cron jobs: %v", err)
@@ -272,7 +292,14 @@ func main() {
 	tgBot.SetCronScheduler(cronScheduler)
 
 	// --- Watchers ---
-	watcherMgr := watcher.NewManager(agentClient, limiter, tgBot.SendNotification, cfg.WorkDir)
+	watcherMgr := watcher.NewManager(cronBackend, limiter, tgBot.SendNotification, cfg.WorkDir)
+	watcherMgr.SetRecorder(func(ctx context.Context, sessionID, user, assistant string) {
+		saveCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		if _, err := ctxBuilder.RecordExchangeSync(saveCtx, sessionID, user, assistant); err != nil {
+			log.Printf("watcher save exchange %s: %v", sessionID, err)
+		}
+	})
 	watcherMgr.Configure(cfg.Watchers)
 
 	// --- Heartbeat ---
@@ -451,6 +478,21 @@ func runHeartbeat(ctx context.Context, client agent.Backend, tgBot *bot.Bot, cfg
 			}
 		}
 	}
+}
+
+func chatAgentSpecs(agents []skills.ChatAgent) []pgdb.AgentSpec {
+	out := make([]pgdb.AgentSpec, 0, len(agents))
+	for _, a := range agents {
+		out = append(out, pgdb.AgentSpec{
+			Handle:      a.Handle,
+			DisplayName: a.Handle,
+			Dir:         a.Dir,
+			ProjectPath: a.ProjectPath,
+			Framework:   a.Framework,
+			Source:      "folder",
+		})
+	}
+	return out
 }
 
 // syncBootstrapMemory reads .md files from the bootstrap directory and upserts

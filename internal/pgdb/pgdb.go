@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"strconv"
 	"strings"
@@ -21,7 +22,8 @@ var ErrNotFound = errors.New("not found")
 
 // DB wraps a PostgreSQL connection pool.
 type DB struct {
-	db *sql.DB
+	db       *sql.DB
+	agentCol bool // conversations.agent_id exists (schema migrate may have been skipped)
 }
 
 // Open connects to PostgreSQL and verifies connectivity.
@@ -38,7 +40,7 @@ func Open(connStr string) (*DB, error) {
 	sqlDB.SetMaxIdleConns(5)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	if err := sqlDB.PingContext(ctx); err != nil {
@@ -46,7 +48,29 @@ func Open(connStr string) (*DB, error) {
 		return nil, fmt.Errorf("pinging postgres: %w", err)
 	}
 
-	return &DB{db: sqlDB}, nil
+	d := &DB{db: sqlDB}
+	// Schema migrate must never prevent Telegram from polling. The gateway
+	// role may lack ALTER on conversations (owned by postgres); log and continue.
+	if err := d.EnsureSchema(ctx); err != nil {
+		log.Printf("pgdb: schema migrate failed (gateway will still start): %v", err)
+	}
+	d.agentCol = d.hasAgentColumn(ctx)
+	if d.agentCol {
+		if err := d.EnsureBuiltinAgents(ctx); err != nil {
+			log.Printf("pgdb: builtin agents: %v", err)
+		} else if n, err := d.BackfillConversationAgents(ctx); err != nil {
+			log.Printf("pgdb: backfill conversation agents: %v", err)
+		} else if n > 0 {
+			log.Printf("pgdb: backfilled agent_id on %d conversation rows", n)
+		}
+	}
+	log.Printf("pgdb: connected (conversations.agent_id=%v)", d.agentCol)
+	return d, nil
+}
+
+// HasAgentColumn reports whether conversations.agent_id is present.
+func (d *DB) HasAgentColumn() bool {
+	return d.agentCol
 }
 
 // Close closes the connection pool.
@@ -83,6 +107,17 @@ type Conversation struct {
 	Content       string
 	TokenEstimate int
 	CreatedAt     time.Time
+	AgentID       int64
+	AgentHandle   string
+}
+
+const conversationSelect = `c.id, c.session_id, c.role, c.content, COALESCE(c.token_estimate, 0), c.created_at, COALESCE(c.agent_id, 0), COALESCE(a.handle, '')`
+const conversationFrom = `conversations c LEFT JOIN agents a ON a.id = c.agent_id`
+
+func scanConversation(s interface{ Scan(...any) error }) (Conversation, error) {
+	var c Conversation
+	err := s.Scan(&c.ID, &c.SessionID, &c.Role, &c.Content, &c.TokenEstimate, &c.CreatedAt, &c.AgentID, &c.AgentHandle)
+	return c, err
 }
 
 // ConversationHit is a Conversation with a similarity score from semantic search.
@@ -168,6 +203,21 @@ func (d *DB) SaveConversation(ctx context.Context, sessionID, role, content stri
 		s := vectorToString(embedding)
 		embStr = &s
 	}
+	if d.agentCol {
+		agentID, err := d.EnsureAgentIDForSession(ctx, sessionID)
+		if err != nil {
+			return fmt.Errorf("save conversation: %w", err)
+		}
+		_, err = d.db.ExecContext(ctx,
+			`INSERT INTO conversations (session_id, role, content, embedding, token_estimate, agent_id)
+			 VALUES ($1, $2, $3, $4::vector, $5, $6)`,
+			sessionID, role, content, embStr, tokenEstimate, agentID,
+		)
+		if err != nil {
+			return fmt.Errorf("save conversation: %w", err)
+		}
+		return nil
+	}
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO conversations (session_id, role, content, embedding, token_estimate)
 		 VALUES ($1, $2, $3, $4::vector, $5)`,
@@ -185,6 +235,22 @@ func (d *DB) SaveConversation(ctx context.Context, sessionID, role, content stri
 // turns even when embedding generation is still in-flight.
 func (d *DB) SaveConversationReturningID(ctx context.Context, sessionID, role, content string, tokenEstimate int) (int64, error) {
 	var id int64
+	if d.agentCol {
+		agentID, err := d.EnsureAgentIDForSession(ctx, sessionID)
+		if err != nil {
+			return 0, fmt.Errorf("save conversation returning id: %w", err)
+		}
+		err = d.db.QueryRowContext(ctx,
+			`INSERT INTO conversations (session_id, role, content, token_estimate, agent_id)
+			 VALUES ($1, $2, $3, $4, $5)
+			 RETURNING id`,
+			sessionID, role, content, tokenEstimate, agentID,
+		).Scan(&id)
+		if err != nil {
+			return 0, fmt.Errorf("save conversation returning id: %w", err)
+		}
+		return id, nil
+	}
 	err := d.db.QueryRowContext(ctx,
 		`INSERT INTO conversations (session_id, role, content, token_estimate)
 		 VALUES ($1, $2, $3, $4)
@@ -220,10 +286,10 @@ func (d *DB) RecentConversations(ctx context.Context, sessionID string, limit in
 		return nil, nil
 	}
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT id, session_id, role, content, COALESCE(token_estimate, 0), created_at
-		 FROM conversations
-		 WHERE session_id = $1
-		 ORDER BY created_at DESC
+		`SELECT `+conversationSelect+`
+		 FROM `+conversationFrom+`
+		 WHERE c.session_id = $1
+		 ORDER BY c.created_at DESC
 		 LIMIT $2`,
 		sessionID, limit,
 	)
@@ -234,8 +300,8 @@ func (d *DB) RecentConversations(ctx context.Context, sessionID string, limit in
 
 	var convs []Conversation
 	for rows.Next() {
-		var c Conversation
-		if err := rows.Scan(&c.ID, &c.SessionID, &c.Role, &c.Content, &c.TokenEstimate, &c.CreatedAt); err != nil {
+		c, err := scanConversation(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scanning conversation: %w", err)
 		}
 		convs = append(convs, c)
@@ -252,9 +318,9 @@ func (d *DB) RecentConversationsAllSessions(ctx context.Context, limit int) ([]C
 		return nil, nil
 	}
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT id, session_id, role, content, COALESCE(token_estimate, 0), created_at
-		 FROM conversations
-		 ORDER BY created_at DESC
+		`SELECT `+conversationSelect+`
+		 FROM `+conversationFrom+`
+		 ORDER BY c.created_at DESC
 		 LIMIT $1`,
 		limit,
 	)
@@ -265,8 +331,8 @@ func (d *DB) RecentConversationsAllSessions(ctx context.Context, limit int) ([]C
 
 	var convs []Conversation
 	for rows.Next() {
-		var c Conversation
-		if err := rows.Scan(&c.ID, &c.SessionID, &c.Role, &c.Content, &c.TokenEstimate, &c.CreatedAt); err != nil {
+		c, err := scanConversation(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scanning conversation: %w", err)
 		}
 		convs = append(convs, c)
@@ -282,10 +348,10 @@ func (d *DB) ConversationsByDate(ctx context.Context, date string) ([]Conversati
 		return nil, fmt.Errorf("conversations by date: invalid date %q: %w", date, err)
 	}
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT id, session_id, role, content, COALESCE(token_estimate, 0), created_at
-		 FROM conversations
-		 WHERE created_at::date = $1::date
-		 ORDER BY created_at ASC`,
+		`SELECT `+conversationSelect+`
+		 FROM `+conversationFrom+`
+		 WHERE c.created_at::date = $1::date
+		 ORDER BY c.created_at ASC`,
 		date,
 	)
 	if err != nil {
@@ -295,8 +361,8 @@ func (d *DB) ConversationsByDate(ctx context.Context, date string) ([]Conversati
 
 	var convs []Conversation
 	for rows.Next() {
-		var c Conversation
-		if err := rows.Scan(&c.ID, &c.SessionID, &c.Role, &c.Content, &c.TokenEstimate, &c.CreatedAt); err != nil {
+		c, err := scanConversation(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scanning conversation: %w", err)
 		}
 		convs = append(convs, c)
@@ -306,7 +372,9 @@ func (d *DB) ConversationsByDate(ctx context.Context, date string) ([]Conversati
 
 // SearchSimilar finds conversations semantically similar to the given embedding.
 // Excludes conversations with IDs in excludeIDs (to avoid duplicating the recency window).
-func (d *DB) SearchSimilar(ctx context.Context, embedding []float32, excludeIDs []int64, limit int, minSimilarity float64) ([]ConversationHit, error) {
+// If sessionID is non-empty, only that agent's thread is searched so named
+// chats cannot pull in another agent's history.
+func (d *DB) SearchSimilar(ctx context.Context, embedding []float32, excludeIDs []int64, limit int, minSimilarity float64, sessionID string) ([]ConversationHit, error) {
 	if len(embedding) == 0 {
 		return nil, nil
 	}
@@ -324,21 +392,28 @@ func (d *DB) SearchSimilar(ctx context.Context, embedding []float32, excludeIDs 
 		for i, id := range excludeIDs {
 			parts[i] = strconv.FormatInt(id, 10)
 		}
-		excludeClause = " AND id NOT IN (" + strings.Join(parts, ",") + ")"
+		excludeClause = " AND c.id NOT IN (" + strings.Join(parts, ",") + ")"
+	}
+
+	sessionClause := ""
+	args := []any{embStr, limit, minSimilarity}
+	if sessionID != "" {
+		sessionClause = " AND c.session_id = $4"
+		args = append(args, sessionID)
 	}
 
 	query := fmt.Sprintf(
-		`SELECT id, session_id, role, content, COALESCE(token_estimate, 0), created_at,
-		        1 - (embedding <=> $1::vector) AS similarity
-		 FROM conversations
-		 WHERE embedding IS NOT NULL
-		   AND 1 - (embedding <=> $1::vector) >= $3%s
-		 ORDER BY embedding <=> $1::vector
+		`SELECT `+conversationSelect+`,
+		        1 - (c.embedding <=> $1::vector) AS similarity
+		 FROM `+conversationFrom+`
+		 WHERE c.embedding IS NOT NULL
+		   AND 1 - (c.embedding <=> $1::vector) >= $3%s%s
+		 ORDER BY c.embedding <=> $1::vector
 		 LIMIT $2`,
-		excludeClause,
+		excludeClause, sessionClause,
 	)
 
-	rows, err := d.db.QueryContext(ctx, query, embStr, limit, minSimilarity)
+	rows, err := d.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search similar: %w", err)
 	}
@@ -347,7 +422,7 @@ func (d *DB) SearchSimilar(ctx context.Context, embedding []float32, excludeIDs 
 	var hits []ConversationHit
 	for rows.Next() {
 		var h ConversationHit
-		if err := rows.Scan(&h.ID, &h.SessionID, &h.Role, &h.Content, &h.TokenEstimate, &h.CreatedAt, &h.Similarity); err != nil {
+		if err := rows.Scan(&h.ID, &h.SessionID, &h.Role, &h.Content, &h.TokenEstimate, &h.CreatedAt, &h.AgentID, &h.AgentHandle, &h.Similarity); err != nil {
 			return nil, fmt.Errorf("scanning hit: %w", err)
 		}
 		hits = append(hits, h)
@@ -641,8 +716,8 @@ func (d *DB) DeletePerson(ctx context.Context, id int) error {
 }
 
 // scanPerson scans the standard 10 person columns from a row.
-// Matches the SELECT: id, full_name, COALESCE(preferred_name, ''), type,
-// COALESCE(role, ''), COALESCE(company, ''), COALESCE(notes, ''),
+// Matches the SELECT: id, full_name, COALESCE(preferred_name, ”), type,
+// COALESCE(role, ”), COALESCE(company, ”), COALESCE(notes, ”),
 // is_active, created_at, updated_at.
 func scanPerson(scanner interface{ Scan(...any) error }) (Person, error) {
 	var p Person

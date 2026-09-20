@@ -749,6 +749,7 @@ GATEWAY_TOP
       - ./memory:/app/memory
       - ./configs:/app/configs
       - \${WORK_DIR}/.claude/agents:/app/agents:ro
+      - \${WORK_DIR}/.claude/teams:/app/teams:ro
     ports:
       - "\${DASHBOARD_PORT:-8080}:8080"
     depends_on:
@@ -1163,7 +1164,7 @@ memory:
     - "/workspace/projects/CLAUDE.md"
 
 orchestrator:
-  agent_dna_dir: "/app/agents"
+  agent_dna_dir: "/app/teams"
   timeout_seconds: 3600
 
 dashboard:

@@ -1,6 +1,11 @@
 package orchestrator
 
-import "sort"
+import (
+	"sort"
+	"sync"
+)
+
+var teamsMu sync.RWMutex
 
 // Agent represents a review agent with its DNA file and permissions.
 type Agent struct {
@@ -9,7 +14,7 @@ type Agent struct {
 	Tier         int
 	Weight       int
 	HasVetoPower bool
-	CanWrite     bool // if false, only Read/Glob/Grep tools allowed
+	CanWrite     bool // if false, only Read/Glob/Grep/Write (reports/) tools allowed
 }
 
 // Team is a named group of agents that reviews together.
@@ -24,16 +29,16 @@ var allTeams = map[string]Team{
 	"go-dev-team": {
 		Name: "go-dev-team",
 		Agents: []Agent{
-			{Name: "GoPurist", DNAFile: "coding/go-team/go-purist.md", Tier: 4, Weight: 1},
-			{Name: "GoPragmatist", DNAFile: "coding/go-team/go-pragmatist.md", Tier: 4, Weight: 1},
-			{Name: "GoPessimist", DNAFile: "coding/go-team/go-pessimist.md", Tier: 4, Weight: 1},
+			{Name: "GoPurist", DNAFile: "coding/go-dev-team/go-purist.md", Tier: 4, Weight: 1},
+			{Name: "GoPragmatist", DNAFile: "coding/go-dev-team/go-pragmatist.md", Tier: 4, Weight: 1},
+			{Name: "GoPessimist", DNAFile: "coding/go-dev-team/go-pessimist.md", Tier: 4, Weight: 1},
 		},
 	},
 	"go-sec-team": {
 		Name: "go-sec-team",
 		Agents: []Agent{
-			{Name: "GoSecurity", DNAFile: "coding/go-team/go-security-agent.md", Tier: 1, Weight: 1000, HasVetoPower: true},
-			{Name: "GoHacker", DNAFile: "coding/go-team/go-hacker-agent.md", Tier: 2, Weight: 100},
+			{Name: "GoSecurity", DNAFile: "coding/go-sec-team/go-security-agent.md", Tier: 1, Weight: 1000, HasVetoPower: true},
+			{Name: "GoHacker", DNAFile: "coding/go-sec-team/go-hacker-agent.md", Tier: 2, Weight: 100},
 		},
 	},
 	"fe-dev-team": {
@@ -113,6 +118,8 @@ var allTeams = map[string]Team{
 
 // TeamNames returns all available team names in sorted order.
 func TeamNames() []string {
+	teamsMu.RLock()
+	defer teamsMu.RUnlock()
 	names := make([]string, 0, len(allTeams))
 	for name := range allTeams {
 		names = append(names, name)
@@ -123,6 +130,12 @@ func TeamNames() []string {
 
 // GetTeam returns a team by name.
 func GetTeam(name string) (Team, bool) {
+	teamsMu.RLock()
+	defer teamsMu.RUnlock()
 	t, ok := allTeams[name]
-	return t, ok
+	if !ok {
+		return Team{}, false
+	}
+	t.Agents = append([]Agent(nil), t.Agents...)
+	return t, true
 }

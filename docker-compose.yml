@@ -38,11 +38,14 @@ services:
       # Google OAuth client_secret JSON (read-only). Used as a fallback when
       # GOOGLE_CLIENT_ID/SECRET env vars aren't set.
       - ./client_secret.json:/root/.config/gog/client_secret.json:ro
+      - ./harness/skills:/app/harness/skills:ro
       - ${WORK_DIR}/.claude/skills:/app/skills:ro
       - ./memory:/app/memory
       - ./configs:/app/configs
-      # Agent DNA files for orchestrator (read-only)
+      # Chat agents (Telegram @Name) and leftover DNA (design/research)
       - ${WORK_DIR}/.claude/agents:/app/agents:ro
+      # Orchestrator review teams (coding/go-dev-team, …)
+      - ${WORK_DIR}/.claude/teams:/app/teams:ro
       # Full workspace — needed by OpenCode backend to access all projects.
       # Mirrors the sidecar mount so both frameworks see the same files.
       - ${WORK_DIR}:/workspace
@@ -60,6 +63,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.sidecar
+      # BuildKit's embedded DNS often returns EAI_AGAIN for registry.npmjs.org.
+      network: host
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file: .env
@@ -87,17 +92,33 @@ services:
       # The sidecar also re-reads this file per request so key rotation does
       # not require a container recreate.
       - GATEWAY_ENV_FILE=/workspace/projects/claude-gateway/.env
+      # Harness skills (Gmail/Calendar tools + always-on prompts for Qwen).
+      - HARNESS_SKILLS_DIR=/app/harness/skills
       # Ollama is on the host GPU. env_file may already set OLLAMA_URL;
       # force the Docker-reachable hostname so a host-side localhost value
       # cannot hide the 3090 from the sidecar.
       - OLLAMA_URL=http://host.docker.internal:11434
-      # vLLM on the host GPU (separate compose, published 8005:8000).
-      - VLLM_URL=http://host.docker.internal:8005
+      # vLLM on the host GPU (published as host 18020). Sidecar appends /v1.
+      - VLLM_URL=http://host.docker.internal:18020
       # grey-docs scripts have a guard that refuses direct execution unless
       # they're invoked via an MCP server. No grey-docs MCP server exists, so
       # we override the guard here. Revisit when a real MCP server is built.
       - GREY_DOCS_ALLOW_DIRECT=1
+      # Grok's installer rewrites PATH in login shells and drops Docker ENV
+      # (/usr/local/go/bin). Keep Go on PATH for Qwen/Grok/Claude Bash.
+      - PATH=/usr/local/bin:/usr/local/go/bin:/root/go/bin:/root/.grok/bin:/root/.claude/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+      # Never inherit GOTOOLCHAIN=auto from a login shell / SDK sandbox.
+      - GOTOOLCHAIN=local
+      - GOSUMDB=off
+      - GOTELEMETRY=off
+      - GOFLAGS=-buildvcs=false
+      - CLAUDE_CODE_DISABLE_SANDBOX=1
     volumes:
+      # Sidecar JS without a full image rebuild (npm registry is flaky in BuildKit).
+      - ./sidecar/index.js:/app/index.js:ro
+      # Grok/login-shell PATH includes /usr/local/bin but not /usr/local/go/bin.
+      - ./sidecar/bin-wrappers/go:/usr/local/bin/go:ro
+      - ./sidecar/bin-wrappers/gofmt:/usr/local/bin/gofmt:ro
       # Host workspace — mounted so Claude Code can read/write project files
       - ${WORK_DIR}:/workspace
       # Client data directories (read-only — for skills that read/copy client data)
@@ -115,6 +136,11 @@ services:
       # OAuth client_secret JSON (read-only). The gog binary loads it as a
       # fallback when GOOGLE_CLIENT_ID/SECRET env vars aren't set.
       - ./client_secret.json:/root/.config/gog/client_secret.json:ro
+      - ./harness/skills:/app/harness/skills:ro
+      - ${WORK_DIR}/.claude/teams:/app/teams:ro
+      # Persist Go compile/module cache so `go build` is seconds, not a cold hang.
+      - go-build-cache:/root/.cache/go-build
+      - go-mod-cache:/root/go/pkg/mod
       # SSH keys (read-only, copied to writable /root/.ssh at startup)
       - ${HOME}/.ssh:/root/.ssh-ro:ro
       # CUPS printing (host printer access via socket)
@@ -142,3 +168,5 @@ volumes:
   gog-tokens:
   # SuperGrok session (auth.json from `grok login --device-auth`).
   grok-home:
+  go-build-cache:
+  go-mod-cache:

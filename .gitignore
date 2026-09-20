@@ -1,7 +1,9 @@
 # Secrets & credentials
 .env
+client_secret.json
 client_secret_*.json
 google-tokens/
+*api_key.txt
 
 # Runtime data
 data/

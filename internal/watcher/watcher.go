@@ -18,11 +18,15 @@ import (
 // NotifyFunc sends notifications to the user.
 type NotifyFunc func(text string)
 
+// RecordFunc persists a watcher exchange to PostgreSQL (session_id watcher-<name>).
+type RecordFunc func(ctx context.Context, sessionID, userMessage, assistantResponse string)
+
 // Manager runs all watchers.
 type Manager struct {
 	agent   agent.Backend
 	limiter *ratelimiter.Limiter
 	notify  NotifyFunc
+	record  RecordFunc
 	workDir string
 
 	watchers []*watchTask
@@ -47,10 +51,25 @@ func NewManager(agentClient agent.Backend, limiter *ratelimiter.Limiter, notify 
 	}
 }
 
+// SetRecorder stores watcher prompt/reply pairs in PostgreSQL under agent "watcher".
+func (m *Manager) SetRecorder(fn RecordFunc) {
+	m.record = fn
+}
+
+func (m *Manager) persist(ctx context.Context, sessionID, user, assistant string) {
+	if m.record == nil || strings.TrimSpace(assistant) == "" {
+		return
+	}
+	m.record(ctx, sessionID, user, assistant)
+}
+
 // Configure sets up watchers from config.
 func (m *Manager) Configure(watchersCfg config.WatchersConfig) {
 	if watchersCfg.Gmail.Enabled {
 		gw := newGmailWatcher(m.agent, m.limiter, m.notify, m.workDir, watchersCfg.Gmail)
+		gw.record = func(ctx context.Context, sessionID, user, assistant string) {
+			m.persist(ctx, sessionID, user, assistant)
+		}
 		m.watchers = append(m.watchers, &watchTask{
 			name:     "gmail",
 			enabled:  true,
@@ -61,6 +80,9 @@ func (m *Manager) Configure(watchersCfg config.WatchersConfig) {
 
 	if watchersCfg.Calendar.Enabled {
 		cw := newCalendarWatcher(m.agent, m.limiter, m.notify, m.workDir, watchersCfg.Calendar)
+		cw.record = func(ctx context.Context, sessionID, user, assistant string) {
+			m.persist(ctx, sessionID, user, assistant)
+		}
 		m.watchers = append(m.watchers, &watchTask{
 			name:     "calendar",
 			enabled:  true,
@@ -130,13 +152,14 @@ func safeInterval(seconds int, name string) time.Duration {
 // --- Gmail Watcher ---
 
 type gmailWatcher struct {
-	agent      agent.Backend
-	limiter    *ratelimiter.Limiter
-	notify     NotifyFunc
-	workDir    string
-	prompt     string
-	mu         sync.Mutex
-	lastCheck  time.Time
+	agent     agent.Backend
+	limiter   *ratelimiter.Limiter
+	notify    NotifyFunc
+	record    RecordFunc
+	workDir   string
+	prompt    string
+	mu        sync.Mutex
+	lastCheck time.Time
 }
 
 func newGmailWatcher(a agent.Backend, l *ratelimiter.Limiter, n NotifyFunc, wd string, cfg config.WatcherConfig) *gmailWatcher {
@@ -178,6 +201,9 @@ func (g *gmailWatcher) check(ctx context.Context) {
 	}
 
 	output := strings.TrimSpace(resp.Text)
+	if g.record != nil && output != "" && !strings.EqualFold(output, "NONE") {
+		g.record(reqCtx, "watcher-gmail", prompt, output)
+	}
 	if output == "" || strings.EqualFold(output, "NONE") {
 		return
 	}
@@ -193,6 +219,7 @@ type calendarWatcher struct {
 	agent          agent.Backend
 	limiter        *ratelimiter.Limiter
 	notify         NotifyFunc
+	record         RecordFunc
 	workDir        string
 	prompt         string
 	mu             sync.Mutex
@@ -236,6 +263,9 @@ func (c *calendarWatcher) check(ctx context.Context) {
 	}
 
 	output := strings.TrimSpace(resp.Text)
+	if c.record != nil && output != "" && output != "[]" {
+		c.record(reqCtx, "watcher-calendar", c.prompt, output)
+	}
 	if output == "" || output == "[]" {
 		return
 	}

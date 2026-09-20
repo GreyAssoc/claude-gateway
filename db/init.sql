@@ -6,13 +6,33 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ================================================================
--- CONVERSATIONS
--- Every user/assistant exchange, with embedding for semantic search.
--- This is the core persistence layer that solves context loss.
+-- AGENTS + CONVERSATIONS
+-- Folder specialists and every user/assistant exchange (with embeddings).
 -- ================================================================
+-- Telegram specialists (@grey-website, @forex-trading, …) plus builtin/system
+-- handles (default, cron, watcher, orchestrator). Auto-upserted on gateway start
+-- and whenever a folder is created under .claude/agents/.
+CREATE TABLE IF NOT EXISTS agents (
+    id              SERIAL PRIMARY KEY,
+    handle          TEXT NOT NULL UNIQUE,
+    handle_key      TEXT NOT NULL UNIQUE,
+    display_name    TEXT NOT NULL,
+    dir             TEXT,
+    project_path    TEXT,
+    framework       TEXT,
+    source          TEXT NOT NULL DEFAULT 'folder',
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agents_handle_key ON agents (handle_key);
+CREATE INDEX IF NOT EXISTS idx_agents_active ON agents (is_active) WHERE is_active = TRUE;
+
 CREATE TABLE IF NOT EXISTS conversations (
     id              BIGSERIAL PRIMARY KEY,
     session_id      TEXT NOT NULL,
+    agent_id        INT REFERENCES agents(id),
     role            TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content         TEXT NOT NULL,
     embedding       vector(768),
@@ -22,6 +42,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 
 CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations (session_id);
 CREATE INDEX IF NOT EXISTS idx_conv_created ON conversations (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conv_agent ON conversations (agent_id);
 -- ivfflat index for cosine similarity search
 -- NOTE: requires at least 100 rows before becoming effective
 CREATE INDEX IF NOT EXISTS idx_conv_embedding ON conversations

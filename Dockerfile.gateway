@@ -9,7 +9,9 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Build
+# Build. GATEWAY_REBUILD busts COPY cache when source looks unchanged to Docker.
+ARG GATEWAY_REBUILD=0
+RUN echo "gateway rebuild=$GATEWAY_REBUILD"
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o gateway ./cmd/gateway
 

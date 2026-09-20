@@ -30,6 +30,7 @@ type Usage struct {
 // Response is what the sidecar returns.
 type Response struct {
 	Text          string         `json:"text"`
+	Thinking      string         `json:"thinking,omitempty"`
 	SessionID     string         `json:"session_id"`
 	Model         string         `json:"api_model,omitempty"`
 	Usage         *Usage         `json:"usage,omitempty"`
@@ -42,9 +43,9 @@ type Response struct {
 // ContextStatus reports the session's per-turn context utilisation.
 // Populated on every successful /ask result.
 type ContextStatus struct {
-	TokensUsed     int `json:"tokens_used"`
-	ContextWindow  int `json:"context_window"`
-	UsageRatioPct  int `json:"usage_ratio_pct"`
+	TokensUsed    int `json:"tokens_used"`
+	ContextWindow int `json:"context_window"`
+	UsageRatioPct int `json:"usage_ratio_pct"`
 }
 
 // Compaction is metadata about an auto- or manual-compaction event.
@@ -54,8 +55,8 @@ type ContextStatus struct {
 type Compaction struct {
 	Triggered       bool   `json:"triggered"`
 	OK              bool   `json:"ok"`
-	Reason          string `json:"reason"`           // e.g. "threshold_80pct", "manual"
-	TriggeredBy     string `json:"triggered_by"`     // "auto" | "manual"
+	Reason          string `json:"reason"`       // e.g. "threshold_80pct", "manual"
+	TriggeredBy     string `json:"triggered_by"` // "auto" | "manual"
 	Summary         string `json:"summary,omitempty"`
 	OldSDKSessionID string `json:"old_sdk_session_id,omitempty"`
 	UsageRatioPct   int    `json:"usage_ratio_pct,omitempty"`
@@ -83,6 +84,7 @@ type StreamEvent struct {
 	Tool          string `json:"tool,omitempty"`
 	Input         string `json:"input,omitempty"`
 	Text          string `json:"text,omitempty"`
+	Thinking      string `json:"thinking,omitempty"`
 	SessionID     string `json:"session_id,omitempty"`
 	Usage         *Usage `json:"usage,omitempty"`
 	Error         string `json:"error,omitempty"`
@@ -123,6 +125,7 @@ type wsResponse struct {
 	Tool          string         `json:"tool,omitempty"`
 	Input         string         `json:"input,omitempty"`
 	Text          string         `json:"text,omitempty"`
+	Thinking      string         `json:"thinking,omitempty"`
 	SessionID     string         `json:"session_id,omitempty"`
 	APIModel      string         `json:"api_model,omitempty"`
 	Usage         *Usage         `json:"usage,omitempty"`
@@ -159,15 +162,15 @@ type pendingReq struct {
 // request and the sidecar injects the matching ANTHROPIC_BASE_URL /
 // ANTHROPIC_AUTH_TOKEN when spawning the SDK subprocess.
 type Client struct {
-	name     string // backend identifier returned by Name()
-	provider string // forwarded as wsRequest.Provider; empty means native Claude
+	name      string // backend identifier returned by Name()
+	provider  string // forwarded as wsRequest.Provider; empty means native Claude
 	wsURL     string
 	healthURL string
 
-	conn      *websocket.Conn
-	connDone  chan struct{} // closed when current connection is replaced or client shuts down
-	connMu    sync.Mutex   // protects conn and connDone
-	writeMu   sync.Mutex   // serializes WebSocket writes
+	conn     *websocket.Conn
+	connDone chan struct{} // closed when current connection is replaced or client shuts down
+	connMu   sync.Mutex    // protects conn and connDone
+	writeMu  sync.Mutex    // serializes WebSocket writes
 
 	pending   map[string]*pendingReq
 	pendingMu sync.Mutex
@@ -322,12 +325,14 @@ func (c *Client) AskWithOptions(ctx context.Context, opts AskOptions) (*Response
 	for {
 		select {
 		case <-ctx.Done():
+			c.AbortSession(opts.SessionID)
 			return nil, ctx.Err()
 		case resp := <-ch:
 			switch resp.Type {
 			case "result":
 				r := &Response{
 					Text:       resp.Text,
+					Thinking:   resp.Thinking,
 					SessionID:  opts.SessionID,
 					Model:      resp.APIModel,
 					Usage:      resp.Usage,
@@ -380,6 +385,7 @@ func (c *Client) AskStreaming(ctx context.Context, opts AskOptions, onProgress f
 	for {
 		select {
 		case <-ctx.Done():
+			c.AbortSession(opts.SessionID)
 			return nil, ctx.Err()
 		case resp := <-ch:
 			switch resp.Type {
@@ -397,6 +403,7 @@ func (c *Client) AskStreaming(ctx context.Context, opts AskOptions, onProgress f
 			case "result":
 				return &Response{
 					Text:       resp.Text,
+					Thinking:   resp.Thinking,
 					SessionID:  opts.SessionID,
 					Model:      resp.APIModel,
 					Usage:      resp.Usage,
@@ -420,9 +427,11 @@ func (c *Client) RunIsolatedAgent(ctx context.Context, opts RunAgentOptions) (*R
 	ch := c.allocReq(id)
 	defer c.freeReq(id)
 
+	logicalSession := "orch-" + id
 	req := wsRequest{
 		ID:           id,
 		Type:         "run-agent",
+		SessionID:    c.wireSessionID(logicalSession),
 		Prompt:       opts.Prompt,
 		WorkDir:      opts.WorkDir,
 		SystemPrompt: opts.SystemPrompt,
@@ -439,6 +448,7 @@ func (c *Client) RunIsolatedAgent(ctx context.Context, opts RunAgentOptions) (*R
 	for {
 		select {
 		case <-ctx.Done():
+			c.AbortSession(logicalSession)
 			return nil, ctx.Err()
 		case resp := <-ch:
 			switch resp.Type {

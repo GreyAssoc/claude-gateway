@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"github.com/you/claude-gateway/internal/agent"
+	"github.com/you/claude-gateway/internal/ctxbuilder"
 	"github.com/you/claude-gateway/internal/db"
 	"github.com/you/claude-gateway/internal/format"
 	"github.com/you/claude-gateway/internal/orchestrator"
@@ -81,15 +83,16 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 			"/crondisable name — disable a cron job\n" +
 			"/cronenable name — enable a cron job\n" +
 			"/cronlist — list scheduled jobs\n" +
+			"/cronrun name — run a cron job now\n" +
 			"/dbcheck — check PostgreSQL conversations\n" +
-			"/framework [name] — show/switch AI framework\n" +
+			"/framework [name] — framework for this agent only (inherit to drop)\n" +
 			"/googleauth [code|status] — Google Workspace OAuth\n" +
 			"/grokauth [status] — sign in SuperGrok (subscription, not API)\n" +
 			"/journal — view daily journal\n" +
 			"/journalsearch — search journal entries\n" +
 			"/memorieslist — list curated memories\n" +
 			"/model — show actual API model in use\n" +
-			"/models — switch DeepSeek / Grok / local Qwen\n" +
+			"/models — model for this agent only (Qwen / DeepSeek / Grok)\n" +
 			"/memoryforget — remove a memory by text match\n" +
 			"/memorylist — list memories by category\n" +
 			"/memoryremember <text> — save a memory\n" +
@@ -106,12 +109,16 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 			"/reviewautosec [dir] — auto-detect with security focus\n" +
 			"/skills — list loaded skills\n" +
 			"/status — gateway health & rate limits\n" +
-			"/stop — stop the current request\n" +
-			"/sync — sync agents & commands between Claude ↔ OpenCode"
+			"/progress [@Name] — peek at a running agent without cancelling\n" +
+			"/stop — stop the current agent (@Name or all)\n" +
+			"/sync — sync agents & commands between Claude ↔ OpenCode\n" +
+			"/who — which agent you are chatting with\n" +
+			"/agents — list folder agents and their private skills\n\n" +
+			"Address an agent with @Name (e.g. @SEOagent). Messages without @ stay with the current agent. Other agents keep working and notify you when they finish. Peek at a running agent with /progress or @Name (no extra text) — a new task message will not cancel it; use /stop."
 
 		if b.skillsManager != nil {
 			var cmds []string
-			for _, s := range b.skillsManager.GetActiveSkills() {
+			for _, s := range b.skillsManager.GetCommandSkills() {
 				if s.Command != "" {
 					desc := s.Description
 					if desc == "" {
@@ -144,6 +151,8 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		b.handleCronEnable(msg)
 	case "cronlist":
 		b.handleCronList(msg)
+	case "cronrun":
+		b.handleCronRun(msg)
 	case "dbcheck":
 		b.handleDBCheck(ctx, msg)
 	case "framework":
@@ -222,6 +231,14 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		b.handleSkillToggle(ctx, msg, false)
 	case "status":
 		b.handleStatus(ctx, msg)
+	case "who", "chats":
+		b.handleWho(msg)
+	case "progress":
+		b.handleProgress(msg)
+	case "default", "home", "main":
+		b.handleDefaultChat(msg)
+	case "agents":
+		b.handleAgentCatalog(msg)
 	case "stop":
 		b.handleStop(msg)
 	case "sync":
@@ -236,9 +253,118 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 				b.handleSkillCommand(ctx, msg, skill)
 				return
 			}
+			if b.tryAgentSlashCommand(ctx, msg) {
+				return
+			}
 		}
-		b.sendMessage(msg.Chat.ID, "Unknown command. Try /start for available commands.")
+		b.sendMessage(msg.Chat.ID, "Unknown command. Try /start or /agents.")
 	}
+}
+
+// maxGatewayLookupLen is the longest message we will treat as a gateway
+// lookup. Work briefs, paste-ins, and multi-clause instructions are always
+// longer than a "show journal" request.
+const maxGatewayLookupLen = 80
+
+// gatewayLookupPhrases maps a normalised whole utterance to a lookup kind.
+// Matching is exact (after light politeness stripping), not substring.
+// A previous contains() matcher intercepted any message containing
+// "daily journal" — including multi-page implementation briefs — and
+// replied "No journal entry for <today>" instead of sending the work
+// to the model. Same class of bug as NL model-switching, which is
+// /models only.
+var gatewayLookupPhrases = buildGatewayLookups()
+
+func buildGatewayLookups() map[string]string {
+	m := make(map[string]string)
+	add := func(kind string, cores ...string) {
+		verbs := []string{
+			"",
+			"show ", "view ", "list ", "get ", "display ",
+			"show me ", "show me the ", "show me my ",
+			"show the ", "show my ", "show all ",
+			"view the ", "view my ",
+			"list the ", "list my ", "list all ",
+		}
+		for _, core := range cores {
+			for _, v := range verbs {
+				m[v+core] = kind
+			}
+		}
+	}
+	add("journal",
+		"journal", "daily journal", "journal entry",
+		"today's journal", "todays journal", "today journal",
+		"today's journal entry", "todays journal entry",
+	)
+	add("cron",
+		"cron", "cron job", "cron jobs", "cron list",
+		"scheduled job", "scheduled jobs", "scheduled task", "scheduled tasks",
+		"active cron", "my cron",
+	)
+	add("people",
+		"people", "contacts", "all people", "all contacts",
+		"my contacts", "my people",
+	)
+	add("profile",
+		"profile", "my profile", "user profile",
+	)
+	add("memories",
+		"memories", "my memories", "all memories",
+	)
+	add("status",
+		"status", "gateway status", "system status",
+		"health check", "rate limit", "rate limits",
+	)
+	// Phrases that don't fit verb+core expansion.
+	m["who do i know"] = "people"
+	m["what do you know about me"] = "profile"
+	m["what do you remember"] = "memories"
+	m["list scheduled"] = "cron"
+	m["list cron"] = "cron"
+	m["show cron"] = "cron"
+	return m
+}
+
+// normalizeGatewayLookup lowercases, collapses space, strips trailing
+// punctuation and a light politeness wrapper. Returns "" for messages
+// that cannot be a short lookup (empty, multiline, too long).
+func normalizeGatewayLookup(text string) string {
+	s := strings.ToLower(strings.TrimSpace(text))
+	if s == "" || strings.ContainsAny(s, "\n\r") {
+		return ""
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > maxGatewayLookupLen {
+		return ""
+	}
+	s = strings.TrimRight(s, ".!?,")
+	for {
+		next := s
+		for _, p := range []string{"please ", "pls ", "can you ", "could you ", "would you "} {
+			next = strings.TrimPrefix(next, p)
+		}
+		next = strings.TrimSuffix(next, " please")
+		next = strings.TrimSuffix(next, " pls")
+		next = strings.TrimSpace(next)
+		if next == s {
+			break
+		}
+		s = next
+	}
+	return s
+}
+
+// classifyGatewayIntent returns a gateway lookup kind for short
+// natural-language queries the gateway can answer directly (cron, people,
+// profile, memories, journal, status). Returns "" when the message should
+// go to the model.
+func classifyGatewayIntent(text string) string {
+	s := normalizeGatewayLookup(text)
+	if s == "" {
+		return ""
+	}
+	return gatewayLookupPhrases[s]
 }
 
 // gatewayIntentMatch checks if a natural language message is asking about
@@ -247,139 +373,32 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 // This prevents Claude from wasting tokens searching the filesystem for
 // gateway-internal data it has no access to.
 func (b *Bot) gatewayIntentMatch(ctx context.Context, msg *tgbotapi.Message) bool {
-	lower := strings.ToLower(strings.TrimSpace(msg.Text))
-
-	// Cron/scheduled jobs
-	if containsAny(lower, "cron job", "cron list", "scheduled job", "list cron", "show cron",
-		"list all cron", "my cron", "active cron", "scheduled task", "list scheduled") {
+	switch classifyGatewayIntent(msg.Text) {
+	case "cron":
 		b.handleCronList(msg)
 		return true
-	}
-
-	// People/contacts
-	if containsAny(lower, "list people", "list contacts", "show contacts", "my contacts",
-		"show people", "who do i know", "list all people", "all contacts") {
+	case "people":
 		b.handleListPeople(ctx, msg)
 		return true
-	}
-
-	// Profile
-	if containsAny(lower, "show my profile", "my profile", "view profile", "show profile",
-		"what do you know about me", "user profile") {
+	case "profile":
 		b.handleProfile(ctx, msg)
 		return true
-	}
-
-	// Memories
-	if containsAny(lower, "list memories", "show memories", "my memories", "all memories",
-		"what do you remember", "list all memories") {
+	case "memories":
 		b.handleMemories(ctx, msg)
 		return true
-	}
-
-	// Journal
-	if containsAny(lower, "today's journal", "todays journal", "show journal", "daily journal",
-		"journal entry", "view journal") && !strings.Contains(lower, "search") {
+	case "journal":
 		b.handleJournal(ctx, msg)
 		return true
-	}
-
-	// Status
-	if containsAny(lower, "gateway status", "system status", "show status", "health check",
-		"rate limit", "rate limits") {
+	case "status":
 		b.handleStatus(ctx, msg)
 		return true
-	}
-
-	// Framework switching
-	if b.matchFrameworkSwitch(ctx, msg, lower) {
-		return true
-	}
-
-	return false
-}
-
-// matchFrameworkSwitch detects natural language requests to switch or query
-// the AI framework. Returns true if handled.
-func (b *Bot) matchFrameworkSwitch(_ context.Context, msg *tgbotapi.Message, lower string) bool {
-	// Query: "which framework", "what framework", "current framework", "what backend"
-	if containsAny(lower, "which framework", "what framework", "current framework",
-		"what backend", "which backend", "active framework", "active backend",
-		"which model", "what model are you") {
-		b.handleFramework(context.Background(), msg)
-		return true
-	}
-
-	// Switch: detect intent + target.
-	// Only match if both a switch verb AND a framework name are present.
-	// Bare "use" or "switch" without a framework target must NOT match,
-	// otherwise normal messages like "use the SEO agent" get intercepted.
-	hasFrameworkTarget := containsAny(lower, "opencode", "open code", "open-code", "zen",
-		"claude", "claude code", "sidecar", "deepseek", "grok", "qwen", "ollama", "vllm")
-
-	if !hasFrameworkTarget {
+	default:
+		// Do not intercept talk about models/frameworks. Natural-language
+		// "switch to qwen" / "use qwen" / "which model" matching made it
+		// impossible to discuss local models — the bot just switched to Qwen.
+		// Model changes are /models only (slash command or its inline picker).
 		return false
 	}
-
-	hasSwitchIntent := containsAny(lower, "switch", "change to", "swap to", "move to",
-		"enable opencode", "enable claude", "activate opencode", "activate claude",
-		"switch to opencode", "switch to claude", "use opencode", "use claude",
-		"use open code", "use claude code", "use deepseek", "switch to deepseek",
-		"use grok", "switch to grok", "enable deepseek", "enable grok",
-		"activate deepseek", "activate grok",
-		"use qwen", "switch to qwen", "enable qwen", "activate qwen",
-		"use ollama", "switch to ollama", "enable ollama",
-		"use vllm", "switch to vllm", "enable vllm")
-
-	if !hasSwitchIntent {
-		return false
-	}
-
-	// Extract target framework from the message
-	target := ""
-	switch {
-	case containsAny(lower, "opencode", "open code", "open-code", "zen"):
-		target = "opencode"
-	case containsAny(lower, "deepseek"):
-		target = "deepseek"
-	case containsAny(lower, "qwen", "ollama", "vllm"):
-		target = "qwen"
-	case containsAny(lower, "grok"):
-		target = "grok"
-	case containsAny(lower, "claude", "claude code", "sidecar"):
-		target = "claude"
-	}
-
-	// Synthesize a command message with the target as argument
-	// so handleFramework can process it.
-	switcher, ok := b.agent.(*agent.Switcher)
-	if !ok {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Framework switching not available.\nActive backend: *%s*", b.agent.Name()))
-		return true
-	}
-
-	if switcher.Active() == target {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Already using *%s*.", target))
-		return true
-	}
-
-	if err := switcher.Switch(target); err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Failed: %v", err))
-		return true
-	}
-
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Switched to *%s*.", target))
-	return true
-}
-
-// containsAny returns true if s contains any of the given substrings.
-func containsAny(s string, substrs ...string) bool {
-	for _, sub := range substrs {
-		if strings.Contains(s, sub) {
-			return true
-		}
-	}
-	return false
 }
 
 func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
@@ -393,15 +412,24 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		return
 	}
 
-	// Intercept "stop" as plain text while a request is active.
+	// Telegram's @ picker is usernames only. Sending "@" lists specialists.
+	if strings.TrimSpace(msg.Text) == "@" {
+		b.sendAgentPicker(msg.Chat.ID)
+		return
+	}
+
+	// "stop" must never be rate-limited or queued — otherwise you cannot
+	// abort a DeepSeek wait when the shared limiter is at 0% headroom.
 	if strings.EqualFold(strings.TrimSpace(msg.Text), "stop") {
-		b.activeReqsMu.Lock()
-		_, active := b.activeReqs[msg.Chat.ID]
-		b.activeReqsMu.Unlock()
-		if active {
-			b.handleStop(msg)
-			return
+		b.handleStop(msg)
+		return
+	}
+
+	if teams := parseReviewTeamRequest(msg.Text); len(teams) > 0 && b.orchestrator != nil {
+		for _, team := range teams {
+			b.handleOrchestratorTeamWithTask(ctx, msg, team, msg.Text)
 		}
+		return
 	}
 
 	// Step 0: Intercept natural language requests about gateway features.
@@ -427,58 +455,109 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		}
 	}
 
-	// Check rate limits (estimate ~1000 input tokens for a typical request)
-	if !b.limiter.CanProceed(1000) {
+	// Local Qwen/Ollama do not consume Anthropic/DeepSeek quota. Counting
+	// their 150k-context usage against OTPM (16k/min) blocks DeepSeek
+	// for the rest of the window after a single local reply.
+	turn, prompt, switchOnly := b.routeAgentMessage(msg)
+	if switchOnly {
+		b.sendFocusMessage(msg.Chat.ID, turn)
+		return
+	}
+
+	if !isLocalQwen(b.frameworkFor(msg.Chat.ID, turn)) && !b.limiter.CanProceed(1000) {
 		status := b.limiter.GetStatus()
-		position := b.limiter.Enqueue(func() {
+		position := b.limiter.EnqueueChat(msg.Chat.ID, func() {
 			// Use Background: queued requests have independent lifecycles
 			// and should not be cancelled by the original handler's context.
-			b.processMessageWith(context.Background(), msg, msg.Text, "", peopleNames)
+			b.processMessageWith(context.Background(), msg, prompt, "", peopleNames, turn)
 		})
 		if position < 0 {
 			b.sendMessage(msg.Chat.ID,
-				fmt.Sprintf("Rate limited. Queue full, please try again later.\nWindow resets in %s.",
-					status.WindowResets))
+				fmt.Sprintf("Rate limited (DeepSeek/Grok/Claude tokens this minute; Qwen is unlimited).\nQueue full. Resets in %s.\nRPM %s · in %s · out %s",
+					status.WindowResets, status.RPM, status.ITPM, status.OTPM))
 		} else {
 			b.sendMessage(msg.Chat.ID,
-				fmt.Sprintf("Rate limited. Queued at position %d.\nWindow resets in %s.\nHeadroom: %.0f%%",
-					position, status.WindowResets, status.Headroom*100))
+				fmt.Sprintf("Rate limited (DeepSeek/Grok/Claude tokens this minute; Qwen is unlimited).\nQueued at position %d. Resets in %s.\nRPM %s · in %s · out %s",
+					position, status.WindowResets, status.RPM, status.ITPM, status.OTPM))
 		}
 		return
 	}
 
-	b.processMessageWith(ctx, msg, msg.Text, "", peopleNames)
+	b.processMessageWith(ctx, msg, prompt, "", peopleNames, turn)
+}
+
+func (b *Bot) routeAgentMessage(msg *tgbotapi.Message) (turn agentSlot, prompt string, switchOnly bool) {
+	prompt = msg.Text
+	call := parseAgentCall(msg.Text)
+	if call.Mentioned {
+		self := ""
+		if b.api != nil {
+			self = b.api.Self.UserName
+		}
+		if self != "" && strings.EqualFold(call.Handle, self) {
+			turn = b.getFocus(msg.Chat.ID)
+			return turn, prompt, false
+		}
+		turn = b.resolveSlot(call.Handle)
+		b.setFocus(msg.Chat.ID, turn)
+		if call.Rest == "" {
+			return turn, "", true
+		}
+		return turn, call.Rest, false
+	}
+	return b.getFocus(msg.Chat.ID), prompt, false
 }
 
 // processMessageWith sends a message to Claude with streaming progress.
 // When systemPrompt is non-empty, it overrides the default system prompt builder.
 // peopleNames are used for enriched context (people profile injection).
-func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, prompt, systemPrompt string, peopleNames []string) {
+func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, prompt, systemPrompt string, peopleNames []string, turn agentSlot) {
+	if turn.Key == "" {
+		turn = agentSlot{Key: defaultAgentKey, Display: defaultAgentDisplay}
+	}
+	tag := "@" + turn.Display
+
+	// A new prompt on a busy slot used to cancel the in-flight run.
+	// Check-ins peek at progress; anything else is refused so the task keeps going.
+	if snap, ok := b.slotSnapshot(msg.Chat.ID, turn.Key); ok {
+		b.sendMessage(msg.Chat.ID, formatRunReport(turn, snap, looksLikeProgressPeek(prompt)))
+		return
+	}
+
 	// Send "Working..." indicator — we'll edit this message in-place with progress
-	thinking := tgbotapi.NewMessage(msg.Chat.ID, "Working...")
+	thinking := tgbotapi.NewMessage(msg.Chat.ID, tag+" — Working...")
 	thinkingMsg, err := b.api.Send(thinking)
 	if err != nil {
 		log.Printf("Failed to send thinking message: %v", err)
 	}
 
-	// Create a session ID from the chat ID
-	sessionID := fmt.Sprintf("tg-%d", msg.Chat.ID)
+	sessionID := sessionIDFor(msg.Chat.ID, turn.Key)
+	if turn.Key != defaultAgentKey && systemPrompt == "" {
+		systemPrompt = namedAgentSystemPrompt(turn)
+		if n := len(turn.Skills); n > 0 {
+			names := make([]string, 0, n)
+			for _, s := range turn.Skills {
+				names = append(names, s.Name)
+			}
+			systemPrompt += "\nPrivate skills (Read the files in your folder if needed): " + strings.Join(names, ", ")
+		}
+	}
 
 	// Build request options
+	backend, fw := b.backendFor(msg.Chat.ID, turn)
 	opts := agent.AskOptions{
 		SessionID: sessionID,
 		Prompt:    prompt,
-		WorkDir:   b.cfg.WorkDir,
-		Model:     b.cfg.Sidecar.DefaultModel,
+		WorkDir:   turn.workDir(b.cfg.WorkDir),
+		Model:     b.modelForFramework(fw),
+		MaxTurns:  40,
 	}
 
-	// Local Qwen via vLLM has a 16k window. Gateway bootstrap + profile +
-	// history + skill index plus Claude Code's own tool schemas already
-	// overflow it. Keep a one-paragraph instruction and skip enrichment.
-	localQwen := false
-	if sw, ok := b.agent.(*agent.Switcher); ok && sw.Active() == "qwen" {
-		localQwen = true
-	}
+	// Local Qwen via vLLM: skip the huge Claude bootstrap/profile system
+	// prompt (that used to blow a 65k window). Harness skills still go
+	// through. At 150k, recent conversation history IS injected so Qwen
+	// has the same "what were we just doing" memory as DeepSeek/Grok.
+	localQwen := isLocalQwen(fw)
 
 	// System prompt injection:
 	// - If an explicit override is provided (skill commands), always use it.
@@ -486,12 +565,28 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	//   If dead/new, build system prompt from PostgreSQL (or legacy memory manager).
 	needsSystemPrompt := true // tracks whether session is new (used for enriched prompt)
 	if localQwen && systemPrompt == "" {
-		opts.SystemPrompt = "You are a coding assistant running locally (Qwen3.8-27B via vLLM). The context window is 16384 tokens. Be concise. Prefer small diffs. Do not dump whole files. Do not emit long chain-of-thought — answer directly."
+		if b.skillsManager != nil {
+			opts.SystemPrompt = b.skillsManager.BuildLibraryPrompt(prompt, 8000)
+		}
 	} else if systemPrompt != "" {
 		opts.SystemPrompt = systemPrompt
-		// Explicit system prompt = fresh session context
+		if turn.Key == defaultAgentKey {
+			// Skill command / explicit override = fresh session context
+		} else if !localQwen {
+			checkCtx, checkCancel := context.WithTimeout(ctx, 2*time.Second)
+			status, checkErr := backend.CheckSession(checkCtx, sessionID)
+			checkCancel()
+			if checkErr == nil && status.Alive && status.IdleSeconds < 1800 {
+				needsSystemPrompt = false
+			}
+		}
+	} else if localQwen {
+		// Qwen sessions live in the sidecar; skip SDK check-session (it used
+		// the immortal handler ctx and could stall the Working bubble).
 	} else {
-		status, checkErr := b.agent.CheckSession(ctx, sessionID)
+		checkCtx, checkCancel := context.WithTimeout(ctx, 2*time.Second)
+		status, checkErr := backend.CheckSession(checkCtx, sessionID)
+		checkCancel()
 		if checkErr == nil && status.Alive && status.IdleSeconds < 1800 {
 			needsSystemPrompt = false
 		}
@@ -503,7 +598,7 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 			// and Claude loses all prior context.
 			if checkErr == nil && status.Alive {
 				resetCtx, resetCancel := context.WithTimeout(ctx, 5*time.Second)
-				if err := b.agent.ResetSession(resetCtx, sessionID); err != nil {
+				if err := backend.ResetSession(resetCtx, sessionID); err != nil {
 					log.Printf("Failed to reset stale session %s: %v", sessionID, err)
 				} else {
 					log.Printf("Reset stale session %s (idle %ds)", sessionID, status.IdleSeconds)
@@ -514,7 +609,7 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 			// Use a dedicated timeout so a hanging DB doesn't block indefinitely.
 			if b.contextBuilder != nil {
 				buildCtx, buildCancel := context.WithTimeout(ctx, 10*time.Second)
-				sp, err := b.contextBuilder.BuildSystemPrompt(buildCtx)
+				sp, err := b.contextBuilder.BuildSystemPrompt(buildCtx, sessionID)
 				buildCancel()
 				if err != nil {
 					log.Printf("System prompt build failed: %v", err)
@@ -546,9 +641,28 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	// Bootstrap is only injected on new sessions — alive sessions already have it
 	// in the system prompt and the SDK manages context retention.
 	sessionAlive := !needsSystemPrompt
-	if b.contextBuilder != nil && systemPrompt == "" && !localQwen {
+	if b.contextBuilder != nil && systemPrompt == "" {
 		enrichCtx, enrichCancel := context.WithTimeout(ctx, 10*time.Second)
-		enriched, enrichErr := b.contextBuilder.BuildEnrichedPrompt(enrichCtx, sessionID, prompt, peopleNames, sessionAlive)
+		var (
+			enriched  string
+			enrichErr error
+		)
+		if localQwen {
+			b.skipQwenHistoryMu.Lock()
+			skipHist := b.skipQwenHistory[sessionID]
+			if skipHist {
+				delete(b.skipQwenHistory, sessionID)
+			}
+			b.skipQwenHistoryMu.Unlock()
+			if skipHist {
+				log.Printf("Qwen: skipping DB history dump after /reset")
+				enriched, enrichErr = "", nil
+			} else {
+				enriched, enrichErr = b.contextBuilder.BuildEnrichedPromptWith(enrichCtx, sessionID, prompt, peopleNames, sessionAlive, ctxbuilder.QwenWideEnrichment())
+			}
+		} else {
+			enriched, enrichErr = b.contextBuilder.BuildEnrichedPrompt(enrichCtx, sessionID, prompt, peopleNames, sessionAlive)
+		}
 		enrichCancel()
 		if enrichErr != nil {
 			log.Printf("Enriched prompt build failed: %v", enrichErr)
@@ -556,8 +670,14 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 			// Append matched skills to enriched prompt — only skills relevant
 			// to this message get their full content injected.
 			if b.skillsManager != nil {
-				if skillSection := b.skillsManager.BuildMatchedSkillsSection(prompt); skillSection != "" {
-					enriched += "\n\n" + skillSection
+				cap := 48000
+				if localQwen {
+					cap = 0 // already in system prompt
+				}
+				if cap > 0 {
+					if skillSection := b.skillsManager.BuildLibraryPrompt(prompt, cap); skillSection != "" {
+						enriched += "\n\n" + skillSection
+					}
 				}
 			}
 			opts.Prompt = enriched + "\n\n---\n\n" + prompt
@@ -568,23 +688,35 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	// and long multi-file tasks while still capping stuck requests so
 	// they release their semaphore slot eventually.
 	reqCtx, reqCancel := context.WithTimeout(ctx, 120*time.Minute)
-	defer reqCancel()
 
-	// Register cancel so /stop can interrupt this request.
-	b.activeReqsMu.Lock()
-	b.activeReqs[msg.Chat.ID] = reqCancel
-	b.activeReqsMu.Unlock()
-	defer func() {
-		b.activeReqsMu.Lock()
-		delete(b.activeReqs, msg.Chat.ID)
-		b.activeReqsMu.Unlock()
-	}()
+	// Register cancel so /stop can interrupt THIS agent. Other agents keep running.
+	// Do not replace an in-flight run — that used to kill the task on a check-in.
+	run, started, unbind := b.tryBeginRun(reqKey(msg.Chat.ID, turn.Key), reqCancel)
+	if !started {
+		reqCancel()
+		if thinkingMsg.MessageID != 0 {
+			del := tgbotapi.NewDeleteMessage(msg.Chat.ID, thinkingMsg.MessageID)
+			if _, err := b.api.Send(del); err != nil {
+				log.Printf("Failed to delete progress message: %v", err)
+			}
+		}
+		snap, ok := run.copySnap()
+		if !ok {
+			snap, _ = b.slotSnapshot(msg.Chat.ID, turn.Key)
+		}
+		b.sendMessage(msg.Chat.ID, formatRunReport(turn, snap, looksLikeProgressPeek(prompt)))
+		return
+	}
+	defer unbind()
+	run.Framework = fw
+	run.setSnap(runSnapshot{Display: turn.Display, Started: time.Now()})
 
 	// Rolling progress state — mutex-protected for concurrent access
 	// between the onProgress callback and the flush goroutine.
 	var mu sync.Mutex
 	var progressLines []string          // tool activity log
 	var responsePreview strings.Builder // accumulates Claude's response text
+	var gpuStatus string
 	var editPending bool
 	startTime := time.Now()
 	lastEdit := time.Time{}
@@ -594,32 +726,42 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	// user sees Claude "typing". Otherwise shows tool activity.
 	editProgress := func() {
 		mu.Lock()
-		lines := progressLines
-		nActions := len(progressLines)
-		if len(lines) > 15 {
-			lines = lines[len(lines)-15:]
-		}
+		allLines := append([]string(nil), progressLines...)
+		nActions := len(allLines)
 		preview := responsePreview.String()
+		gpu := gpuStatus
 		editPending = false
 		lastEdit = time.Now()
 		mu.Unlock()
+		lines := allLines
+		if len(lines) > 15 {
+			lines = lines[len(lines)-15:]
+		}
 
 		elapsed := time.Since(startTime).Truncate(time.Second)
+		bg := ""
+		if !b.isFocused(msg.Chat.ID, turn.Key) {
+			bg = " (background)"
+		}
+		gpuBit := ""
+		if gpu != "" {
+			gpuBit = " | " + gpu
+		}
 
 		var text string
 		if preview != "" {
 			// Response text is flowing — show it as a live preview.
 			// Truncate from the front to show the most recent text, keeping
 			// within Telegram's message limit.
-			const maxPreview = maxTelegramMessage - 100
+			const maxPreview = maxTelegramMessage - 120
 			if len(preview) > maxPreview {
 				preview = "..." + preview[len(preview)-maxPreview:]
 			}
-			text = fmt.Sprintf("Responding... %s | %d actions\n\n%s", elapsed, nActions, preview)
+			text = fmt.Sprintf("%s — Responding%s... %s | %d actions%s\n\n%s", tag, bg, elapsed, nActions, gpuBit, preview)
 		} else if nActions > 0 {
-			text = fmt.Sprintf("Working... %s (%d actions)\n\n%s", elapsed, nActions, strings.Join(lines, "\n"))
+			text = fmt.Sprintf("%s — Working%s... %s (%d actions)%s\n\n%s", tag, bg, elapsed, nActions, gpuBit, strings.Join(lines, "\n"))
 		} else {
-			text = fmt.Sprintf("Working... %s", elapsed)
+			text = fmt.Sprintf("%s — Working%s... %s%s", tag, bg, elapsed, gpuBit)
 		}
 
 		if thinkingMsg.MessageID != 0 {
@@ -628,6 +770,14 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 				log.Printf("Failed to edit progress message: %v", err)
 			}
 		}
+		run.setSnap(runSnapshot{
+			Display: turn.Display,
+			Started: startTime,
+			Actions: nActions,
+			Lines:   allLines,
+			Preview: preview,
+			GPU:     gpu,
+		})
 	}
 
 	// Flush goroutine: ticks every 3 seconds to flush pending edits.
@@ -669,11 +819,15 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	onProgress := func(ev agent.StreamEvent) {
 		mu.Lock()
 		if ev.Tool != "" {
+			gpuStatus = applyGPUProgress(gpuStatus, ev.Tool, ev.Input)
 			icon := toolIcon(ev.Tool)
-			progressLines = append(progressLines, fmt.Sprintf("%s %s: %s", icon, ev.Tool, ev.Input))
+			line := fmt.Sprintf("%s %s: %s", icon, ev.Tool, ev.Input)
+			n := len(progressLines)
+			if n == 0 || progressLines[n-1] != line {
+				progressLines = append(progressLines, line)
+			}
 		} else if ev.Text != "" && !isNoiseProgress(ev.Text) {
-			responsePreview.WriteString(ev.Text)
-			responsePreview.WriteByte('\n')
+			appendStreamText(&responsePreview, ev.Text)
 		} else {
 			mu.Unlock()
 			return
@@ -693,7 +847,7 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	}
 
 	// Call Claude via sidecar with streaming
-	resp, err := b.agent.AskStreaming(reqCtx, opts, onProgress)
+	resp, err := backend.AskStreaming(reqCtx, opts, onProgress)
 
 	// Stop flush goroutine
 	close(flushDone)
@@ -707,7 +861,8 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	}
 
 	if err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Error: %v", err))
+		notify := !b.isFocused(msg.Chat.ID, turn.Key)
+		b.sendLongMessage(msg.Chat.ID, formatAgentReply(turn.Display, fmt.Sprintf("Error: %v", err), notify))
 		return
 	}
 
@@ -720,7 +875,9 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 
 	// Record usage
 	if resp.Usage != nil {
-		b.limiter.Record(resp.Usage)
+		if !isLocalQwen(fw) {
+			b.limiter.Record(resp.Usage)
+		}
 		b.recordSessionUsage(msg.Chat.ID, resp.Usage)
 
 		// Record to DB with a dedicated timeout so queued requests
@@ -738,13 +895,15 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		}
 	}
 
-	// Send response, splitting if needed
-	text := resp.Text
+	// Final Telegram message is the answer only. Qwen thinking is streamed
+	// into the live "Working..." bubble (then that bubble is deleted above).
+	text := strings.TrimSpace(resp.Text)
 	if text == "" {
 		text = "Done (no text output)."
 	}
 
-	b.sendLongMessage(msg.Chat.ID, text)
+	notify := !b.isFocused(msg.Chat.ID, turn.Key)
+	b.sendLongMessage(msg.Chat.ID, formatAgentReply(turn.Display, text, notify))
 
 	// Auto-compaction notice: if the sidecar compacted this turn,
 	// surface a Claude-Code-style notification to the user and persist
@@ -790,11 +949,25 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 }
 
 // toolIcon returns an emoji icon for a Claude tool name.
+// appendStreamText concatenates model stream tokens. Grok emits one
+// subword per event; a newline per event made Telegram show one word
+// per line. Do not insert breaks here — the sidecar prefixes 💭 once
+// per thinking burst and puts a newline when leaving thinking.
+func appendStreamText(dst *strings.Builder, chunk string) {
+	if chunk == "" || dst == nil {
+		return
+	}
+	dst.WriteString(chunk)
+}
+
 // isNoiseProgress hides SDK internals that leak through the stream
 // (DeepSeek thinking ticks, Claude Code model warnings, session chatter).
 func isNoiseProgress(s string) bool {
 	t := strings.TrimSpace(s)
 	if t == "" || t == "Session initialized" {
+		return true
+	}
+	if strings.Contains(t, "💭") {
 		return true
 	}
 	if strings.Contains(t, "thinking_tokens") || strings.Contains(t, "unrecognized_model") {
@@ -837,9 +1010,11 @@ func (b *Bot) handleStatus(ctx context.Context, msg *tgbotapi.Message) {
 		sidecarStatus = fmt.Sprintf("Error: %v", err)
 	}
 
+	focus := b.getFocus(msg.Chat.ID)
 	lines := []string{
 		"*Gateway Status*",
 		"",
+		fmt.Sprintf("Chatting with: @%s", focus.Display),
 		fmt.Sprintf("Sidecar: %s", sidecarStatus),
 		"",
 		"*Rate Limits:*",
@@ -862,8 +1037,15 @@ func (b *Bot) handleStatus(ctx context.Context, msg *tgbotapi.Message) {
 }
 
 func (b *Bot) handleReset(ctx context.Context, msg *tgbotapi.Message) {
-	sessionID := fmt.Sprintf("tg-%d", msg.Chat.ID)
-	if err := b.agent.ResetSession(ctx, sessionID); err != nil {
+	turn := b.getFocus(msg.Chat.ID)
+	sessionID := sessionIDFor(msg.Chat.ID, turn.Key)
+	var err error
+	if sw, ok := b.agent.(*agent.Switcher); ok {
+		err = sw.ResetSessionEverywhere(ctx, sessionID)
+	} else {
+		err = b.agent.ResetSession(ctx, sessionID)
+	}
+	if err != nil {
 		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Reset failed: %v", err))
 		return
 	}
@@ -872,7 +1054,14 @@ func (b *Bot) handleReset(ctx context.Context, msg *tgbotapi.Message) {
 	delete(b.sessions, msg.Chat.ID)
 	b.sessionsMu.Unlock()
 
-	b.sendMessage(msg.Chat.ID, "Session cleared. Fresh start.")
+	b.skipQwenHistoryMu.Lock()
+	if b.skipQwenHistory == nil {
+		b.skipQwenHistory = make(map[string]bool)
+	}
+	b.skipQwenHistory[sessionID] = true
+	b.skipQwenHistoryMu.Unlock()
+
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("@%s session cleared. Fresh start.", turn.Display))
 }
 
 // handleCompact runs a manual session compaction: the active model
@@ -880,10 +1069,12 @@ func (b *Bot) handleReset(ctx context.Context, msg *tgbotapi.Message) {
 // session, and the user is notified. Unlike /reset, prior context is
 // preserved (as a summary) rather than discarded.
 func (b *Bot) handleCompact(ctx context.Context, msg *tgbotapi.Message) {
-	sessionID := fmt.Sprintf("tg-%d", msg.Chat.ID)
-	b.sendMessage(msg.Chat.ID, "🗜 Summarising conversation and preparing fresh session…")
+	turn := b.getFocus(msg.Chat.ID)
+	sessionID := sessionIDFor(msg.Chat.ID, turn.Key)
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("🗜 @%s — summarising conversation and preparing fresh session…", turn.Display))
 
-	c, err := b.agent.CompactSession(ctx, sessionID)
+	be, _ := b.backendFor(msg.Chat.ID, turn)
+	c, err := be.CompactSession(ctx, sessionID)
 	if err != nil {
 		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Compact failed: %v", err))
 		return
@@ -906,23 +1097,247 @@ func (b *Bot) handleCompact(ctx context.Context, msg *tgbotapi.Message) {
 }
 
 func (b *Bot) handleStop(msg *tgbotapi.Message) {
-	b.activeReqsMu.Lock()
-	cancel, ok := b.activeReqs[msg.Chat.ID]
-	b.activeReqsMu.Unlock()
+	dropped := 0
+	if b.limiter != nil {
+		dropped = b.limiter.DropQueuedFor(msg.Chat.ID)
+	}
 
-	if !ok {
+	args := strings.TrimSpace(msg.CommandArguments())
+	if args == "" && strings.EqualFold(strings.TrimSpace(msg.Text), "stop") {
+		args = ""
+	}
+
+	stopOne := func(slot string) bool {
+		stopped := b.cancelSlot(msg.Chat.ID, slot)
+		b.agent.AbortSession(sessionIDFor(msg.Chat.ID, slot))
+		return stopped
+	}
+
+	var stopped bool
+	label := ""
+	switch {
+	case strings.EqualFold(args, "all"):
+		slots := b.runningSlots(msg.Chat.ID)
+		n := b.cancelAllSlots(msg.Chat.ID)
+		seen := map[string]bool{}
+		for _, s := range slots {
+			seen[s] = true
+			b.agent.AbortSession(sessionIDFor(msg.Chat.ID, s))
+		}
+		for _, s := range []string{defaultAgentKey, orchestratorSlot, b.getFocus(msg.Chat.ID).Key} {
+			if !seen[s] {
+				b.agent.AbortSession(sessionIDFor(msg.Chat.ID, s))
+			}
+		}
+		stopped = n > 0
+		label = "all agents"
+	case strings.HasPrefix(args, "@") || args != "":
+		handle := strings.TrimPrefix(args, "@")
+		if p := parseAgentCall("@" + handle); p.Mentioned {
+			handle = p.Handle
+		}
+		if strings.EqualFold(handle, orchestratorSlot) {
+			stopped = stopOne(orchestratorSlot)
+			label = "@orchestrator"
+		} else {
+			slot := b.resolveSlot(handle)
+			stopped = stopOne(slot.Key)
+			label = "@" + slot.Display
+		}
+	default:
+		focus := b.getFocus(msg.Chat.ID)
+		stopped = stopOne(focus.Key)
+		label = "@" + focus.Display
+	}
+
+	if !stopped && dropped == 0 {
 		b.sendMessage(msg.Chat.ID, "Nothing running to stop.")
 		return
 	}
 
-	// Cancel the context — AskStreaming will return ctx.Err()
-	cancel()
+	text := "Stopped " + label + "."
+	if dropped > 0 {
+		text = fmt.Sprintf("Stopped %s. Dropped %d queued message(s).", label, dropped)
+	}
+	b.sendMessage(msg.Chat.ID, text)
+}
 
-	// Also tell the sidecar to abort the SDK session
-	sessionID := fmt.Sprintf("tg-%d", msg.Chat.ID)
-	b.agent.AbortSession(sessionID)
+func (b *Bot) handleWho(msg *tgbotapi.Message) {
+	focus := b.getFocus(msg.Chat.ID)
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Chatting with @%s\n", focus.Display)
+	if focus.DNAName != "" {
+		fmt.Fprintf(&sb, "Bound file: %s\n", focus.DNAName)
+	}
+	running := b.runningSlots(msg.Chat.ID)
+	if len(running) > 0 {
+		sb.WriteString("\nWorking now:\n")
+		for _, s := range running {
+			slot := agentSlot{Key: s, Display: s}
+			if s == defaultAgentKey {
+				slot.Display = defaultAgentDisplay
+			} else if s == orchestratorSlot {
+				slot.Display = orchestratorSlot
+			} else {
+				slot = b.resolveSlot(s)
+				if slot.Display == "" {
+					slot.Display = s
+				}
+			}
+			mark := ""
+			if s == focus.Key {
+				mark = " (this chat)"
+			}
+			if snap, ok := b.slotSnapshot(msg.Chat.ID, s); ok {
+				elapsed := time.Since(snap.Started).Truncate(time.Second)
+				gpu := ""
+				if snap.GPU != "" {
+					gpu = " — " + snap.GPU
+				}
+				last := ""
+				if n := len(snap.Lines); n > 0 {
+					last = " — " + snap.Lines[n-1]
+				}
+				fmt.Fprintf(&sb, "- @%s%s — %s, %d actions%s%s\n", slot.Display, mark, elapsed, snap.Actions, gpu, last)
+			} else {
+				fmt.Fprintf(&sb, "- @%s%s\n", slot.Display, mark)
+			}
+		}
+		sb.WriteString("\nPeek without cancelling: /progress or @Name with no extra text.\n")
+		sb.WriteString("A new task message will not cancel a running agent — use /stop first.\n")
+	} else {
+		sb.WriteString("\nNo agent is working in the background.\n")
+	}
+	sb.WriteString("\nType / to scroll commands. Type @ and send it, or /agents, for the agent list.")
+	b.sendMessage(msg.Chat.ID, sb.String())
+}
 
-	b.sendMessage(msg.Chat.ID, "Stopped.")
+func (b *Bot) sendFocusMessage(chatID int64, turn agentSlot) {
+	text := b.switchMessage(chatID, turn)
+	if snap, ok := b.slotSnapshot(chatID, turn.Key); ok {
+		text += "\n\n" + formatRunReport(turn, snap, true)
+	} else {
+		text += "\n\n" + formatIdleStatus(turn.Display)
+	}
+	b.sendMessage(chatID, text)
+}
+
+func (b *Bot) handleProgress(msg *tgbotapi.Message) {
+	args := strings.TrimSpace(msg.CommandArguments())
+	sendOne := func(slot agentSlot) {
+		snap, ok := b.slotSnapshot(msg.Chat.ID, slot.Key)
+		if !ok {
+			b.sendMessage(msg.Chat.ID, formatIdleStatus(slot.Display))
+			return
+		}
+		b.sendMessage(msg.Chat.ID, formatRunReport(slot, snap, true))
+	}
+	switch {
+	case args == "":
+		sendOne(b.getFocus(msg.Chat.ID))
+	case strings.EqualFold(args, "all"):
+		focus := b.getFocus(msg.Chat.ID)
+		slots := b.runningSlots(msg.Chat.ID)
+		if len(slots) == 0 {
+			b.sendMessage(msg.Chat.ID, "Nothing is working right now.\n"+formatIdleStatus(focus.Display)+"\n\nOnly in-flight agents appear on /progress all. Idle specialists are omitted.")
+			return
+		}
+		type row struct {
+			slot agentSlot
+			snap runSnapshot
+		}
+		var rows []row
+		for _, s := range slots {
+			slot := agentSlot{Key: s, Display: s}
+			if s == defaultAgentKey {
+				slot.Display = defaultAgentDisplay
+			} else if s == orchestratorSlot {
+				slot.Display = orchestratorSlot
+			} else {
+				slot = b.resolveSlot(s)
+			}
+			snap, _ := b.slotSnapshot(msg.Chat.ID, slot.Key)
+			if snap.Display == "" {
+				snap.Display = slot.Display
+			}
+			rows = append(rows, row{slot: slot, snap: snap})
+		}
+		sort.SliceStable(rows, func(i, j int) bool {
+			return gpuQueueRank(rows[i].snap.GPU) < gpuQueueRank(rows[j].snap.GPU)
+		})
+		var q strings.Builder
+		q.WriteString("GPU queue (one Qwen generation at a time):\n")
+		for _, r := range rows {
+			name := r.snap.Display
+			if name == "" {
+				name = r.slot.Display
+			}
+			if r.snap.GPU != "" {
+				fmt.Fprintf(&q, "- @%s — %s\n", name, r.snap.GPU)
+			} else {
+				fmt.Fprintf(&q, "- @%s — tools/other (not waiting on GPU)\n", name)
+			}
+		}
+		focusWorking := false
+		for _, r := range rows {
+			if r.slot.Key == focus.Key {
+				focusWorking = true
+				break
+			}
+		}
+		q.WriteString(progressAllNote(focus.Display, focusWorking))
+		b.sendMessage(msg.Chat.ID, q.String())
+		for _, r := range rows {
+			sendOne(r.slot)
+		}
+	default:
+		handle := strings.TrimPrefix(args, "@")
+		if p := parseAgentCall("@" + handle); p.Mentioned {
+			handle = p.Handle
+		}
+		if strings.EqualFold(handle, orchestratorSlot) {
+			sendOne(agentSlot{Key: orchestratorSlot, Display: orchestratorSlot})
+			return
+		}
+		sendOne(b.resolveSlot(handle))
+	}
+}
+
+func (b *Bot) handleDefaultChat(msg *tgbotapi.Message) {
+	turn := agentSlot{Key: defaultAgentKey, Display: defaultAgentDisplay}
+	b.setFocus(msg.Chat.ID, turn)
+	b.sendFocusMessage(msg.Chat.ID, turn)
+}
+
+func (b *Bot) handleAgentCatalog(msg *tgbotapi.Message) {
+	focus := b.getFocus(msg.Chat.ID)
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Chatting with @%s", focus.Display))
+	b.sendAgentPicker(msg.Chat.ID)
+}
+
+func (b *Bot) tryAgentSlashCommand(ctx context.Context, msg *tgbotapi.Message) bool {
+	if b.skillsManager == nil {
+		return false
+	}
+	ag, ok := b.skillsManager.FindChatAgent(msg.Command())
+	if !ok {
+		return false
+	}
+	turn := b.resolveSlot(ag.Handle)
+	b.setFocus(msg.Chat.ID, turn)
+	rest := strings.TrimSpace(msg.CommandArguments())
+	if rest == "" {
+		b.sendFocusMessage(msg.Chat.ID, turn)
+		return true
+	}
+	var peopleNames []string
+	if b.peopleManager != nil {
+		if names, err := b.peopleManager.MatchNames(ctx, rest); err == nil {
+			peopleNames = names
+		}
+	}
+	b.processMessageWith(ctx, msg, rest, "", peopleNames, turn)
+	return true
 }
 
 func (b *Bot) handleCost(msg *tgbotapi.Message) {
@@ -1078,20 +1493,82 @@ func (b *Bot) handleContext(ctx context.Context, msg *tgbotapi.Message) {
 	b.sendLongMessage(msg.Chat.ID, b.memoryManager.StatusText(ctx))
 }
 
+func parseReviewTeamRequest(text string) []string {
+	t := strings.ToLower(strings.TrimSpace(text))
+	if t == "" || len(t) > 280 {
+		return nil
+	}
+	if strings.HasPrefix(t, "i ran") || strings.HasPrefix(t, "i have run") || strings.Contains(t, "couldn't") || strings.Contains(t, "could not") {
+		return nil
+	}
+	launch := strings.HasPrefix(t, "run ") || strings.Contains(t, "run the") ||
+		strings.Contains(t, "please run") || strings.Contains(t, "launch the") ||
+		strings.HasPrefix(t, "review ")
+	if !launch {
+		return nil
+	}
+	var teams []string
+	add := func(name string) {
+		for _, x := range teams {
+			if x == name {
+				return
+			}
+		}
+		teams = append(teams, name)
+	}
+	if strings.Contains(t, "go-dev") || strings.Contains(t, "go dev") {
+		add("go-dev-team")
+	}
+	if strings.Contains(t, "go-sec") || strings.Contains(t, "go sec") || strings.Contains(t, "go-security") {
+		add("go-sec-team")
+	}
+	if strings.Contains(t, "fe-dev") || strings.Contains(t, "fe dev") {
+		add("fe-dev-team")
+	}
+	if strings.Contains(t, "fe-sec") || strings.Contains(t, "fe sec") {
+		add("fe-sec-team")
+	}
+	return teams
+}
+
 func (b *Bot) handleOrchestratorTeam(ctx context.Context, msg *tgbotapi.Message, teamName string) {
+	task := strings.TrimSpace(msg.CommandArguments())
+	if task == "" {
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Usage: /reviewgo or /reviewgosec <task description>\nOr: run the %s on <what to review>", teamName))
+		return
+	}
+	b.handleOrchestratorTeamWithTask(ctx, msg, teamName, task)
+}
+
+// bindStoppable registers a cancel func so /stop can abort this work.
+// Orchestrator commands previously used the process-lifetime context, so
+// isolated vLLM requests kept the GPU busy until docker compose down.
+func (b *Bot) bindStoppable(ctx context.Context, chatID int64, slot string) (context.Context, func()) {
+	reqCtx, cancel := context.WithCancel(ctx)
+	unbind := b.replaceCancel(reqKey(chatID, slot), cancel)
+	return reqCtx, unbind
+}
+
+func (b *Bot) handleOrchestratorTeamWithTask(ctx context.Context, msg *tgbotapi.Message, teamName, task string) {
 	if b.orchestrator == nil {
 		b.sendMessage(msg.Chat.ID, "Orchestrator not initialized.")
 		return
 	}
-	task := strings.TrimSpace(msg.CommandArguments())
+	task = strings.TrimSpace(task)
 	if task == "" {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Usage: /review_%s <task description>", strings.ReplaceAll(teamName, "-", "_")))
-		return
+		task = "Review the current uncommitted work."
 	}
 
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Running %s...", teamName))
+	fw := ""
+	if sw, ok := b.agent.(*agent.Switcher); ok {
+		fw = sw.Active()
+	}
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Running %s via %s...", teamName, fw))
 
-	result, err := b.orchestrator.RunTeamStreaming(ctx, teamName, task,
+	reqCtx, unbind := b.bindStoppable(ctx, msg.Chat.ID, orchestratorSlot)
+	defer unbind()
+
+	result, err := b.orchestrator.RunTeamStreaming(reqCtx, teamName, task,
 		func(progress string) {
 			b.sendMessage(msg.Chat.ID, progress)
 		})
@@ -1117,7 +1594,10 @@ func (b *Bot) handleGauntlet(ctx context.Context, msg *tgbotapi.Message) {
 
 	b.sendMessage(msg.Chat.ID, "Running full gauntlet pipeline...")
 
-	results, err := b.orchestrator.RunGauntlet(ctx, task, "",
+	reqCtx, unbind := b.bindStoppable(ctx, msg.Chat.ID, orchestratorSlot)
+	defer unbind()
+
+	results, err := b.orchestrator.RunGauntlet(reqCtx, task, "",
 		func(progress string) {
 			b.sendMessage(msg.Chat.ID, progress)
 		})
@@ -1177,7 +1657,10 @@ func (b *Bot) handleAutoReview(ctx context.Context, msg *tgbotapi.Message, secur
 
 	task := fmt.Sprintf("Review the code in %s", projectDir)
 
-	result, err := b.orchestrator.RunTeamStreaming(ctx, teamName, task,
+	reqCtx, unbind := b.bindStoppable(ctx, msg.Chat.ID, orchestratorSlot)
+	defer unbind()
+
+	result, err := b.orchestrator.RunTeamStreaming(reqCtx, teamName, task,
 		func(progress string) {
 			b.sendMessage(msg.Chat.ID, progress)
 		})
@@ -1310,16 +1793,28 @@ func (b *Bot) handleSkillCommand(ctx context.Context, msg *tgbotapi.Message, ski
 		return
 	}
 
-	// Reset session so the skill gets a fresh, focused context.
-	sessionID := fmt.Sprintf("tg-%d", msg.Chat.ID)
-	_ = b.agent.ResetSession(ctx, sessionID)
-	b.sessionsMu.Lock()
-	delete(b.sessions, msg.Chat.ID)
-	b.sessionsMu.Unlock()
+	turn := agentSlot{Key: defaultAgentKey, Display: defaultAgentDisplay}
+	if skill.Owner != "" {
+		turn = b.resolveSlot(skill.Owner)
+		b.setFocus(msg.Chat.ID, turn)
+	}
 
-	// Build system prompt: memory context (bootstrap, CLAUDE.md, curated, daily)
-	// plus ONLY this skill — not all active skills.
+	sessionID := sessionIDFor(msg.Chat.ID, turn.Key)
+	be, _ := b.backendFor(msg.Chat.ID, turn)
+	_ = be.ResetSession(ctx, sessionID)
+	if turn.Key == defaultAgentKey {
+		b.sessionsMu.Lock()
+		delete(b.sessions, msg.Chat.ID)
+		b.sessionsMu.Unlock()
+	}
+
 	var parts []string
+	if turn.Key != defaultAgentKey {
+		parts = append(parts, namedAgentSystemPrompt(turn))
+		if len(turn.Skills) > 0 {
+			parts = append(parts, skills.FormatSkillsXML(turn.Skills))
+		}
+	}
 	if b.memoryManager != nil {
 		if section := b.memoryManager.BuildSystemPromptSection(ctx); section != "" {
 			parts = append(parts, section)
@@ -1336,7 +1831,7 @@ func (b *Bot) handleSkillCommand(ctx context.Context, msg *tgbotapi.Message, ski
 		return
 	}
 
-	b.processMessageWith(ctx, msg, args, systemPrompt, nil)
+	b.processMessageWith(ctx, msg, args, systemPrompt, nil, turn)
 }
 
 // --- v2 command handlers ---
@@ -1710,27 +2205,43 @@ func (b *Bot) handleDBCheck(ctx context.Context, msg *tgbotapi.Message) {
 		b.sendMessage(msg.Chat.ID, "PostgreSQL not connected.")
 		return
 	}
-	// Query last 10 conversations
+
+	var buf strings.Builder
+	agents, agErr := b.pgDB.ListAgents(ctx, true)
+	if agErr != nil {
+		fmt.Fprintf(&buf, "Agents query failed: %v\n\n", agErr)
+	} else {
+		fmt.Fprintf(&buf, "PostgreSQL agents (%d active):\n", len(agents))
+		for _, a := range agents {
+			fmt.Fprintf(&buf, "  #%d @%s (%s)\n", a.ID, a.Handle, a.Source)
+		}
+		buf.WriteByte('\n')
+	}
+
 	convs, err := b.pgDB.RecentConversationsAllSessions(ctx, 10)
 	if err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Query failed: %v", err))
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("%sQuery failed: %v", buf.String(), err))
 		return
 	}
 
 	if len(convs) == 0 {
-		b.sendMessage(msg.Chat.ID, "No conversations in PostgreSQL. RecordExchange may not be saving.")
+		buf.WriteString("No conversations in PostgreSQL. RecordExchange may not be saving.")
+		b.sendMessage(msg.Chat.ID, buf.String())
 		return
 	}
 
-	var buf strings.Builder
-	fmt.Fprintf(&buf, "Last %d messages in PostgreSQL:\n\n", len(convs))
+	fmt.Fprintf(&buf, "Last %d messages:\n\n", len(convs))
 	for _, c := range convs {
 		content := c.Content
 		if len(content) > 80 {
 			content = content[:80] + "..."
 		}
-		fmt.Fprintf(&buf, "[%s] %s | %s: %s\n",
-			c.CreatedAt.Format("15:04:05"), c.SessionID, c.Role, content)
+		agent := c.AgentHandle
+		if agent == "" {
+			agent = "?"
+		}
+		fmt.Fprintf(&buf, "[%s] @%s | %s | %s: %s\n",
+			c.CreatedAt.Format("15:04:05"), agent, c.SessionID, c.Role, content)
 	}
 	b.sendMessage(msg.Chat.ID, buf.String())
 }
@@ -1836,6 +2347,24 @@ func (b *Bot) handleCronDisable(msg *tgbotapi.Message) {
 	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Cron job %q disabled.", name))
 }
 
+// handleCronRun runs a configured job immediately (does not wait for the schedule).
+func (b *Bot) handleCronRun(msg *tgbotapi.Message) {
+	if b.cronScheduler == nil {
+		b.sendMessage(msg.Chat.ID, "Cron scheduler not available.")
+		return
+	}
+	name := strings.TrimSpace(msg.CommandArguments())
+	if name == "" {
+		b.sendMessage(msg.Chat.ID, "Usage: /cronrun name\n\nTry /cronlist for job names.")
+		return
+	}
+	if err := b.cronScheduler.RunJob(name); err != nil {
+		b.sendMessage(msg.Chat.ID, err.Error())
+		return
+	}
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Running *%s* now (Qwen, not /framework). Result arrives when it finishes.", name))
+}
+
 // handleFramework shows the current AI framework or switches to a new one.
 //
 //	/framework          — show current + available
@@ -1844,20 +2373,25 @@ func (b *Bot) handleCronDisable(msg *tgbotapi.Message) {
 // self-reported model identity. This is immune to conversation history
 // pollution and always reflects what the API actually returned.
 func (b *Bot) handleModel(msg *tgbotapi.Message) {
-	configured := b.cfg.Sidecar.DefaultModel
-	framework := "claude"
-	if sw, ok := b.agent.(*agent.Switcher); ok {
-		framework = sw.Active()
-		configured = b.modelForFramework(framework)
-	}
+	turn := b.getFocus(msg.Chat.ID)
+	framework := b.frameworkFor(msg.Chat.ID, turn)
+	configured := b.modelForFramework(framework)
 
 	b.lastAPIModelMu.RLock()
 	apiModel := b.lastAPIModel[msg.Chat.ID]
 	b.lastAPIModelMu.RUnlock()
 
 	var text strings.Builder
-	fmt.Fprintf(&text, "Framework: `%s`\n", framework)
+	fmt.Fprintf(&text, "Agent: `@%s`\n", turn.Display)
+	fmt.Fprintf(&text, "Framework: `%s` (%s)\n", framework, frameworkLabel(framework))
 	fmt.Fprintf(&text, "Configured: `%s`\n", configured)
+	if ov := b.slotFrameworkOverride(msg.Chat.ID, turn.Key); ov != "" {
+		text.WriteString("Source: this-chat override (`/models inherit` to drop)\n")
+	} else if turn.Framework != "" {
+		text.WriteString("Source: agent YAML pin\n")
+	} else {
+		text.WriteString("Source: gateway default (Qwen)\n")
+	}
 	if apiModel != "" {
 		fmt.Fprintf(&text, "Last API model: `%s`", apiModel)
 	} else {
@@ -1867,17 +2401,57 @@ func (b *Bot) handleModel(msg *tgbotapi.Message) {
 	b.sendMarkdownMessage(msg.Chat.ID, text.String())
 }
 
-// selectableModels is the curated list shown by /models. Each entry is a
-// first-class sidecar provider (Anthropic-compatible), not an OpenCode model.
-// Backend is the switcher name; Model is what that provider actually runs.
-var selectableModels = []struct {
-	Label   string // button text
-	Backend string // switcher / provider name
-	Model   string // vendor model id
-}{
-	{"DeepSeek V4 Pro", "deepseek", "deepseek-v4-pro"},
-	{"Grok 4.5", "grok", "grok-4.5"},
-	{"Qwen3.8 (local)", "qwen", "qwen3.8-27b"},
+// selectableModel is one /models button. Key is unique (callback + slot
+// override). Backend is the switcher provider (deepseek/grok/qwen). Two
+// DeepSeek rows share Backend and differ by Model.
+type selectableModel struct {
+	Label   string
+	Key     string
+	Backend string
+	Model   string
+}
+
+var selectableModels = []selectableModel{
+	{"DeepSeek V4.1 Flash", "deepseek-flash", "deepseek", "deepseek-flash"},
+	{"DeepSeek V4 Pro", "deepseek", "deepseek", "deepseek-v4-pro"},
+	{"Grok 4.5", "grok", "grok", "grok-4.5"},
+	{"Qwen3.8 (local)", "qwen", "qwen", "qwen3.8-27b"},
+}
+
+func lookupSelectable(name string) (selectableModel, bool) {
+	n := strings.ToLower(strings.TrimSpace(name))
+	switch n {
+	case "flash", "v4.1-flash", "v4.1", "deepseek-v4.1-flash", "deepseek-v4-flash", "deepseekflash":
+		n = "deepseek-flash"
+	}
+	var byBackend *selectableModel
+	for i := range selectableModels {
+		m := &selectableModels[i]
+		if n == m.Key || n == m.Model || strings.EqualFold(n, m.Label) {
+			return *m, true
+		}
+		if n == m.Backend && byBackend == nil {
+			byBackend = m
+		}
+	}
+	if byBackend != nil {
+		return *byBackend, true
+	}
+	return selectableModel{}, false
+}
+
+// providerOf maps a slot override / YAML pin (e.g. deepseek-flash) to the
+// switcher backend name (deepseek).
+func providerOf(name string) string {
+	if m, ok := lookupSelectable(name); ok {
+		return m.Backend
+	}
+	switch name {
+	case "ollama", "vllm":
+		return "qwen"
+	default:
+		return name
+	}
 }
 
 // modelForFramework returns the configured/default model string for a backend.
@@ -1886,7 +2460,16 @@ func (b *Bot) modelForFramework(framework string) string {
 }
 
 func configuredModelName(framework, claudeDefault, opencodeDefault, ollamaChat, vllmModel string) string {
+	if m, ok := lookupSelectable(framework); ok {
+		if m.Key == "qwen" || m.Backend == "qwen" {
+			// fall through for vLLM/Ollama env overrides
+		} else {
+			return m.Model
+		}
+	}
 	switch framework {
+	case "deepseek-flash":
+		return "deepseek-flash"
 	case "deepseek":
 		return "deepseek-v4-pro"
 	case "grok":
@@ -1920,7 +2503,8 @@ func (b *Bot) handleModels(msg *tgbotapi.Message) {
 		return
 	}
 
-	current := sw.Active()
+	turn := b.getFocus(msg.Chat.ID)
+	current := b.frameworkFor(msg.Chat.ID, turn)
 
 	var rows [][]tgbotapi.InlineKeyboardButton
 	var row []tgbotapi.InlineKeyboardButton
@@ -1931,10 +2515,10 @@ func (b *Bot) handleModels(msg *tgbotapi.Message) {
 		}
 		shown++
 		label := m.Label
-		if m.Backend == current {
+		if m.Key == current {
 			label = "✅ " + label
 		}
-		btn := tgbotapi.NewInlineKeyboardButtonData(label, "model:"+m.Backend)
+		btn := tgbotapi.NewInlineKeyboardButtonData(label, "model:"+m.Key)
 		row = append(row, btn)
 		if len(row) == 2 {
 			rows = append(rows, row)
@@ -1949,7 +2533,7 @@ func (b *Bot) handleModels(msg *tgbotapi.Message) {
 		return
 	}
 
-	reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Current: `%s` — `%s`\nPick a model:", current, b.modelForFramework(current)))
+	reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("For @%s: `%s` — `%s`\nPick a model (this agent only). Gateway default stays Qwen.\n/models inherit to drop the override.", turn.Display, current, b.modelForFramework(current)))
 	reply.ParseMode = tgbotapi.ModeMarkdown
 	reply.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	if _, err := b.api.Send(reply); err != nil {
@@ -1966,18 +2550,20 @@ func (b *Bot) switchSelectableModel(chatID int64, name string) {
 	}
 
 	name = strings.ToLower(strings.TrimSpace(name))
+	turn := b.getFocus(chatID)
+	if name == "inherit" || name == "reset" {
+		b.setSlotFramework(chatID, turn.Key, "")
+		fw := b.frameworkFor(chatID, turn)
+		b.sendMarkdownMessage(chatID, fmt.Sprintf("@%s now inherits *%s* (`%s`).", turn.Display, frameworkLabel(fw), b.modelForFramework(fw)))
+		return
+	}
 	if name == "ollama" || name == "vllm" || strings.HasPrefix(name, "qwen3.8") {
 		name = "qwen"
 	}
-	// Accept a label, backend name, or vendor model id.
-	backend := name
-	label := name
-	for _, m := range selectableModels {
-		if name == m.Backend || name == m.Model || strings.EqualFold(name, m.Label) {
-			backend = m.Backend
-			label = m.Label
-			break
-		}
+	sel, okSel := lookupSelectable(name)
+	backend, key, label := name, name, name
+	if okSel {
+		backend, key, label = sel.Backend, sel.Key, sel.Label
 	}
 
 	if !sw.Has(backend) {
@@ -1986,16 +2572,14 @@ func (b *Bot) switchSelectableModel(chatID int64, name string) {
 		return
 	}
 
-	old := sw.Active()
-	if old == backend {
-		b.sendMarkdownMessage(chatID, fmt.Sprintf("Already using *%s* (`%s`).", label, b.modelForFramework(backend)))
+	old := b.frameworkFor(chatID, turn)
+	if old == key {
+		b.setSlotFramework(chatID, turn.Key, key)
+		b.sendMarkdownMessage(chatID, fmt.Sprintf("@%s already using *%s* (`%s`).", turn.Display, label, b.modelForFramework(key)))
 		return
 	}
-	if err := sw.Switch(backend); err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed: %v", err))
-		return
-	}
-	b.sendMarkdownMessage(chatID, fmt.Sprintf("Switched: `%s` → *%s* (`%s`)", old, label, b.modelForFramework(backend)))
+	b.setSlotFramework(chatID, turn.Key, key)
+	b.sendMarkdownMessage(chatID, fmt.Sprintf("@%s: `%s` → *%s* (`%s`)\nThis agent only. Gateway default stays Qwen. /models inherit to undo.", turn.Display, old, label, b.modelForFramework(key)))
 }
 
 // /framework claude   — switch to Claude Code
@@ -2009,22 +2593,21 @@ func (b *Bot) handleFramework(_ context.Context, msg *tgbotapi.Message) {
 
 	arg := strings.TrimSpace(msg.CommandArguments())
 
+	turn := b.getFocus(msg.Chat.ID)
 	if arg == "" {
-		// Show current status with model info
-		active := switcher.Active()
+		active := b.frameworkFor(msg.Chat.ID, turn)
 		available := switcher.Available()
-
-		// Map framework names to their configured models
 		models := map[string]string{
-			"claude":   b.cfg.Sidecar.DefaultModel,
-			"opencode": b.cfg.OpenCode.Model,
-			"deepseek": "deepseek-v4-pro",
-			"grok":     "grok-4.5",
-			"qwen":     b.modelForFramework("qwen"),
+			"claude":         b.cfg.Sidecar.DefaultModel,
+			"opencode":       b.cfg.OpenCode.Model,
+			"deepseek":       "deepseek-v4-pro",
+			"deepseek-flash": "deepseek-flash",
+			"grok":           "grok-4.5",
+			"qwen":           b.modelForFramework("qwen"),
 		}
-
 		var lines []string
-		lines = append(lines, fmt.Sprintf("*Active framework:* %s", active))
+		lines = append(lines, fmt.Sprintf("*@%s framework:* %s (`%s`)", turn.Display, active, b.modelForFramework(active)))
+		lines = append(lines, fmt.Sprintf("Gateway default: `%s` (unchanged by this command)", switcher.Active()))
 		lines = append(lines, "")
 		for _, name := range available {
 			icon := "  "
@@ -2038,23 +2621,32 @@ func (b *Bot) handleFramework(_ context.Context, msg *tgbotapi.Message) {
 			lines = append(lines, fmt.Sprintf("%s`%s` — %s", icon, name, model))
 		}
 		lines = append(lines, "")
-		lines = append(lines, "Switch: /framework <name>")
-
+		lines = append(lines, "Switch this agent: /framework <name>")
+		lines = append(lines, "Drop override: /framework inherit")
 		b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 		return
 	}
 
-	// Switch
 	arg = strings.ToLower(arg)
+	if arg == "inherit" || arg == "reset" {
+		b.setSlotFramework(msg.Chat.ID, turn.Key, "")
+		fw := b.frameworkFor(msg.Chat.ID, turn)
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("@%s inherits *%s*.", turn.Display, fw))
+		return
+	}
 	if arg == "ollama" || arg == "vllm" || strings.HasPrefix(arg, "qwen3.8") {
 		arg = "qwen"
 	}
-	if err := switcher.Switch(arg); err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Failed: %v", err))
+	if sel, ok := lookupSelectable(arg); ok {
+		arg = sel.Key
+	}
+	if !switcher.Has(providerOf(arg)) {
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Unknown backend: %s (available: %v)", arg, switcher.Available()))
 		return
 	}
-
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Switched to *%s*.", arg))
+	old := b.frameworkFor(msg.Chat.ID, turn)
+	b.setSlotFramework(msg.Chat.ID, turn.Key, arg)
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("@%s: `%s` → *%s* (`%s`, this agent only). Gateway default stays Qwen.", turn.Display, old, arg, b.modelForFramework(arg)))
 }
 
 // sendCommandMenu sends a grid of tappable inline buttons for quick access to commands.

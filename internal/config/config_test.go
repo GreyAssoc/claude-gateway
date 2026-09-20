@@ -40,6 +40,7 @@ func TestLoad_DefaultValues(t *testing.T) {
 	// Set minimum required env vars
 	t.Setenv("TELEGRAM_BOT_TOKEN", "test-token")
 	t.Setenv("ALLOWED_USER_IDS", "123")
+	t.Setenv("CRON_FRAMEWORK", "")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -70,6 +71,41 @@ func TestLoad_DefaultValues(t *testing.T) {
 	}
 	if cfg.Sidecar.DefaultModel != "sonnet" {
 		t.Errorf("Sidecar.DefaultModel = %q, want sonnet", cfg.Sidecar.DefaultModel)
+	}
+	if len(cfg.Skills.Dirs) < 2 || cfg.Skills.Dirs[0] != "harness/skills" {
+		t.Errorf("Skills.Dirs = %#v, want harness/skills first", cfg.Skills.Dirs)
+	}
+	if cfg.CronFramework != "qwen" {
+		t.Errorf("CronFramework = %q, want qwen", cfg.CronFramework)
+	}
+}
+
+func TestLoad_CronFrameworkEnv(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "test-token")
+	t.Setenv("ALLOWED_USER_IDS", "123")
+	t.Setenv("CRON_FRAMEWORK", "grok")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.CronFramework != "grok" {
+		t.Errorf("CronFramework = %q, want grok from env", cfg.CronFramework)
+	}
+}
+
+func TestNormalizeSkillsDirs(t *testing.T) {
+	got := normalizeSkillsDirs(nil)
+	if len(got) != 2 || got[0] != "harness/skills" || got[1] != "skills" {
+		t.Errorf("empty = %#v", got)
+	}
+	got = normalizeSkillsDirs([]string{"skills"})
+	if len(got) != 2 || got[0] != "harness/skills" {
+		t.Errorf("prepend = %#v", got)
+	}
+	got = normalizeSkillsDirs([]string{"harness/skills", "skills"})
+	if len(got) != 2 {
+		t.Errorf("already present duplicated: %#v", got)
 	}
 }
 
