@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -112,6 +113,18 @@ func TestFrameworkForSlotOverride(t *testing.T) {
 	bare := agentSlot{Key: "default", Display: "default"}
 	if got := b.frameworkFor(1, bare); got != "qwen" {
 		t.Fatalf("gateway default = %q", got)
+	}
+}
+
+func TestIsUserCancel(t *testing.T) {
+	if !isUserCancel(context.Canceled) {
+		t.Fatal("context.Canceled should be a user stop")
+	}
+	if isUserCancel(context.DeadlineExceeded) {
+		t.Fatal("deadline is not a user stop")
+	}
+	if isUserCancel(nil) {
+		t.Fatal("nil is not a user stop")
 	}
 }
 

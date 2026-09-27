@@ -32,8 +32,10 @@ dashboard:
   enabled: true
   port: 8080
 
-# All cron jobs (YAML and /cronadd) run on CRON_FRAMEWORK (default qwen),
-# not the Telegram /framework switch.
+# Default backend is CRON_FRAMEWORK (qwen). Per job you can set:
+#   agent: grey-website          # folder under .claude/agents/
+#   framework: deepseek-flash    # qwen | deepseek | deepseek-flash | grok | claude
+#   model: deepseek-flash        # optional raw vendor id
 cron:
   morning_briefing:
     schedule: "0 7 * * 1-5"
@@ -61,6 +63,48 @@ cron:
   memory_compaction:
     schedule: "0 0 * * *"
     prompt: "__INTERNAL_MEMORY_COMPACT__"
+    enabled: true
+
+  home_solar_battery:
+    schedule: "0 20 * * *"
+    agent: home-solar
+    prompt: >
+      Run the evening charge-settings procedure now: (a) fetch tomorrow's PV
+      forecast, (b) pick the charge tier and APPLY it to the inverter with
+      set-inverter-soc.js, (c) generate tomorrow's solar output chart with
+      make-solar-chart.js, (d) email Steve the chart PNG as an attachment, and
+      (e) message Steve a concise text briefing — forecast summary, the charge
+      tier, and whether the inverter save confirmed (OK / UNCERTAIN).
+    enabled: true
+
+  paddle_river_cardio:
+    schedule: "0 19 * * *"
+    agent: paddleboarding
+    prompt: >
+      Run the next-day paddleboard cardio-paddle report for the River Frome /
+      Wareham. The target day is automatically tomorrow because this fires in
+      the evening. Run:
+        cd /workspace/.claude/agents/paddleboarding && node daily-report.js river
+      and paste the full report output to Steve verbatim. Then add a one-line
+      verdict: "go / caution / skip" with the best window and the tide
+      state. If the fetch fails (exit 3), tell Steve the report is unavailable
+      tonight and what failed.
+    enabled: true
+
+  paddle_surf:
+    schedule: "30 19 * * *"
+    agent: paddleboarding
+    prompt: >
+      Run the next-day surf report for the Poole Bay / Bournemouth coast.
+      The target day is automatically tomorrow because this fires in the
+      evening. Run:
+        cd /workspace/.claude/agents/paddleboarding && node daily-report.js surf
+      and paste the full report output to Steve verbatim (top-3 of Lulworth,
+      Swanage, Kimmeridge, Bournemouth with their best hour, wave height +
+      period, wind chop, and weather). Then add a one-line verdict:
+      "best spot tonight is X — worth a paddle / flat and boring". If the
+      fetch fails (exit 3), tell Steve the surf report is unavailable tonight
+      and what failed.
     enabled: true
 
 watchers:

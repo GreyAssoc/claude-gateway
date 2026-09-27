@@ -58,6 +58,7 @@ func NormalizeHandle(s string) string {
 //	tg-42-ag-greywebsite     → greywebsite
 //	qwen:tg-42-ag-greywebsite → greywebsite
 //	cron-standup             → cron
+//	cron-seo-ag-greywebsite  → greywebsite
 //	watcher-gmail            → watcher
 func AgentKeyFromSession(sessionID string) string {
 	s := strings.TrimSpace(sessionID)
@@ -70,6 +71,12 @@ func AgentKeyFromSession(sessionID string) string {
 			s = rest
 		}
 	}
+	if i := strings.LastIndex(s, "-ag-"); i >= 0 {
+		key := NormalizeHandle(s[i+len("-ag-"):])
+		if key != "" {
+			return key
+		}
+	}
 	switch {
 	case s == AgentHandleCron || strings.HasPrefix(s, "cron-"):
 		return AgentHandleCron
@@ -77,12 +84,6 @@ func AgentKeyFromSession(sessionID string) string {
 		return AgentHandleWatcher
 	case s == AgentHandleOrchestrator || strings.HasPrefix(s, "orch-"):
 		return AgentHandleOrchestrator
-	}
-	if i := strings.LastIndex(s, "-ag-"); i >= 0 {
-		key := NormalizeHandle(s[i+len("-ag-"):])
-		if key != "" {
-			return key
-		}
 	}
 	return AgentHandleDefault
 }

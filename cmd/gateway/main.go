@@ -274,7 +274,7 @@ func main() {
 	// Created after bot because it needs tgBot.SendNotification for alerts.
 	// CronStatus is wired back via SetCronStatus to resolve the circular dependency.
 	cronBackend := agentClient.Durable(cfg.CronFramework)
-	log.Printf("Cron/watchers pinned to %s (Telegram /framework is %s)", cronBackend.Name(), agentClient.Active())
+	log.Printf("Cron/watchers default backend %s (Telegram /framework is %s)", cronBackend.Name(), agentClient.Active())
 	cronScheduler := cron.New(cronBackend, limiter, tgBot.SendNotification, cfg.WorkDir)
 	cronScheduler.SetRecorder(func(ctx context.Context, sessionID, user, assistant string) {
 		saveCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -283,6 +283,7 @@ func main() {
 			log.Printf("cron save exchange %s: %v", sessionID, err)
 		}
 	})
+	cronScheduler.SetPrepare(prepareCronJob(cfg, skillsMgr, agentClient, cronBackend))
 	if cfg.Cron != nil {
 		if err := cronScheduler.LoadJobs(cfg.Cron); err != nil {
 			log.Fatalf("Failed to load cron jobs: %v", err)
@@ -478,6 +479,80 @@ func runHeartbeat(ctx context.Context, client agent.Backend, tgBot *bot.Bot, cfg
 			}
 		}
 	}
+}
+
+func prepareCronJob(cfg *config.Config, skillsMgr *skills.Manager, switcher *agent.Switcher, durable agent.Backend) cron.PrepareFunc {
+	return func(name string, job config.CronJob) cron.ExecSpec {
+		spec := cron.ExecSpec{
+			Backend:   durable,
+			WorkDir:   cfg.WorkDir,
+			SessionID: "cron-" + name,
+		}
+		fw := strings.TrimSpace(job.Framework)
+		if fw == "" {
+			fw = strings.TrimSpace(job.Model)
+		}
+		if fw == "" {
+			fw = cfg.CronFramework
+		}
+		if fw == "" {
+			fw = "qwen"
+		}
+		_, backend, model, label, ok := bot.ResolveSelectable(fw)
+		if !ok {
+			backend = fw
+			model = strings.TrimSpace(job.Model)
+			label = fw
+		} else if m := strings.TrimSpace(job.Model); m != "" && strings.TrimSpace(job.Framework) != "" {
+			model = m
+		}
+		if switcher != nil {
+			if be := switcher.Get(backend); be != nil {
+				spec.Backend = be
+			} else {
+				log.Printf("cron %s: backend %q not registered; using %s", name, backend, durable.Name())
+			}
+		}
+		spec.Model = model
+		spec.ModelLabel = label
+		handle := strings.TrimSpace(strings.TrimPrefix(job.Agent, "@"))
+		if handle == "" || skillsMgr == nil {
+			return spec
+		}
+		if ag, found := skillsMgr.FindChatAgent(handle); found {
+			spec.AgentDisplay = ag.Handle
+			if p := strings.TrimRight(strings.TrimSpace(ag.ProjectPath), "/"); p != "" {
+				spec.WorkDir = p
+			} else if strings.TrimSpace(ag.Dir) != "" {
+				spec.WorkDir = ag.Dir
+			}
+			spec.SystemPrompt = cronAgentSystemPrompt(ag)
+			spec.SessionID = fmt.Sprintf("cron-%s-ag-%s", name, pgdb.NormalizeHandle(ag.Handle))
+			return spec
+		}
+		log.Printf("cron %s: agent %q not found; running without DNA", name, handle)
+		spec.AgentDisplay = handle
+		spec.SessionID = fmt.Sprintf("cron-%s-ag-%s", name, pgdb.NormalizeHandle(handle))
+		return spec
+	}
+}
+
+func cronAgentSystemPrompt(ag skills.ChatAgent) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "You are @%s running a scheduled cron job. Same working style as @default: tools on the files, then a short Telegram briefing.\n", ag.Handle)
+	if p := strings.TrimRight(strings.TrimSpace(ag.ProjectPath), "/"); p != "" {
+		fmt.Fprintf(&b, "WORKING DIRECTORY: %s\nAlready there. Do not cd. Do not search /workspace.\n", p)
+	}
+	dna := strings.TrimSpace(ag.DNA)
+	if len(dna) > 900 {
+		dna = dna[:900] + "\n…"
+	}
+	if dna != "" {
+		fmt.Fprintf(&b, "\nAgent instructions:\n%s\n", dna)
+	}
+	b.WriteString("\nKeep the reply concise and well-formatted for Telegram. Use bullet points.\n")
+	b.WriteString("Google Workspace: prefer named tools, otherwise Bash gog. Never delete or trash mail.\n")
+	return b.String()
 }
 
 func chatAgentSpecs(agents []skills.ChatAgent) []pgdb.AgentSpec {

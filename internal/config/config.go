@@ -93,9 +93,12 @@ type RateLimiter struct {
 }
 
 type CronJob struct {
-	Schedule string `yaml:"schedule"`
-	Prompt   string `yaml:"prompt"`
-	Enabled  bool   `yaml:"enabled"`
+	Schedule  string `yaml:"schedule"`
+	Prompt    string `yaml:"prompt"`
+	Enabled   bool   `yaml:"enabled"`
+	Agent     string `yaml:"agent"`     // @grey-website — DNA, cwd, session tag
+	Framework string `yaml:"framework"` // qwen | deepseek | deepseek-flash | grok | claude
+	Model     string `yaml:"model"`     // optional vendor id; overrides framework default
 }
 
 type WatchersConfig struct {

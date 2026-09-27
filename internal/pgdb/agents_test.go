@@ -31,6 +31,8 @@ func TestAgentKeyFromSession(t *testing.T) {
 		{"cron-standup", "cron"},
 		{"cron-morning_briefing", "cron"},
 		{"qwen:cron-standup", "cron"},
+		{"cron-seo-ag-greywebsite", "greywebsite"},
+		{"qwen:cron-seo-ag-greywebsite", "greywebsite"},
 		{"watcher-gmail", "watcher"},
 		{"watcher-calendar", "watcher"},
 		{"orch-gopurist", "orchestrator"},

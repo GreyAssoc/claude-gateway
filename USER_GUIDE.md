@@ -814,7 +814,15 @@ The file is auto-detected by the file watcher. No restart required.
 
 ## 10. Scheduled Jobs (Cron)
 
-Cron jobs fire a prompt on a schedule and send the result to your Telegram **notification** chat. They always run on **Qwen** (`CRON_FRAMEWORK`, default `qwen`). Telegram `/framework` / `/models` never apply to cron.
+Cron jobs fire a prompt on a schedule and send the result to your Telegram **notification** chat.
+
+Jobs with **no** `agent` / `framework` still use **Qwen** (`CRON_FRAMEWORK`). Telegram `/models` does **not** change that default. Each job can pin a specialist and a model:
+
+```
+/cronadd seo_links "0 8 * * 1" @grey-website deepseek-flash Audit internal linking. Report gaps.
+```
+
+That run uses `@grey-website` DNA and cwd, and DeepSeek V4.1 Flash (`deepseek-flash`). It does not use the Telegram chat's current model.
 
 Times use the container timezone (`TZ=Europe/London` in compose).
 
@@ -844,17 +852,19 @@ Output looks like:
 ### Add a job from Telegram
 
 ```
-/cronadd <name> "<minute hour day month weekday>" <prompt>
+/cronadd <name> "<minute hour day month weekday>" [@agent] [model] <prompt>
 ```
 
-The **schedule must be in double quotes**. Name: letters/digits/underscores, no spaces, unique.
+The **schedule must be in double quotes**. Name: letters/digits/underscores, no spaces, unique. `@agent` and `model` are optional; omit both to stay on Qwen.
 
 | Example | Meaning |
 |---------|---------|
-| `/cronadd standup "30 9 * * 1-5" Check my calendar and summarise today's meetings` | 09:30 weekdays |
-| `/cronadd inbox_pulse "0 12,16 * * 1-5" Check unread Gmail from the last 4 hours. Bullet anything that needs a reply.` | Noon and 16:00 weekdays |
-| `/cronadd friday_wrap "0 16 * * 5" Summarise this week's Drive changes and open calendar items for next week.` | Friday 16:00 |
-| `/cronadd my_check "*/30 9-17 * * 1-5" Check for new support tickets and summarise` | Every 30 minutes, 09:00–17:00 weekdays |
+| `/cronadd standup "30 9 * * 1-5" Check my calendar and summarise today's meetings` | 09:30 weekdays, Qwen, no specialist |
+| `/cronadd seo_links "0 8 * * 1" @grey-website deepseek-flash Audit internal linking. List gaps.` | Monday 08:00, `@grey-website`, DeepSeek V4.1 Flash |
+| `/cronadd seo_pro "0 8 * * 3" @grey-website deepseek Weekly SEO pass with V4 Pro` | Wednesday 08:00, same agent, DeepSeek V4 Pro |
+| `/cronadd fx_health "0 7 * * 1-5" @forex-trading qwen Summarise uncommitted work and test status.` | 07:00 weekdays, `@forex-trading`, local Qwen |
+| `/cronadd inbox_grey "0 12,16 * * 1-5" @grey-email grok Unread mail last 4 hours. Bullet replies needed.` | Noon and 16:00, `@grey-email`, Grok 4.5 |
+| `/cronadd inbox_pulse "0 12,16 * * 1-5" Check unread Gmail from the last 4 hours.` | Same times, default Qwen |
 
 The job is **enabled immediately**. It does **not** write to `gateway.yaml` — `/cronadd` jobs live in memory and **disappear on gateway restart**. For a job that must survive restarts, add it in YAML (below) then recreate the gateway.
 
@@ -895,7 +905,38 @@ cron:
       check my calendar for today's events, and give me a concise morning
       briefing. Keep it short — bullet the top 3 priorities.
     enabled: true
+
+  seo_links:
+    schedule: "0 8 * * 1"
+    agent: grey-website
+    framework: deepseek-flash
+    prompt: >
+      Audit internal linking on the Grey website. List missing
+      cross-links between service pages. Do not edit files unless
+      the prompt says to.
+    enabled: true
+
+  fx_health:
+    schedule: "0 7 * * 1-5"
+    agent: forex-trading
+    framework: qwen
+    prompt: >
+      Summarise git status and whether go test ./internal/exec/ is
+      in a good state. No commits.
+    enabled: true
+
+  grey_inbox:
+    schedule: "0 12,16 * * 1-5"
+    agent: grey-email
+    framework: grok
+    prompt: >
+      Unread Gmail from the last 4 hours. Bullet anything that needs a reply.
+    enabled: true
 ```
+
+`agent` is the folder handle (`grey-website`, not the `@`). `framework` is the same token as `/models`: `qwen`, `deepseek`, `deepseek-flash`, `grok`, `claude`. Optional `model:` overrides the vendor id if you need a raw string.
+
+`/cronlist` shows `@agent` and the model next to the schedule. `/cronadd` jobs still vanish on gateway restart — YAML is what survives.
 
 `{since}` in a prompt is replaced with the last successful run time:
 

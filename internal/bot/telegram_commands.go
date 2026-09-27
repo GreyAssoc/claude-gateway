@@ -62,7 +62,7 @@ func coreTelegramCommands() []tgbotapi.BotCommand {
 		{Command: "progress", Description: "Peek at a running agent without cancelling"},
 		{Command: "stop", Description: "Stop current agent (@Name or all)"},
 		{Command: "status", Description: "Gateway health and rate limits"},
-		{Command: "models", Description: "Model for this agent only (Qwen/DeepSeek/Grok)"},
+		{Command: "models", Description: "Model for this agent only (Qwen/DeepSeek/Flash/Grok)"},
 		{Command: "framework", Description: "Framework for this agent only"},
 		{Command: "compact", Description: "Summarise session and start fresh"},
 		{Command: "reset", Description: "Clear current agent session"},

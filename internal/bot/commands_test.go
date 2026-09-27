@@ -8,6 +8,24 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+func TestParseCronAddTail(t *testing.T) {
+	tests := []struct {
+		in, agent, fw, prompt string
+	}{
+		{"Check my calendar", "", "", "Check my calendar"},
+		{"@grey-website deepseek-flash Audit linking", "grey-website", "deepseek-flash", "Audit linking"},
+		{"@forex-trading qwen Summarise uncommitted work", "forex-trading", "qwen", "Summarise uncommitted work"},
+		{"flash Inbox pulse", "", "deepseek-flash", "Inbox pulse"},
+		{"@grey-email Check unread mail", "grey-email", "", "Check unread mail"},
+	}
+	for _, tt := range tests {
+		a, fw, p := parseCronAddTail(tt.in)
+		if a != tt.agent || fw != tt.fw || p != tt.prompt {
+			t.Errorf("parseCronAddTail(%q) = (%q,%q,%q) want (%q,%q,%q)", tt.in, a, fw, p, tt.agent, tt.fw, tt.prompt)
+		}
+	}
+}
+
 func TestSelectableModels_DeepSeekAndGrok(t *testing.T) {
 	want := map[string]string{
 		"deepseek-flash": "deepseek-flash",

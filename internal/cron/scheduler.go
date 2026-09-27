@@ -29,6 +29,7 @@ type Scheduler struct {
 	limiter *ratelimiter.Limiter
 	notify  NotifyFunc
 	record  RecordFunc
+	prepare PrepareFunc
 	workDir string
 
 	mu   sync.RWMutex
@@ -40,12 +41,29 @@ type Scheduler struct {
 }
 
 type jobInfo struct {
-	Name     string
-	Schedule string
-	Prompt   string
-	Enabled  bool
-	EntryID  cron.EntryID
+	Name      string
+	Schedule  string
+	Prompt    string
+	Agent     string
+	Framework string
+	Model     string
+	Enabled   bool
+	EntryID   cron.EntryID
 }
+
+// ExecSpec is how one fire of a job talks to the sidecar.
+type ExecSpec struct {
+	Backend      agent.Backend
+	WorkDir      string
+	Model        string
+	SystemPrompt string
+	SessionID    string
+	AgentDisplay string
+	ModelLabel   string
+}
+
+// PrepareFunc binds a job to a specialist, backend, and vendor model.
+type PrepareFunc func(name string, job config.CronJob) ExecSpec
 
 // New creates a cron scheduler that executes Claude prompts on a schedule.
 func New(agentClient agent.Backend, limiter *ratelimiter.Limiter, notify NotifyFunc, workDir string) *Scheduler {
@@ -65,15 +83,23 @@ func (s *Scheduler) SetRecorder(fn RecordFunc) {
 	s.record = fn
 }
 
+// SetPrepare routes each job to an @agent and model. Nil keeps CRON_FRAMEWORK.
+func (s *Scheduler) SetPrepare(fn PrepareFunc) {
+	s.prepare = fn
+}
+
 // LoadJobs registers cron jobs from config.
 func (s *Scheduler) LoadJobs(cronJobs map[string]config.CronJob) error {
 	for name, job := range cronJobs {
 		if !job.Enabled {
 			s.jobs[name] = &jobInfo{
-				Name:     name,
-				Schedule: job.Schedule,
-				Prompt:   job.Prompt,
-				Enabled:  false,
+				Name:      name,
+				Schedule:  job.Schedule,
+				Prompt:    job.Prompt,
+				Agent:     strings.TrimSpace(strings.TrimPrefix(job.Agent, "@")),
+				Framework: strings.TrimSpace(job.Framework),
+				Model:     strings.TrimSpace(job.Model),
+				Enabled:   false,
 			}
 			continue
 		}
@@ -90,7 +116,7 @@ func (s *Scheduler) addJob(name string, job config.CronJob) error {
 	jobName := name // capture for closure
 
 	entryID, err := s.cron.AddFunc(job.Schedule, func() {
-		s.executeJob(jobName, prompt)
+		s.executeJob(jobName)
 	})
 	if err != nil {
 		return err
@@ -98,11 +124,14 @@ func (s *Scheduler) addJob(name string, job config.CronJob) error {
 
 	s.mu.Lock()
 	s.jobs[name] = &jobInfo{
-		Name:     name,
-		Schedule: job.Schedule,
-		Prompt:   prompt,
-		Enabled:  true,
-		EntryID:  entryID,
+		Name:      name,
+		Schedule:  job.Schedule,
+		Prompt:    prompt,
+		Agent:     strings.TrimSpace(strings.TrimPrefix(job.Agent, "@")),
+		Framework: strings.TrimSpace(job.Framework),
+		Model:     strings.TrimSpace(job.Model),
+		Enabled:   true,
+		EntryID:   entryID,
 	}
 	s.mu.Unlock()
 
@@ -131,8 +160,7 @@ Never delete or trash mail. If gog says not authenticated, tell the user to run 
 Keep your response concise and well-formatted for Telegram. Use bullet points.
 If a tool is unavailable or returns an error, note it briefly and continue with what you can do.`
 
-func (s *Scheduler) executeJob(name, prompt string) {
-	// Skip if scheduler is stopping
+func (s *Scheduler) executeJob(name string) {
 	select {
 	case <-s.done:
 		log.Printf("Cron %s skipped: scheduler stopping", name)
@@ -140,16 +168,33 @@ func (s *Scheduler) executeJob(name, prompt string) {
 	default:
 	}
 
-	// Skip internal sentinel prompts — these are handled elsewhere.
+	s.mu.RLock()
+	stored, ok := s.jobs[name]
+	s.mu.RUnlock()
+	if !ok {
+		log.Printf("Cron %s skipped: unknown job", name)
+		return
+	}
+	prompt := stored.Prompt
+	cfgJob := config.CronJob{
+		Schedule:  stored.Schedule,
+		Prompt:    stored.Prompt,
+		Enabled:   true,
+		Agent:     stored.Agent,
+		Framework: stored.Framework,
+		Model:     stored.Model,
+	}
+
 	if strings.HasPrefix(prompt, internalPrefix) {
 		log.Printf("Cron %s skipped: internal sentinel %q", name, prompt)
 		return
 	}
 
-	log.Printf("Cron executing: %s", name)
+	spec := s.specFor(name, cfgJob)
+	log.Printf("Cron executing: %s agent=%s model=%s cwd=%s", name, spec.AgentDisplay, spec.Model, spec.WorkDir)
 
-	// Check rate limits before running
-	if !s.limiter.CanProceed(2000) {
+	paid := spec.Backend != nil && spec.Backend.Name() != "qwen" && spec.Backend.Name() != "vllm"
+	if paid && !s.limiter.CanProceed(2000) {
 		log.Printf("Cron %s skipped: rate limited", name)
 		if s.notify != nil {
 			s.notify(fmt.Sprintf("⏭️ Cron job *%s* skipped — rate limited.", name))
@@ -160,9 +205,6 @@ func (s *Scheduler) executeJob(name, prompt string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// Cancel job early if scheduler stops during execution.
-	// The goroutine always exits when this function returns because
-	// defer cancel() closes ctx.Done(), which the select watches.
 	go func() {
 		select {
 		case <-s.done:
@@ -171,14 +213,30 @@ func (s *Scheduler) executeJob(name, prompt string) {
 		}
 	}()
 
-	sessionID := fmt.Sprintf("cron-%s", name)
+	sessionID := spec.SessionID
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("cron-%s", name)
+	}
+	sys := spec.SystemPrompt
+	if sys == "" {
+		sys = cronSystemPrompt
+	}
+	be := spec.Backend
+	if be == nil {
+		be = s.agent
+	}
+	workDir := spec.WorkDir
+	if workDir == "" {
+		workDir = s.workDir
+	}
 
-	resp, err := s.agent.AskWithOptions(ctx, agent.AskOptions{
+	resp, err := be.AskWithOptions(ctx, agent.AskOptions{
 		SessionID:    sessionID,
 		Prompt:       prompt,
-		WorkDir:      s.workDir,
+		WorkDir:      workDir,
+		Model:        spec.Model,
 		MaxTurns:     20,
-		SystemPrompt: cronSystemPrompt,
+		SystemPrompt: sys,
 	})
 	if err != nil {
 		log.Printf("Cron %s failed: %v", name, err)
@@ -188,7 +246,7 @@ func (s *Scheduler) executeJob(name, prompt string) {
 		return
 	}
 
-	if resp.Usage != nil {
+	if resp.Usage != nil && paid {
 		s.limiter.Record(resp.Usage)
 	}
 
@@ -202,9 +260,9 @@ func (s *Scheduler) executeJob(name, prompt string) {
 		if s.notify != nil {
 			s.notify(fmt.Sprintf(
 				"❌ Cron job *%s* failed: Claude Code in the sidecar is not logged in.\n\n"+
-					"`/login` is a *Claude CLI* command, not Telegram. Cron jobs are pinned to Qwen "+
-					"(`CRON_FRAMEWORK`, not `/framework`). If this job hit Claude instead, check "+
-					"`CRON_FRAMEWORK=qwen` and that vLLM is running.",
+					"`/login` is a *Claude CLI* command, not Telegram. This job's framework is "+
+					"Qwen/Claude unless the job sets `framework:` / `/cronadd … qwen|deepseek-flash|…`. "+
+					"If it hit Claude by mistake, set `framework: qwen` on the job and check vLLM.",
 				name,
 			))
 		}
@@ -216,8 +274,50 @@ func (s *Scheduler) executeJob(name, prompt string) {
 	}
 
 	if s.notify != nil {
-		s.notify(fmt.Sprintf("🕐 *%s*\n\n%s", name, text))
+		title := fmt.Sprintf("🕐 *%s*", name)
+		if spec.AgentDisplay != "" || spec.ModelLabel != "" {
+			extra := spec.AgentDisplay
+			if extra != "" {
+				extra = "@" + extra
+			}
+			if spec.ModelLabel != "" {
+				if extra != "" {
+					extra += " · "
+				}
+				extra += spec.ModelLabel
+			}
+			title = fmt.Sprintf("🕐 *%s* (%s)", name, extra)
+		}
+		s.notify(fmt.Sprintf("%s\n\n%s", title, text))
 	}
+}
+
+func (s *Scheduler) specFor(name string, job config.CronJob) ExecSpec {
+	spec := ExecSpec{
+		Backend:      s.agent,
+		WorkDir:      s.workDir,
+		SystemPrompt: cronSystemPrompt,
+		SessionID:    fmt.Sprintf("cron-%s", name),
+	}
+	if s.prepare != nil {
+		got := s.prepare(name, job)
+		if got.Backend != nil {
+			spec.Backend = got.Backend
+		}
+		if got.WorkDir != "" {
+			spec.WorkDir = got.WorkDir
+		}
+		if got.SystemPrompt != "" {
+			spec.SystemPrompt = got.SystemPrompt
+		}
+		if got.SessionID != "" {
+			spec.SessionID = got.SessionID
+		}
+		spec.Model = got.Model
+		spec.AgentDisplay = got.AgentDisplay
+		spec.ModelLabel = got.ModelLabel
+	}
+	return spec
 }
 
 func looksLikeClaudeLogin(text string) bool {
@@ -247,7 +347,7 @@ func (s *Scheduler) Stop() {
 
 // AddDynamic registers a new cron job at runtime. Returns an error if the
 // name already exists or the schedule expression is invalid.
-func (s *Scheduler) AddDynamic(name, schedule, prompt string) error {
+func (s *Scheduler) AddDynamic(name string, job config.CronJob) error {
 	s.mu.Lock()
 	if _, exists := s.jobs[name]; exists {
 		s.mu.Unlock()
@@ -255,11 +355,8 @@ func (s *Scheduler) AddDynamic(name, schedule, prompt string) error {
 	}
 	s.mu.Unlock()
 
-	return s.addJob(name, config.CronJob{
-		Schedule: schedule,
-		Prompt:   prompt,
-		Enabled:  true,
-	})
+	job.Enabled = true
+	return s.addJob(name, job)
 }
 
 // RemoveJob removes a cron job by name.
@@ -310,11 +407,10 @@ func (s *Scheduler) EnableJob(name string) error {
 		return fmt.Errorf("job %q is already enabled", name)
 	}
 	schedule := job.Schedule
-	prompt := job.Prompt
 	s.mu.Unlock()
 
 	entryID, err := s.cron.AddFunc(schedule, func() {
-		s.executeJob(name, prompt)
+		s.executeJob(name)
 	})
 	if err != nil {
 		return fmt.Errorf("re-enabling job %q: %w", name, err)
@@ -341,7 +437,7 @@ func (s *Scheduler) RunJob(name string) error {
 		return fmt.Errorf("job %q is internal and cannot be run from Telegram", name)
 	}
 	log.Printf("Cron %s triggered manually", name)
-	go s.executeJob(job.Name, job.Prompt)
+	go s.executeJob(job.Name)
 	return nil
 }
 
@@ -353,10 +449,13 @@ func (s *Scheduler) ListJobs() []JobDetail {
 	details := make([]JobDetail, 0, len(s.jobs))
 	for _, job := range s.jobs {
 		details = append(details, JobDetail{
-			Name:     job.Name,
-			Schedule: job.Schedule,
-			Prompt:   job.Prompt,
-			Enabled:  job.Enabled,
+			Name:      job.Name,
+			Schedule:  job.Schedule,
+			Prompt:    job.Prompt,
+			Enabled:   job.Enabled,
+			Agent:     job.Agent,
+			Framework: job.Framework,
+			Model:     job.Model,
 		})
 	}
 	return details
@@ -364,10 +463,13 @@ func (s *Scheduler) ListJobs() []JobDetail {
 
 // JobDetail is an exported view of a cron job.
 type JobDetail struct {
-	Name     string
-	Schedule string
-	Prompt   string
-	Enabled  bool
+	Name      string
+	Schedule  string
+	Prompt    string
+	Enabled   bool
+	Agent     string
+	Framework string
+	Model     string
 }
 
 // Status returns a formatted string of all jobs with next-run times.
@@ -405,7 +507,18 @@ func (s *Scheduler) Status() string {
 		}
 		prompt = strings.ReplaceAll(prompt, "\n", " ")
 
-		lines = append(lines, fmt.Sprintf("%s *%s* — `%s`%s\n   %s", icon, job.Name, job.Schedule, nextStr, prompt))
+		who := ""
+		if job.Agent != "" {
+			who = " @" + job.Agent
+		}
+		model := job.Framework
+		if job.Model != "" {
+			model = job.Model
+		}
+		if model != "" {
+			who += " `" + model + "`"
+		}
+		lines = append(lines, fmt.Sprintf("%s *%s*%s — `%s`%s\n   %s", icon, job.Name, who, job.Schedule, nextStr, prompt))
 	}
 
 	return strings.Join(lines, "\n")

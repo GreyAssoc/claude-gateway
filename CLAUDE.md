@@ -31,18 +31,32 @@ docker compose logs -f gateway      # gateway only
 
 ### Cron (Telegram)
 
-All jobs run on Qwen (`CRON_FRAMEWORK`). Times are `TZ=Europe/London`.
+Default jobs use Qwen (`CRON_FRAMEWORK`). Per-job `@agent` and model are optional. Times are `TZ=Europe/London`.
 
 ```
-/cronlist                                          # name, schedule, next run
+/cronlist
 /cronadd standup "30 9 * * 1-5" Check calendar and summarise today's meetings
-/cronrun standup
+/cronadd seo_links "0 8 * * 1" @grey-website deepseek-flash Audit internal linking
+/cronadd fx_health "0 7 * * 1-5" @forex-trading qwen Summarise uncommitted work
+/cronrun seo_links
 /crondisable morning_briefing
 /cronenable morning_briefing
 /crondel standup
 ```
 
-`/cronadd` is in-memory only (lost on gateway restart). Permanent jobs go in `configs/gateway.yaml` under `cron:` then recreate the gateway. Full examples: `USER_GUIDE.md` §10.
+YAML (survives restart) — `configs/gateway.yaml` then recreate gateway:
+
+```yaml
+cron:
+  seo_links:
+    schedule: "0 8 * * 1"
+    agent: grey-website
+    framework: deepseek-flash
+    prompt: Audit internal linking. List gaps.
+    enabled: true
+```
+
+`/cronadd` is in-memory only. Full examples: `USER_GUIDE.md` §10.
 
 > **Note:** `docker compose restart` reuses existing containers and will NOT pick up
 > changes to volumes/mounts in `docker-compose.yml` **or** env vars interpolated at

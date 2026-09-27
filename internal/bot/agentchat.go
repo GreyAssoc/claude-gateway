@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -609,6 +610,12 @@ func applyGPUProgress(current, tool, input string) string {
 		return "tools (not on GPU)"
 	}
 	return current
+}
+
+// isUserCancel is true when /stop (or process shutdown) canceled the run.
+// DeadlineExceeded is a different failure and must still be shown.
+func isUserCancel(err error) bool {
+	return errors.Is(err, context.Canceled)
 }
 
 func gpuQueueRank(gpu string) int {

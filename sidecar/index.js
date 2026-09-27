@@ -27,8 +27,9 @@ const DEFAULT_CWD = process.env.WORK_DIR || "/home/user/project";
 // behaviour Claude Code applies to its own sessions.
 const COMPACT_THRESHOLD = parseFloat(process.env.COMPACT_THRESHOLD || "0.80");
 // Qwen/vLLM: compact when input fills this fraction of (context − reserved output).
-// 0.95 of usable window is just below the 114k+16k=131k overflow cliff.
-const VLLM_COMPACT_THRESHOLD = parseFloat(process.env.VLLM_COMPACT_THRESHOLD || "0.95");
+// 0.70 leaves room for a bad chars/token estimate and for max_tokens. 0.95
+// compacted only after vLLM had already rejected the request.
+const VLLM_COMPACT_THRESHOLD = parseFloat(process.env.VLLM_COMPACT_THRESHOLD || "0.70");
 
 // Per-model context windows. Defaults are Anthropic's published numbers;
 // override per-model with the COG_CONTEXT_WINDOW_<MODEL> pattern if needed.
@@ -682,11 +683,10 @@ function killSpawned(child) {
 
 function markAborted(abortState) {
   if (!abortState) return;
-  abortState.aborted = true;
-  if (abortState.httpReq && typeof abortState.httpReq.destroy === "function") {
-    try { abortState.httpReq.destroy(); } catch (_) {}
-    abortState.httpReq = null;
-  }
+  // Drops the vLLM HTTP call and any GPU ticket still waiting. A bare
+  // req.destroy() after streaming has started does not emit 'error' or
+  // 'end', so this also rejects via abortState.cancel.
+  abortInFlight(abortState);
   if (abortState.child) {
     killSpawned(abortState.child);
     abortState.child = null;
@@ -2135,66 +2135,234 @@ function sanitizeQwenMessages(messages, currentUserPrompt) {
   const prompt = String(currentUserPrompt || "").trim();
   if (prompt) {
     const lastReal = [...out].reverse().find(isRealUserQuery);
-    if (!lastReal || lastReal.content !== prompt) {
+    const last = lastReal ? String(lastReal.content || "") : "";
+    // A shrink pass marks the kept user turn with [truncated]. Putting the
+    // original prompt back would restore the overflow for the next cron run.
+    const head = last.split("\n…[truncated]…\n")[0];
+    const truncatedKeep = last.includes("[truncated]") && head.length >= 40 && prompt.startsWith(head);
+    if (!lastReal || (last !== prompt && !truncatedKeep)) {
       out.push({ role: "user", content: prompt });
     }
   }
   return out;
 }
 
+// Learned from a vLLM 400 ("maximum context length is N"). Config can be
+// larger than the serve (131072 in env, 65536 on the GPU). Estimates and
+// cron retries must use the smaller number or every later run 400s.
+let vllmObservedContext = 0;
+
+function noteVllmContextLimit(errText) {
+  const m = String(errText || "").match(/maximum context length is (\d+)/i);
+  if (!m) return 0;
+  const n = parseInt(m[1], 10);
+  if (!n || n < 2048) return 0;
+  if (!vllmObservedContext || n < vllmObservedContext) {
+    vllmObservedContext = n;
+    console.warn(`[vllm] server context window is ${n}; clamping estimates`);
+  }
+  return n;
+}
+
 function vllmContextLimit() {
-  return parseInt(envFileOrProc("VLLM_CONTEXT_WINDOW", "131072"), 10) || 131072;
+  const configured = parseInt(envFileOrProc("VLLM_CONTEXT_WINDOW", "131072"), 10) || 131072;
+  if (vllmObservedContext > 0) return Math.min(configured, vllmObservedContext);
+  return configured;
 }
 
 function vllmMaxOutput() {
   return parseInt(envFileOrProc("VLLM_MAX_OUTPUT_TOKENS", "16384"), 10) || 16384;
 }
 
+// --- vllm-fit-test-start ---
+// Code and tool JSON are often ~2 chars/token. Dividing by 3 under-counted,
+// so compact never fired and vLLM returned "maximum context length".
+const VLLM_CHARS_PER_TOKEN = 2;
+const VLLM_TOOLS_TOKENS = 12000;
+
 function estimateTokensFromChars(n) {
-  // Code + JSON tools are denser than 4 chars/token. 3 is safer.
-  return Math.ceil(Math.max(0, n) / 3);
+  return Math.ceil(Math.max(0, n) / VLLM_CHARS_PER_TOKEN);
 }
+
+function vllmTextLen(c) {
+  if (typeof c === "string") return c.length;
+  if (c == null) return 0;
+  try { return JSON.stringify(c).length; } catch { return 0; }
+}
+
+function vllmMessageChars(m) {
+  if (!m) return 0;
+  let n = vllmTextLen(m.content);
+  if (m.tool_calls) n += vllmTextLen(m.tool_calls);
+  if (typeof m.reasoning_content === "string") n += m.reasoning_content.length;
+  return n;
+}
+
+function vllmFitIsToolResponse(m) {
+  if (!m || m.role !== "user") return false;
+  const c = typeof m.content === "string" ? m.content.trim() : "";
+  return c.startsWith("<tool_response>") && c.endsWith("</tool_response>");
+}
+
+function vllmFitIsRealUser(m) {
+  return Boolean(m && m.role === "user" && !vllmFitIsToolResponse(m) && String(m.content || "").trim());
+}
+
+function parseVllmContextLimit(errText) {
+  const m = String(errText || "").match(/maximum context length is (\d+)/i);
+  if (!m) return 0;
+  const n = parseInt(m[1], 10);
+  return n >= 2048 ? n : 0;
+}
+
+function vllmInputTokens(messages, toolsTok) {
+  let chars = 0;
+  for (const m of messages || []) chars += vllmMessageChars(m);
+  return estimateTokensFromChars(chars) + (toolsTok == null ? VLLM_TOOLS_TOKENS : toolsTok);
+}
+
+// Last server-reported prompt_tokens is exact. The char estimate is a guess.
+// Pressure is the worse of the two so a low estimate cannot skip compact.
+function vllmPressureRatio(messages, maxOut, ctxLimit, lastPromptTokens, toolsTok) {
+  const ctx = ctxLimit || 131072;
+  const inputTok = vllmInputTokens(messages, toolsTok);
+  const usable = Math.max(1024, ctx - maxOut - 512);
+  let ratio = inputTok / usable;
+  if (lastPromptTokens > 0) ratio = Math.max(ratio, lastPromptTokens / usable);
+  return { ratio, inputTok, usable, ctx };
+}
+
+function capVllmMessage(m, maxChars) {
+  if (!m || typeof m.content !== "string" || m.content.length <= maxChars) return false;
+  const mark = "\n…[truncated]…\n";
+  const room = Math.max(200, maxChars - mark.length);
+  const head = Math.max(80, Math.floor(room * 0.25));
+  const tail = Math.max(80, room - head);
+  m.content = m.content.slice(0, head) + mark + m.content.slice(-tail);
+  return true;
+}
+
+// Drop oldest turns and truncate huge tool dumps until input + maxOut fits.
+// Keeps the system message and the latest real user text. Mutates messages.
+function shrinkVllmToFitLimit(messages, maxOut, ctxLimit, toolsTok) {
+  const ctx = ctxLimit || 131072;
+  const tools = toolsTok == null ? VLLM_TOOLS_TOKENS : toolsTok;
+  const safety = 1024;
+  const inputTok = () => vllmInputTokens(messages, tools);
+  const over = () => inputTok() + maxOut + safety > ctx;
+  let changed = false;
+  const lastUser = () => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (vllmFitIsRealUser(messages[i])) return i;
+    }
+    return -1;
+  };
+  const charBudget = Math.max(2000, (ctx - maxOut - tools - safety) * VLLM_CHARS_PER_TOKEN);
+  const perMsg = Math.max(1500, Math.floor(charBudget / 4));
+  if (over()) {
+    for (const m of messages) {
+      if (capVllmMessage(m, perMsg)) changed = true;
+    }
+  }
+  let guard = 0;
+  while (messages.length > 2 && over() && guard++ < 400) {
+    let dropAt = messages[0] && messages[0].role === "system" ? 1 : 0;
+    const keep = lastUser();
+    if (dropAt === keep || dropAt >= messages.length) {
+      const m = keep >= 0 ? messages[keep] : null;
+      if (m && capVllmMessage(m, Math.max(800, Math.floor(String(m.content || "").length * 0.6)))) {
+        changed = true;
+        continue;
+      }
+      break;
+    }
+    const dropped = messages[dropAt];
+    messages.splice(dropAt, 1);
+    changed = true;
+    if (dropped && dropped.role === "assistant" && Array.isArray(dropped.tool_calls) && dropped.tool_calls.length) {
+      while (dropAt < messages.length && vllmFitIsToolResponse(messages[dropAt]) && dropAt !== lastUser()) {
+        messages.splice(dropAt, 1);
+      }
+    }
+  }
+  guard = 0;
+  while (over() && guard++ < 8) {
+    let cut = false;
+    for (const m of messages) {
+      if (typeof m.content === "string" && m.content.length > 600 && capVllmMessage(m, Math.floor(m.content.length * 0.6))) {
+        cut = true;
+        changed = true;
+      }
+    }
+    if (!cut) break;
+  }
+  let out = maxOut;
+  const room = ctx - inputTok() - safety;
+  if (room < out) out = Math.max(256, room);
+  return { maxOut: out, inputTok: inputTok(), ctx, changed, overflow: inputTok() + out + safety > ctx };
+}
+// --- vllm-fit-test-end ---
 
 function vllmHistoryCharBudget() {
   const tok = vllmContextLimit();
   const out = vllmMaxOutput();
-  // tools+system ≈ 12k tokens; keep a 1k safety margin
-  const histTok = Math.max(8000, tok - out - 12000 - 1024);
-  return histTok * 3;
+  // Stay under the window after tools + output. The old budget was
+  // (window − output) × 3 chars and could itself exceed the serve.
+  // Below the compact threshold once tool tokens are added back, so a
+  // freshly trimmed cron session does not compact on the very next call.
+  const histTok = Math.max(4000, Math.floor((tok - out - VLLM_TOOLS_TOKENS - 1024) * 0.55));
+  return histTok * VLLM_CHARS_PER_TOKEN;
 }
 
 function estimateVllmInputTokens(messages) {
-  let chars = 0;
-  for (const m of messages || []) chars += vllmContentLen(m.content);
-  return estimateTokensFromChars(chars) + 10000;
+  return vllmInputTokens(messages, VLLM_TOOLS_TOKENS);
 }
 
-function vllmFillRatio(messages, maxOut) {
-  const ctx = vllmContextLimit();
-  const usable = Math.max(1024, ctx - maxOut - 512);
-  const inputTok = estimateVllmInputTokens(messages);
-  return { ratio: inputTok / usable, inputTok, usable, ctx };
+function vllmFillRatio(messages, maxOut, lastPromptTokens) {
+  return vllmPressureRatio(messages, maxOut, vllmContextLimit(), lastPromptTokens, VLLM_TOOLS_TOKENS);
+}
+
+function shrinkVllmToFit(messages, maxOut) {
+  return shrinkVllmToFitLimit(messages, maxOut, vllmContextLimit(), VLLM_TOOLS_TOKENS);
 }
 
 async function summariseVllmMessages(messages, baseURL, auth, modelName, abortState) {
+  // The summary request itself must fit. Thirty full tool dumps do not,
+  // and a thinking-only reply used to look like an empty summary so
+  // compact was skipped and the next call (and the next cron run) 400'd.
   const conv = (messages || []).filter((m) => m.role !== "system");
-  const clipped = conv.slice(-30).map((m) => ({
-    role: m.role === "assistant" ? "assistant" : "user",
-    content: typeof m.content === "string" ? m.content.slice(0, 2500) : "",
-  })).filter((m) => m.content);
+  const pieces = [];
+  let budget = 12000;
+  for (let i = conv.length - 1; i >= 0 && budget > 200; i--) {
+    let text = typeof conv[i].content === "string" ? conv[i].content : "";
+    if (conv[i].tool_calls) {
+      try { text += "\n" + JSON.stringify(conv[i].tool_calls).slice(0, 400); } catch (_) { /* ignore */ }
+    }
+    text = text.trim();
+    if (!text) continue;
+    const take = text.slice(0, Math.min(1800, budget));
+    pieces.push({
+      role: conv[i].role === "assistant" ? "assistant" : "user",
+      content: take,
+    });
+    budget -= take.length;
+  }
+  pieces.reverse();
   const json = await vllmChat(baseURL, auth, {
     model: modelName,
     messages: [
       { role: "system", content: SUMMARY_PROMPT },
-      ...clipped,
+      ...pieces,
       { role: "user", content: "Write the summary now. Output only the summary." },
     ],
-    max_tokens: 2048,
+    max_tokens: 1024,
     chat_template_kwargs: { enable_thinking: false, reasoning_effort: "low" },
   }, abortState);
   const msgOut = json?.choices?.[0]?.message || {};
-  const { content } = splitVllmMessage(msgOut);
-  return (content || "").trim();
+  const { thinking, content } = splitVllmMessage(msgOut);
+  let summary = (content || thinking || "").trim();
+  if (summary.length > 6000) summary = summary.slice(0, 6000);
+  return summary;
 }
 
 async function compactVllmSession(opts) {
@@ -2236,36 +2404,12 @@ async function compactVllmSession(opts) {
 }
 
 function fitVllmMessages(messages, maxOut) {
-  const ctx = vllmContextLimit();
-  const toolsTok = 10000;
-  const safety = 512;
-  const est = () => {
-    let chars = 0;
-    for (const m of messages) chars += vllmContentLen(m.content);
-    return estimateTokensFromChars(chars) + toolsTok;
-  };
-  while (messages.length > 2 && est() + maxOut + safety > ctx) {
-    let lastUser = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (isRealUserQuery(messages[i])) {
-        lastUser = i;
-        break;
-      }
-    }
-    let dropAt = 0;
-    if (dropAt === lastUser) dropAt++;
-    if (dropAt >= messages.length) break;
-    messages.splice(dropAt, 1);
-  }
-  let out = maxOut;
-  const room = ctx - est() - safety;
-  if (room < out) out = Math.max(1024, room);
-  return { maxOut: out, inputTok: est() };
+  return shrinkVllmToFit(messages, maxOut);
 }
 
 function trimVllmHistory(messages, maxChars) {
   let total = 0;
-  for (const m of messages) total += vllmContentLen(m.content);
+  for (const m of messages) total += vllmMessageChars(m);
   while (messages.length > 2 && total > maxChars) {
     let lastUser = -1;
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -2278,7 +2422,22 @@ function trimVllmHistory(messages, maxChars) {
     if (dropAt === lastUser) dropAt++;
     if (dropAt >= messages.length) break;
     const dropped = messages.splice(dropAt, 1)[0];
-    total -= vllmContentLen(dropped.content);
+    total -= vllmMessageChars(dropped);
+  }
+  // The latest user turn is kept even when it alone exceeds the budget
+  // (enriched prompt, cron DNA). Truncate it instead of sending a 400.
+  while (total > maxChars) {
+    let cut = false;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (typeof m.content === "string" && m.content.length > 600 && capVllmMessage(m, Math.floor(m.content.length * 0.6))) {
+        cut = true;
+        break;
+      }
+    }
+    if (!cut) break;
+    total = 0;
+    for (const m of messages) total += vllmMessageChars(m);
   }
   return messages;
 }
@@ -2316,6 +2475,37 @@ function isTransientFetch(err) {
   return /fetch failed|econnreset|econnrefused|etimedout|und_err|socket|timed out|aborted|network/.test(s);
 }
 
+function watchVllmResponse(res, fail, isSettled) {
+  // 'error' with no listener crashes the process. Mid-stream destroy()
+  // emits 'aborted' + 'close' (complete=false) and neither 'end' nor
+  // req 'error' — without these, the GPU ticket never leaves the queue.
+  // A finished body emits 'end' first; isSettled stops that close from
+  // turning a good response into an abort.
+  const done = () => (typeof isSettled === "function" ? isSettled() : false);
+  res.on("error", (err) => {
+    if (!done()) fail(err || new Error("aborted"));
+  });
+  res.on("aborted", () => {
+    if (!done()) fail(new Error("aborted"));
+  });
+  res.on("close", () => {
+    if (vllmResponseEvent("close", Boolean(res.complete), done()) === "reject") {
+      fail(new Error("aborted"));
+    }
+  });
+}
+
+function watchVllmRequest(req, abortState, fail) {
+  req.on("error", (err) => fail(err || new Error("aborted")));
+  if (!abortState) return () => {};
+  abortState.cancel = fail;
+  abortState.httpReq = req;
+  return () => {
+    if (abortState.cancel === fail) abortState.cancel = null;
+    if (abortState.httpReq === req) abortState.httpReq = null;
+  };
+}
+
 function postJson(urlStr, { headers, body, timeoutMs, abortState }) {
   return new Promise((resolve, reject) => {
     let u;
@@ -2331,6 +2521,16 @@ function postJson(urlStr, { headers, body, timeoutMs, abortState }) {
     }
     const lib = u.protocol === "https:" ? https : http;
     const payload = Buffer.from(body);
+    let settled = false;
+    let disarm = () => {};
+    const settle = (err, value) => {
+      if (settled) return;
+      settled = true;
+      disarm();
+      if (err) reject(err);
+      else resolve(value);
+    };
+    const fail = (err) => settle(err || new Error("aborted"));
     const req = lib.request({
       hostname: u.hostname,
       port: u.port || (u.protocol === "https:" ? 443 : 80),
@@ -2343,29 +2543,25 @@ function postJson(urlStr, { headers, body, timeoutMs, abortState }) {
       },
       timeout: timeoutMs,
     }, (res) => {
+      watchVllmResponse(res, fail, () => settled);
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
-        if (abortState && abortState.httpReq === req) abortState.httpReq = null;
+        if (vllmResponseEvent("end", res.complete, settled) !== "resolve") return;
         const raw = Buffer.concat(chunks).toString("utf8");
         let json = {};
         try { json = raw ? JSON.parse(raw) : {}; } catch { json = { message: raw.slice(0, 500) }; }
-        resolve({ status: res.statusCode || 0, json });
+        settle(null, { status: res.statusCode || 0, json });
       });
     });
-    if (abortState) abortState.httpReq = req;
+    disarm = watchVllmRequest(req, abortState, fail);
     req.on("timeout", () => {
-      if (abortState && abortState.httpReq === req) abortState.httpReq = null;
-      req.destroy();
-      reject(new Error("vLLM request timed out"));
-    });
-    req.on("error", (err) => {
-      if (abortState && abortState.httpReq === req) abortState.httpReq = null;
-      reject(err);
+      try { req.destroy(new Error("vLLM request timed out")); } catch (_) {}
+      fail(new Error("vLLM request timed out"));
     });
     if (abortState && abortState.aborted) {
-      req.destroy();
-      reject(new Error("aborted"));
+      try { req.destroy(new Error("aborted")); } catch (_) {}
+      fail(new Error("aborted"));
       return;
     }
     req.write(payload);
@@ -2373,10 +2569,24 @@ function postJson(urlStr, { headers, body, timeoutMs, abortState }) {
   });
 }
 
+// --- gpu-queue-test-start ---
 // One 27B sequence at a time on the 3090. A second @agent hitting vLLM
 // while another is generating caused "socket hang up" (OOM / dropped HTTP).
-let vllmTail = Promise.resolve();
-const gpuTickets = [];
+// Not a promise chain: /stop must pull a waiting agent out immediately.
+// A chain could only skip that agent by resolving its slot, which let the
+// next request start in parallel with the one still on the GPU.
+var gpuTickets = [];
+var gpuBusy = false;
+
+// Mid-stream req.destroy() emits response 'close' (complete=false) and
+// not 'end'. A finished body emits 'end' then 'close' with complete=true.
+function vllmResponseEvent(kind, complete, settled) {
+  if (settled) return "ignore";
+  if (kind === "end") return "resolve";
+  if (kind === "close" && complete) return "ignore";
+  if (kind === "close" || kind === "aborted" || kind === "error") return "reject";
+  return "ignore";
+}
 
 function gpuAgentName(abortState) {
   const sid = String((abortState && abortState.sessionId) || "");
@@ -2415,30 +2625,110 @@ function broadcastGpuQueue() {
   });
 }
 
-function enqueueVllm(fn, abortState) {
-  const ticket = { abortState, running: false };
-  gpuTickets.push(ticket);
-  broadcastGpuQueue();
-  let release;
-  const slot = new Promise((resolve) => { release = resolve; });
-  const start = vllmTail.catch(() => {});
-  vllmTail = slot;
-  return start.then(async () => {
+function dropAbortedGpuTickets() {
+  let changed = false;
+  for (let i = gpuTickets.length - 1; i >= 0; i--) {
+    const t = gpuTickets[i];
+    if (t.running) continue;
+    if (t.abortState && t.abortState.aborted) {
+      gpuTickets.splice(i, 1);
+      t.fail(new Error("aborted"));
+      changed = true;
+    }
+  }
+  if (changed) {
+    broadcastGpuQueue();
+    if (!gpuBusy) pumpGpu();
+  }
+}
+
+// Reject the in-flight vLLM call and forget queued turns for this agent.
+// The running ticket stays until its HTTP promise settles, so the next
+// agent cannot overlap it on the 3090. Waiting tickets are removed now —
+// otherwise /stop leaves them in front of whoever starts next.
+function abortInFlight(abortState) {
+  if (!abortState) return;
+  abortState.aborted = true;
+  const cancel = abortState.cancel;
+  const req = abortState.httpReq;
+  abortState.cancel = null;
+  abortState.httpReq = null;
+  if (req && typeof req.destroy === "function") {
+    try { req.destroy(new Error("aborted")); } catch (_) {}
+  }
+  if (typeof cancel === "function") {
+    try { cancel(new Error("aborted")); } catch (_) {}
+  }
+  const name = gpuAgentName(abortState);
+  console.log(`[gpu-abort] @${name} tickets=${gpuTickets.length} busy=${gpuBusy}`);
+  dropAbortedGpuTickets();
+}
+
+function pumpGpu() {
+  if (gpuBusy) return;
+  while (gpuTickets.length) {
+    const ticket = gpuTickets[0];
+    if (ticket.abortState && ticket.abortState.aborted) {
+      gpuTickets.shift();
+      ticket.fail(new Error("aborted"));
+      continue;
+    }
+    gpuBusy = true;
     ticket.running = true;
     broadcastGpuQueue();
-    try {
-      if (abortState && abortState.aborted) {
-        throw new Error("aborted");
-      }
-      return await fn();
-    } finally {
-      const idx = gpuTickets.indexOf(ticket);
-      if (idx >= 0) gpuTickets.splice(idx, 1);
-      broadcastGpuQueue();
-      release();
+    Promise.resolve()
+      .then(() => {
+        if (ticket.abortState && ticket.abortState.aborted) {
+          throw new Error("aborted");
+        }
+        return ticket.fn();
+      })
+      .then((v) => ticket.succeed(v), (e) => ticket.fail(e))
+      .finally(() => {
+        const idx = gpuTickets.indexOf(ticket);
+        if (idx >= 0) gpuTickets.splice(idx, 1);
+        gpuBusy = false;
+        broadcastGpuQueue();
+        pumpGpu();
+      });
+    return;
+  }
+  broadcastGpuQueue();
+}
+
+function enqueueVllm(fn, abortState) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const ticket = {
+      abortState,
+      fn,
+      running: false,
+      succeed(v) {
+        if (settled) return;
+        settled = true;
+        resolve(v);
+      },
+      fail(e) {
+        if (settled) return;
+        settled = true;
+        reject(e instanceof Error ? e : new Error(String(e || "aborted")));
+      },
+    };
+    if (abortState && abortState.aborted) {
+      ticket.fail(new Error("aborted"));
+      return;
     }
+    gpuTickets.push(ticket);
+    broadcastGpuQueue();
+    pumpGpu();
   });
 }
+
+function resetGpuQueueForTests() {
+  gpuTickets.length = 0;
+  gpuBusy = false;
+}
+// --- gpu-queue-test-end ---
 
 async function vllmChat(baseURL, auth, body, abortState) {
   return enqueueVllm(() => vllmChatUnlocked(baseURL, auth, body, abortState), abortState);
@@ -2518,6 +2808,16 @@ function vllmChatStreamUnlocked(baseURL, auth, body, abortState, onDelta) {
       stream: true,
     }));
     const lib = u.protocol === "https:" ? https : http;
+    let settled = false;
+    let disarm = () => {};
+    const settle = (err, value) => {
+      if (settled) return;
+      settled = true;
+      disarm();
+      if (err) reject(err);
+      else resolve(value);
+    };
+    const fail = (err) => settle(err || new Error("aborted"));
     console.log(`[vllm-stream] POST ${urlStr} bytes=${payload.length}`);
     const req = lib.request({
       hostname: u.hostname,
@@ -2532,23 +2832,24 @@ function vllmChatStreamUnlocked(baseURL, auth, body, abortState, onDelta) {
       },
       timeout: timeoutMs,
     }, (res) => {
+      watchVllmResponse(res, fail, () => settled);
       if ((res.statusCode || 0) < 200 || res.statusCode >= 300) {
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
         res.on("end", () => {
-          if (abortState && abortState.httpReq === req) abortState.httpReq = null;
+          if (vllmResponseEvent("end", res.complete, settled) !== "resolve") return;
           const raw = Buffer.concat(chunks).toString("utf8");
           let json = {};
           try { json = raw ? JSON.parse(raw) : {}; } catch { json = { message: raw.slice(0, 500) }; }
           if (res.statusCode === 401) {
-            reject(new Error(
+            fail(new Error(
               "HTTP 401 from vLLM — the serve on :18020 requires an API key. " +
               "Set VLLM_API_KEY in claude-gateway/.env to the same value as vLLM's --api-key."
             ));
             return;
           }
           const errMsg = (typeof json?.error === "string" ? json.error : json?.error?.message) || json?.message || `HTTP ${res.statusCode}`;
-          reject(new Error(errMsg));
+          fail(new Error(errMsg));
         });
         return;
       }
@@ -2607,9 +2908,9 @@ function vllmChatStreamUnlocked(baseURL, auth, body, abortState, onDelta) {
         }
       });
       res.on("end", () => {
-        if (abortState && abortState.httpReq === req) abortState.httpReq = null;
+        if (vllmResponseEvent("end", res.complete, settled) !== "resolve") return;
         const tool_calls = toolAcc.filter(Boolean);
-        resolve({
+        settle(null, {
           model: apiModel,
           usage,
           choices: [{
@@ -2624,19 +2925,14 @@ function vllmChatStreamUnlocked(baseURL, auth, body, abortState, onDelta) {
         });
       });
     });
-    if (abortState) abortState.httpReq = req;
+    disarm = watchVllmRequest(req, abortState, fail);
     req.on("timeout", () => {
-      if (abortState && abortState.httpReq === req) abortState.httpReq = null;
-      req.destroy();
-      reject(new Error("vLLM request timed out"));
-    });
-    req.on("error", (err) => {
-      if (abortState && abortState.httpReq === req) abortState.httpReq = null;
-      reject(err);
+      try { req.destroy(new Error("vLLM request timed out")); } catch (_) {}
+      fail(new Error("vLLM request timed out"));
     });
     if (abortState && abortState.aborted) {
-      req.destroy();
-      reject(new Error("aborted"));
+      try { req.destroy(new Error("aborted")); } catch (_) {}
+      fail(new Error("aborted"));
       return;
     }
     req.write(payload);
@@ -2738,8 +3034,8 @@ async function handleVllmAsk(msg, send, sharedAbort) {
       if (abortState.aborted) break;
       const requireTools = forceTools;
       forceTools = false;
-      if (!isolated && !chatOnly && openaiMessages.length > 6) {
-        const fill = vllmFillRatio(openaiMessages, maxOut);
+      if (!chatOnly && openaiMessages.length > 2) {
+        const fill = vllmFillRatio(openaiMessages, maxOut, session.lastPromptTokens);
         if (fill.ratio >= VLLM_COMPACT_THRESHOLD) {
           send({ type: "progress", tool: "compact", input: `${Math.round(fill.ratio * 100)}% of usable context` });
           const c = await compactVllmSession({
@@ -2759,14 +3055,24 @@ async function handleVllmAsk(msg, send, sharedAbort) {
           });
           if (c.ok && Array.isArray(c.seed)) {
             compaction = c;
+            session.lastPromptTokens = 0;
             session.messages = c.seed;
             openaiMessages.length = 0;
             openaiMessages.push({ role: "system", content: systemContent }, ...c.seed);
+          } else {
+            console.warn(`[compact-vllm ${sessionId}] not applied (${c.error || "no seed"}); trimming instead`);
           }
         }
       }
-      const fitted = fitVllmMessages(openaiMessages, maxOut);
-      if (fitted.maxOut < maxOut) {
+      // Always shrink to the real window before the call. Compact can fail
+      // (empty summary, summary request 400) and must not leave the cron
+      // session over the limit for the next run.
+      let fitted = shrinkVllmToFit(openaiMessages, maxOut);
+      if (fitted.changed) {
+        session.lastPromptTokens = 0;
+        session.messages = openaiMessages.filter((m) => m && m.role !== "system");
+        console.warn(`[vllm-ask ${sessionId}] trimmed to ~${fitted.inputTok} tokens (ctx ${fitted.ctx}, msgs ${openaiMessages.length})`);
+      } else if (fitted.maxOut < maxOut) {
         console.log(`[vllm-ask ${sessionId}] fit max_out ${maxOut}→${fitted.maxOut} est_in=${fitted.inputTok} msgs=${openaiMessages.length}`);
       }
       const call = (choice) => {
@@ -2810,27 +3116,69 @@ async function handleVllmAsk(msg, send, sharedAbort) {
         });
       };
       let json;
-      try {
-        json = await call(requireTools ? "required" : "auto");
-      } catch (err) {
-        const msgErr = String(err.message || "");
-        if (abortState.aborted || /aborted/i.test(msgErr)) {
-          break;
-        }
-        if (/maximum context length|input_tokens/i.test(msgErr)) {
-          fitVllmMessages(openaiMessages, Math.min(fitted.maxOut, 4096));
-          console.warn(`[vllm-ask ${sessionId}] context overflow; trimmed to ${openaiMessages.length} msgs and retry`);
-          json = await call("auto");
-        } else if (requireTools) {
-          console.warn(`[vllm-ask ${sessionId}] tool_choice=required failed (${msgErr}); retry auto`);
-          json = await call("auto");
-        } else {
+      let toolChoice = requireTools ? "required" : "auto";
+      for (let attempt = 1; attempt <= 3 && !json; attempt++) {
+        try {
+          json = await call(toolChoice);
+        } catch (err) {
+          const msgErr = String(err.message || "");
+          if (abortState.aborted || /aborted/i.test(msgErr)) break;
+          const overflow = /maximum context length|input_tokens/i.test(msgErr);
+          if (overflow && attempt < 3) {
+            noteVllmContextLimit(msgErr);
+            console.warn(`[vllm-ask ${sessionId}] context overflow attempt ${attempt}; window=${vllmContextLimit()} msgs=${openaiMessages.length}`);
+            send({ type: "progress", tool: "compact", input: "context full — trimming history" });
+            if (attempt === 1 && openaiMessages.length > 3) {
+              const c = await compactVllmSession({
+                sessionId,
+                messages: openaiMessages,
+                systemContent,
+                currentPrompt: prompt,
+                baseURL,
+                auth,
+                modelName,
+                usageRatio: 1,
+                contextWindow: vllmContextLimit(),
+                tokensAtTrigger: fitted.inputTok,
+                triggeredBy: "auto",
+                reason: "context_overflow",
+                abortState,
+              });
+              if (c.ok && Array.isArray(c.seed)) {
+                compaction = c;
+                openaiMessages.length = 0;
+                openaiMessages.push({ role: "system", content: systemContent }, ...c.seed);
+              }
+            }
+            // Server disagreed with the estimate. Cut bodies even when the
+            // char count still looks safe, then fit to the learned window.
+            if (!parseVllmContextLimit(msgErr)) {
+              for (const m of openaiMessages) {
+                if (typeof m.content === "string" && m.content.length > 800) {
+                  capVllmMessage(m, Math.floor(m.content.length / 2));
+                }
+              }
+            }
+            fitted = shrinkVllmToFit(openaiMessages, Math.min(fitted.maxOut || maxOut, 4096));
+            session.lastPromptTokens = 0;
+            session.messages = openaiMessages.filter((m) => m && m.role !== "system");
+            toolChoice = "auto";
+            continue;
+          }
+          if (toolChoice === "required" && !overflow) {
+            console.warn(`[vllm-ask ${sessionId}] tool_choice=required failed (${msgErr}); retry auto`);
+            toolChoice = "auto";
+            continue;
+          }
           throw err;
         }
       }
       if (!json || abortState.aborted) break;
       inTok += json.usage?.prompt_tokens || 0;
       outTok += json.usage?.completion_tokens || 0;
+      if (json.usage && json.usage.prompt_tokens) {
+        session.lastPromptTokens = json.usage.prompt_tokens;
+      }
       if (json.model) apiModel = json.model;
 
       const choice = json.choices && json.choices[0];
@@ -3062,6 +3410,193 @@ async function handleVllmAsk(msg, send, sharedAbort) {
   }
 }
 
+// --- gateway-tool-approval-test-start ---
+// Claude Code never auto-approves writes under a directory named `.claude`
+// (protected path), even in acceptEdits and even when that directory is the
+// cwd. The SDK then waits for canUseTool. With no callback the tool dies as
+// "you haven't granted it yet", so @agent-creator cannot land files in
+// /workspace/.claude/agents. Settings files stay blocked.
+function gatewayNormPath(cwd, p) {
+  if (!p || typeof p !== "string") return "";
+  let s = p.replace(/\\/g, "/");
+  if (!s.startsWith("/")) {
+    const base = String(cwd || "/workspace").replace(/\/+$/, "");
+    s = `${base}/${s.replace(/^\.\//, "")}`;
+  }
+  const parts = [];
+  for (const seg of s.split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") parts.pop();
+    else parts.push(seg);
+  }
+  return `/${parts.join("/")}`;
+}
+
+function isBlockedClaudeConfig(abs) {
+  const n = String(abs || "").replace(/\\/g, "/");
+  if (!n) return false;
+  if (n === "/root/.claude" || n.startsWith("/root/.claude/")) return true;
+  if (/\/\.claude\/settings(?:\.(?:local|managed))?\.json$/.test(n)) return true;
+  if (n.endsWith("/.claude.json")) return true;
+  return false;
+}
+
+function bashClaudeTargets(command, cwd) {
+  const out = [];
+  const re = /(?:^|[\s"'`(=:])((?:\/[\w.+@-]+)+(?:\/\.claude(?:\/[^\s"'`;|&$<>]*)?)|\/root\/\.claude[^\s"'`;|&$<>]*|(?:\.\.?\/)?\.claude(?:\/[^\s"'`;|&$<>]*)?)/g;
+  const s = String(command || "");
+  let m;
+  while ((m = re.exec(s))) {
+    const abs = gatewayNormPath(cwd, m[1]);
+    if (abs) out.push(abs);
+  }
+  return out;
+}
+
+function approveGatewayTool(toolName, input, cwd) {
+  const allow = () => ({ behavior: "allow", updatedInput: input });
+  const deny = (message) => ({ behavior: "deny", message });
+  if (toolName === "AskUserQuestion") {
+    return deny("No keyboard is attached. Pick an approach and continue, or ask in your reply.");
+  }
+  const src = input && typeof input === "object" ? input : {};
+  const paths = [];
+  for (const key of ["file_path", "notebook_path", "path"]) {
+    const abs = gatewayNormPath(cwd, src[key]);
+    if (abs) paths.push(abs);
+  }
+  if (toolName === "Bash") paths.push(...bashClaudeTargets(src.command, cwd));
+  for (const p of paths) {
+    if (isBlockedClaudeConfig(p)) {
+      return deny(`refusing to change Claude settings at ${p}. Files under /workspace/.claude/agents (and skills, teams, commands) are allowed.`);
+    }
+  }
+  return allow();
+}
+// --- gateway-tool-approval-test-end ---
+
+// --- sdk-max-turns-test-start ---
+// Claude Code stops the process at maxTurns and the gateway used to forward
+// "Reached maximum number of turns (40)" as the agent's final answer.
+var SDK_MAX_TURN_CONTINUATIONS = 15;
+
+function isSdkMaxTurns(subtype, text) {
+  if (subtype === "error_max_turns") return true;
+  return /reached maximum number of turns\s*\(\d+\)/i.test(String(text || ""));
+}
+
+function shouldContinueAfterMaxTurns(state) {
+  if (!state || state.isolated) return false;
+  if (!state.hitMaxTurns) return false;
+  if (!state.sdkSessionId) return false;
+  if (state.aborted) return false;
+  const cap = state.maxContinuations == null ? SDK_MAX_TURN_CONTINUATIONS : state.maxContinuations;
+  if ((state.continuations || 0) >= cap) return false;
+  // A resume that immediately maxes out again without doing any work is stuck.
+  if ((state.continuations || 0) > 0 && !state.toolsThisSlice) return false;
+  return true;
+}
+// --- sdk-max-turns-test-end ---
+
+function addSdkUsage(dst, src) {
+  const out = dst || {};
+  const inc = src || {};
+  for (const k of ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]) {
+    out[k] = (out[k] || 0) + (inc[k] || 0);
+  }
+  return out;
+}
+
+// One Claude Code query. A max-turns stop is a result event, sometimes
+// followed by the process exiting 1. Capture the result either way.
+async function consumeSdkQuery(prompt, options, bag) {
+  const { send, abortState, sessionId } = bag;
+  let resultText = "";
+  let subtype = "";
+  let usage = {};
+  let apiModel = bag.apiModel || "";
+  let sdkSessionId = bag.sdkSessionId || "";
+  let toolsThisSlice = 0;
+  const conversation = query({ prompt, options });
+  try {
+    for await (const message of conversation) {
+      if (abortState.aborted) {
+        console.log(`[ws-ask ${sessionId}] aborted by user`);
+        break;
+      }
+      const type = message.type;
+      const sub = message.subtype ? `:${message.subtype}` : "";
+      console.log(`[ws-ask ${sessionId}] event: ${type}${sub}`);
+
+      if (type === "system" && message.subtype === "init") {
+        sdkSessionId = message.session_id || sdkSessionId;
+        continue;
+      }
+
+      if (type === "system") {
+        const thought = sdkThinkingText(message);
+        if (thought) sendThinkingProgress(send, thought.startsWith("💭") ? thought : "💭 " + thought);
+        continue;
+      }
+
+      if (type === "assistant") {
+        const msgModel = message.message?.model || message.model;
+        if (msgModel) {
+          apiModel = msgModel;
+          console.log(`[ws-ask ${sessionId}]   api-model: ${apiModel}`);
+        }
+        const thought = sdkThinkingText(message);
+        if (thought) sendThinkingProgress(send, thought.startsWith("💭") ? thought : "💭 " + thought);
+        const content = message.content
+          || (message.message && message.message.content)
+          || [];
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === "tool_use") {
+              toolsThisSlice++;
+              const toolName = block.name || "unknown";
+              const inputSummary = summarizeInput(block.input);
+              console.log(`[ws-ask ${sessionId}]   tool: ${toolName} → ${inputSummary.slice(0, 80)}`);
+              send({ type: "progress", tool: toolName, input: inputSummary });
+            } else if (block.type === "text" && block.text) {
+              send({ type: "progress", text: block.text });
+            }
+          }
+        }
+        continue;
+      }
+
+      if (type === "result") {
+        subtype = message.subtype || "";
+        resultText = subtype === "success"
+          ? stripThinkTags(message.result || "")
+          : ((message.errors || []).join("\n") || message.error || `Error: ${subtype}`);
+        usage = message.usage || {};
+        sdkSessionId = message.session_id || sdkSessionId;
+        continue;
+      }
+
+      const preview = JSON.stringify(message).slice(0, 200);
+      console.log(`[ws-ask ${sessionId}]   other: ${preview}`);
+    }
+  } catch (err) {
+    if (abortState.aborted) {
+      return { aborted: true, resultText, subtype, usage, apiModel, sdkSessionId, toolsThisSlice };
+    }
+    if (!resultText) throw err;
+    console.log(`[ws-ask ${sessionId}] query ended after result (${subtype || "no subtype"}): ${err.message}`);
+  }
+  return {
+    aborted: Boolean(abortState.aborted),
+    resultText,
+    subtype,
+    usage,
+    apiModel,
+    sdkSessionId,
+    toolsThisSlice,
+  };
+}
+
 // --- WebSocket Handlers ---
 
 async function handleAsk(msg, send) {
@@ -3119,6 +3654,17 @@ async function handleAsk(msg, send) {
     const options = {
       cwd: workDir,
       permissionMode: "acceptEdits",
+      // Protected-path prompts (.claude/agents, .git, …) have no human to
+      // click Allow. Approve them here, except Claude's own settings files.
+      canUseTool: async (toolName, input) => {
+        const decision = approveGatewayTool(toolName, input, workDir);
+        if (decision.behavior === "deny") {
+          console.warn(`[ws-ask ${sessionId}] denied ${toolName}: ${decision.message}`);
+        } else {
+          console.log(`[ws-ask ${sessionId}] approved prompted ${toolName}`);
+        }
+        return decision;
+      },
     };
 
     if (max_turns && max_turns > 0) options.maxTurns = max_turns;
@@ -3204,7 +3750,7 @@ async function handleAsk(msg, send) {
     const canResume = session?.sdkSessionId && (
       localGpu ? session.ok === true : session.ok !== false
     );
-    if (canResume) options.resume = session.sdkSessionId;
+    let resumeId = canResume ? session.sdkSessionId : undefined;
 
     options.stderr = (data) => {
       process.stderr.write(`[claude-sdk] ${data}`);
@@ -3214,70 +3760,53 @@ async function handleAsk(msg, send) {
       }
     };
 
-    console.log(`[ws-ask ${sessionId}] query (cwd: ${workDir}, model: ${options.model || "default"}, provider: ${provider || "claude"}, resume: ${session?.sdkSessionId || "none"}, seeded: ${consumedSeed ? "yes" : "no"})`);
-
-    const conversation = query({ prompt: effectivePrompt, options });
-
-    for await (const message of conversation) {
-      if (abortState.aborted) {
-        console.log(`[ws-ask ${sessionId}] aborted by user`);
+    // DeepSeek/Claude Code stops at maxTurns (40 from Telegram) and that
+    // used to be the whole reply. Resume the same session and keep working.
+    const sliceTurns = (max_turns && max_turns > 0) ? max_turns : 40;
+    options.maxTurns = sliceTurns;
+    let promptForQuery = effectivePrompt;
+    let continuations = 0;
+    let totalUsage = {};
+    let lastSliceUsage = {};
+    while (true) {
+      if (resumeId) options.resume = resumeId;
+      else delete options.resume;
+      console.log(`[ws-ask ${sessionId}] query (cwd: ${workDir}, model: ${options.model || "default"}, provider: ${provider || "claude"}, resume: ${resumeId || "none"}, seeded: ${consumedSeed && continuations === 0 ? "yes" : "no"}, slice: ${continuations})`);
+      const slice = await consumeSdkQuery(promptForQuery, options, {
+        send, abortState, sessionId, apiModel, sdkSessionId,
+      });
+      if (slice.apiModel) apiModel = slice.apiModel;
+      if (slice.sdkSessionId) sdkSessionId = slice.sdkSessionId;
+      resultText = slice.resultText || "";
+      lastSliceUsage = slice.usage || {};
+      totalUsage = addSdkUsage(totalUsage, lastSliceUsage);
+      if (slice.aborted || abortState.aborted) break;
+      const hitMax = isSdkMaxTurns(slice.subtype, resultText);
+      if (!shouldContinueAfterMaxTurns({
+        isolated,
+        hitMaxTurns: hitMax,
+        sdkSessionId,
+        aborted: abortState.aborted,
+        continuations,
+        maxContinuations: SDK_MAX_TURN_CONTINUATIONS,
+        toolsThisSlice: slice.toolsThisSlice,
+      })) {
+        if (hitMax && !isolated) {
+          console.warn(`[ws-ask ${sessionId}] turn budget exhausted after ${continuations} continuation(s)`);
+          resultText = "Still working when the turn budget ran out. Send continue and I will pick up from here.";
+        }
         break;
       }
-      const type = message.type;
-      const sub = message.subtype ? `:${message.subtype}` : "";
-      console.log(`[ws-ask ${sessionId}] event: ${type}${sub}`);
-
-      if (type === "system" && message.subtype === "init") {
-        sdkSessionId = message.session_id;
-        continue;
-      }
-
-      if (type === "system") {
-        const thought = sdkThinkingText(message);
-        if (thought) sendThinkingProgress(send, thought.startsWith("💭") ? thought : "💭 " + thought);
-        continue;
-      }
-
-      if (type === "assistant") {
-        // Capture actual API model from response metadata
-        const msgModel = message.message?.model || message.model;
-        if (msgModel) {
-          apiModel = msgModel;
-          console.log(`[ws-ask ${sessionId}]   api-model: ${apiModel}`);
-        }
-        const thought = sdkThinkingText(message);
-        if (thought) sendThinkingProgress(send, thought.startsWith("💭") ? thought : "💭 " + thought);
-        const content = message.content
-          || (message.message && message.message.content)
-          || [];
-        if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block.type === "tool_use") {
-              const toolName = block.name || "unknown";
-              const inputSummary = summarizeInput(block.input);
-              console.log(`[ws-ask ${sessionId}]   tool: ${toolName} → ${inputSummary.slice(0, 80)}`);
-              send({ type: "progress", tool: toolName, input: inputSummary });
-            } else if (block.type === "text" && block.text) {
-              send({ type: "progress", text: block.text });
-            }
-          }
-        }
-        continue;
-      }
-
-      if (type === "result") {
-        resultText = message.subtype === "success"
-          ? stripThinkTags(message.result || "")
-          : ((message.errors || []).join("\n") || message.error || `Error: ${message.subtype}`);
-        usage = message.usage || {};
-        sdkSessionId = sdkSessionId || message.session_id;
-        continue;
-      }
-
-      // Unknown SDK event types — log only, do not leak into Telegram.
-      const preview = JSON.stringify(message).slice(0, 200);
-      console.log(`[ws-ask ${sessionId}]   other: ${preview}`);
+      continuations++;
+      resumeId = sdkSessionId;
+      promptForQuery = "Continue the task from the exact point you stopped. The turn limit is not a reason to stop or summarise. Do not recap. Do not restart. Finish the remaining work, then write the user-facing answer.";
+      const note = `turn limit — continuing (${continuations}/${SDK_MAX_TURN_CONTINUATIONS})`;
+      console.log(`[ws-ask ${sessionId}] ${note}`);
+      send({ type: "progress", tool: "continue", input: note });
     }
+    usage = totalUsage;
+    // Context pressure is the last slice, not the sum of every resume.
+    const usageForContext = lastSliceUsage;
 
     clearInterval(keepalive);
     activeRequests.delete(sessionId);
@@ -3302,9 +3831,9 @@ async function handleAsk(msg, send) {
     // conversation; the sum of these is the model's view of the active
     // window, which is what threshold checks should compare against.
     const lastTurnTotal =
-      (usage.input_tokens || 0) +
-      (usage.cache_read_input_tokens || 0) +
-      (usage.cache_creation_input_tokens || 0);
+      (usageForContext.input_tokens || 0) +
+      (usageForContext.cache_read_input_tokens || 0) +
+      (usageForContext.cache_creation_input_tokens || 0);
     const ctxWindow = contextWindowFor(apiModel || options.model);
     const usageRatio = ctxWindow > 0 ? lastTurnTotal / ctxWindow : 0;
 

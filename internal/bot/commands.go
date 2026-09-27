@@ -13,6 +13,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"github.com/you/claude-gateway/internal/agent"
+	"github.com/you/claude-gateway/internal/config"
 	"github.com/you/claude-gateway/internal/ctxbuilder"
 	"github.com/you/claude-gateway/internal/db"
 	"github.com/you/claude-gateway/internal/format"
@@ -78,7 +79,7 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 			"/contactadd — add contact detail to person\n" +
 			"/context — current context layers\n" +
 			"/cost — token usage this session\n" +
-			"/cronadd name \"schedule\" prompt — add a cron job\n" +
+			"/cronadd name \"schedule\" [@agent] [model] prompt — add a cron job\n" +
 			"/crondel name — remove a cron job\n" +
 			"/crondisable name — disable a cron job\n" +
 			"/cronenable name — enable a cron job\n" +
@@ -861,6 +862,12 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	}
 
 	if err != nil {
+		// /stop already told the user. context.Canceled is that cancel
+		// (or gateway shutdown) — not a failure to surface again.
+		if isUserCancel(err) {
+			log.Printf("Agent @%s stopped", turn.Display)
+			return
+		}
 		notify := !b.isFocused(msg.Chat.ID, turn.Key)
 		b.sendLongMessage(msg.Chat.ID, formatAgentReply(turn.Display, fmt.Sprintf("Error: %v", err), notify))
 		return
@@ -2247,8 +2254,7 @@ func (b *Bot) handleDBCheck(ctx context.Context, msg *tgbotapi.Message) {
 }
 
 // handleCronAdd creates a new cron job at runtime.
-// Usage: /cronadd name "schedule" prompt text here
-// Example: /cronadd standup "30 9 * * 1-5" Check my calendar and summarise today's meetings
+// Usage: /cronadd name "schedule" [@agent] [model] prompt
 func (b *Bot) handleCronAdd(msg *tgbotapi.Message) {
 	if b.cronScheduler == nil {
 		b.sendMessage(msg.Chat.ID, "Cron scheduler not available.")
@@ -2256,23 +2262,26 @@ func (b *Bot) handleCronAdd(msg *tgbotapi.Message) {
 	}
 
 	args := msg.CommandArguments()
+	usage := "Usage: /cronadd name \"schedule\" [@agent] [model] prompt\n\n" +
+		"Examples:\n" +
+		"/cronadd standup \"30 9 * * 1-5\" Check my calendar\n" +
+		"/cronadd seo_links \"0 8 * * 1\" @grey-website deepseek-flash Audit internal linking\n" +
+		"/cronadd fx_health \"0 7 * * 1-5\" @forex-trading qwen Summarise uncommitted work"
 	if args == "" {
-		b.sendMessage(msg.Chat.ID, "Usage: /cronadd name \"schedule\" prompt text\n\nExample:\n/cronadd standup \"30 9 * * 1-5\" Check my calendar and summarise today's meetings")
+		b.sendMessage(msg.Chat.ID, usage)
 		return
 	}
 
-	// Parse: name "schedule" prompt...
 	parts := strings.SplitN(args, " ", 2)
 	if len(parts) < 2 {
-		b.sendMessage(msg.Chat.ID, "Usage: /cronadd name \"schedule\" prompt text")
+		b.sendMessage(msg.Chat.ID, usage)
 		return
 	}
 	name := parts[0]
 	rest := parts[1]
 
-	// Extract quoted schedule
 	if !strings.HasPrefix(rest, "\"") {
-		b.sendMessage(msg.Chat.ID, "Schedule must be in quotes: /cronadd name \"0 9 * * *\" prompt text")
+		b.sendMessage(msg.Chat.ID, "Schedule must be in quotes: /cronadd name \"0 9 * * *\" [@agent] [model] prompt")
 		return
 	}
 	endQuote := strings.Index(rest[1:], "\"")
@@ -2281,19 +2290,63 @@ func (b *Bot) handleCronAdd(msg *tgbotapi.Message) {
 		return
 	}
 	schedule := rest[1 : endQuote+1]
-	prompt := strings.TrimSpace(rest[endQuote+2:])
+	tail := strings.TrimSpace(rest[endQuote+2:])
+	agentHandle, framework, prompt := parseCronAddTail(tail)
 
 	if prompt == "" {
 		b.sendMessage(msg.Chat.ID, "Prompt cannot be empty.")
 		return
 	}
 
-	if err := b.cronScheduler.AddDynamic(name, schedule, prompt); err != nil {
+	job := config.CronJob{
+		Schedule:  schedule,
+		Prompt:    prompt,
+		Enabled:   true,
+		Agent:     agentHandle,
+		Framework: framework,
+	}
+	if err := b.cronScheduler.AddDynamic(name, job); err != nil {
 		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Failed: %v", err))
 		return
 	}
 
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Cron job %q added.\nSchedule: %s\nPrompt: %s", name, schedule, prompt))
+	var extra strings.Builder
+	if agentHandle != "" {
+		fmt.Fprintf(&extra, "\nAgent: @%s", agentHandle)
+	}
+	if framework != "" {
+		fmt.Fprintf(&extra, "\nModel: %s (`%s`)", frameworkLabel(framework), b.modelForFramework(framework))
+	} else {
+		extra.WriteString("\nModel: CRON_FRAMEWORK default (Qwen)")
+	}
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Cron job %q added.\nSchedule: %s%s\nPrompt: %s", name, schedule, extra.String(), prompt))
+}
+
+// parseCronAddTail reads optional @agent and model token, then the prompt.
+func parseCronAddTail(rest string) (agentHandle, framework, prompt string) {
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return "", "", ""
+	}
+	if strings.HasPrefix(rest, "@") {
+		p := parseAgentCall(rest)
+		if p.Mentioned {
+			agentHandle = p.Handle
+			rest = p.Rest
+		}
+	}
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return agentHandle, "", ""
+	}
+	tok := strings.ToLower(strings.Trim(fields[0], "/"))
+	if _, ok := lookupSelectable(tok); ok {
+		sel, _ := lookupSelectable(tok)
+		framework = sel.Key
+		prompt = strings.TrimSpace(rest[len(fields[0]):])
+		return agentHandle, framework, prompt
+	}
+	return agentHandle, "", rest
 }
 
 func (b *Bot) handleCronDel(msg *tgbotapi.Message) {
@@ -2416,6 +2469,15 @@ var selectableModels = []selectableModel{
 	{"DeepSeek V4 Pro", "deepseek", "deepseek", "deepseek-v4-pro"},
 	{"Grok 4.5", "grok", "grok", "grok-4.5"},
 	{"Qwen3.8 (local)", "qwen", "qwen", "qwen3.8-27b"},
+}
+
+// ResolveSelectable maps a /models name or YAML framework pin to provider + vendor model.
+func ResolveSelectable(name string) (key, backend, model, label string, ok bool) {
+	m, ok := lookupSelectable(name)
+	if !ok {
+		return "", "", "", "", false
+	}
+	return m.Key, m.Backend, m.Model, m.Label, true
 }
 
 func lookupSelectable(name string) (selectableModel, bool) {
