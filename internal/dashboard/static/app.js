@@ -2,6 +2,16 @@
 
 const POLL_INTERVAL = 30000;
 
+function esc(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+    }[ch]));
+}
+
 // Fetch helper with optional auth
 async function api(path) {
     const headers = {};
@@ -43,16 +53,28 @@ async function loadRateLimits() {
         const headroomPct = Math.round(c.headroom * 100);
         const meterClass = headroomPct > 50 ? "low" : headroomPct > 20 ? "medium" : "high";
 
+        const conv = Array.isArray(c.conversations) ? c.conversations : [];
+        let convRows = "";
+        for (const row of conv) {
+            const pct = row.context_window ? Math.round(100 * row.context_tokens / row.context_window) : 0;
+            convRows += `<tr><td>${esc(row.framework)}</td><td>${esc(row.session_id)}</td><td>${esc(row.model)}</td><td>${row.context_tokens} / ${row.context_window} (${pct}%)</td><td>${row.output_tokens}</td></tr>`;
+        }
+        if (!convRows) {
+            convRows = `<tr><td colspan="5">No conversations yet</td></tr>`;
+        }
         document.getElementById("rate-limits-content").innerHTML = `
             <table>
-                <tr><th>RPM</th><td>${c.rpm}</td></tr>
-                <tr><th>ITPM</th><td>${c.itpm}</td></tr>
-                <tr><th>OTPM</th><td>${c.otpm}</td></tr>
-                <tr><th>Headroom</th><td>${headroomPct}%
+                <tr><th>RPM</th><td>${esc(c.rpm)}</td></tr>
+                <tr><th>Request headroom</th><td>${headroomPct}%
                     <div class="meter"><div class="meter-fill ${meterClass}" style="width:${headroomPct}%"></div></div>
                 </td></tr>
-                <tr><th>Queue</th><td>${c.queue_depth}</td></tr>
-                <tr><th>Window Resets</th><td>${c.window_resets}</td></tr>
+                <tr><th>Queue</th><td>${esc(c.queue_depth)}</td></tr>
+                <tr><th>Window Resets</th><td>${esc(c.window_resets)}</td></tr>
+            </table>
+            <p>Each conversation is counted against its own context window. Agents are not added together.</p>
+            <table>
+                <tr><th>Framework</th><th>Session</th><th>Model</th><th>Context</th><th>Output this turn</th></tr>
+                ${convRows}
             </table>`;
 
         // Track history for chart

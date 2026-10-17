@@ -234,7 +234,9 @@ func (b *Builder) BuildEnrichedPromptWith(ctx context.Context, sessionID, userMe
 			}
 
 			hits, err := b.db.SearchSimilar(ctx, emb, excludeIDs, b.semanticHits, b.minSimilarity, sessionID)
-			if err == nil && len(hits) > 0 {
+			if err != nil {
+				log.Printf("Context builder: semantic search failed: %v", err)
+			} else if len(hits) > 0 {
 				var hitBuf strings.Builder
 				hitBuf.WriteString("<related_past_conversations>\n")
 				for _, h := range hits {

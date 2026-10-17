@@ -129,9 +129,28 @@ func (c *Client) Generate(ctx context.Context, prompt, systemPrompt string) (str
 	return c.generate(ctx, prompt, systemPrompt, "", nil)
 }
 
+// runnerDied reports Ollama's GPU-runner crash. vLLM holds the host GPU, so
+// loading qwen2.5:7b onto it returns this and kills the runner. A CPU retry
+// succeeds.
+func runnerDied(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "llama runner process has terminated")
+}
+
 // generate is the internal implementation that supports an optional format parameter
 // and performance options. When format is "json", Ollama constrains output to valid JSON.
+// A GPU runner crash is retried once on CPU.
 func (c *Client) generate(ctx context.Context, prompt, systemPrompt, format string, opts *GenerateOpts) (string, error) {
+	out, err := c.doGenerate(ctx, prompt, systemPrompt, format, opts, false)
+	if err == nil || !runnerDied(err) {
+		return out, err
+	}
+	log.Printf("ollama: %s runner crashed; retrying on CPU", c.llmModel)
+	return c.doGenerate(ctx, prompt, systemPrompt, format, opts, true)
+}
+
+// doGenerate performs one /api/generate call. forceCPU sets num_gpu=0 so the
+// model does not try to share the GPU with vLLM.
+func (c *Client) doGenerate(ctx context.Context, prompt, systemPrompt, format string, opts *GenerateOpts, forceCPU bool) (string, error) {
 	if prompt == "" {
 		return "", fmt.Errorf("ollama generate: empty prompt")
 	}
@@ -147,20 +166,23 @@ func (c *Client) generate(ctx context.Context, prompt, systemPrompt, format stri
 	if format != "" {
 		payload["format"] = format
 	}
+	options := map[string]any{}
 	if opts != nil {
-		options := map[string]any{}
 		if opts.NumPredict > 0 {
 			options["num_predict"] = opts.NumPredict
 		}
 		if opts.Temperature >= 0 {
 			options["temperature"] = opts.Temperature
 		}
-		if len(options) > 0 {
-			payload["options"] = options
-		}
 		if opts.KeepAlive != "" {
 			payload["keep_alive"] = opts.KeepAlive
 		}
+	}
+	if forceCPU {
+		options["num_gpu"] = 0
+	}
+	if len(options) > 0 {
+		payload["options"] = options
 	}
 
 	body, err := json.Marshal(payload)

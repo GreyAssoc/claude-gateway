@@ -192,16 +192,18 @@ vLLM on the host GPU when `VLLM_MODEL` / `VLLM_URL` is set; Ollama is the
 fallback if only `OLLAMA_CHAT_MODEL` is set).
 
 **Default is Qwen** (`FRAMEWORK=qwen` in `.env`). Cron stays on Qwen
-(`CRON_FRAMEWORK`). Telegram `/models` and `/framework` apply **only to the
-focused agent**, not the process default.
+(`CRON_FRAMEWORK`) unless that job names a model. Telegram `/models` and
+`/framework` select the model for the focused agent. Every process that
+agent starts uses the same model, including the grey-website content
+pipeline, quality control, and repair when @grey-website is the one selected.
 
 ```
 @forex-trading
-/models deepseek          # this agent only; DeepSeek V4 Pro
-/models deepseek-flash    # this agent only; DeepSeek V4.1 Flash (`deepseek-flash`)
+/models deepseek          # this agent and every process it starts; DeepSeek V4 Pro
+/models deepseek-flash    # this agent and every process it starts; DeepSeek V4.1 Flash (`deepseek-flash`)
 @grey-email
-/models qwen              # this agent only
-/models inherit           # drop chat override (YAML pin remains)
+/models qwen              # this agent and every process it starts
+/models inherit           # drop the selection (a YAML pin remains, otherwise Qwen)
 /framework inherit
 ```
 

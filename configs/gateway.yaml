@@ -107,6 +107,21 @@ cron:
       and what failed.
     enabled: true
 
+  greyandassociates_weekly_serp:
+    schedule: "0 17 * * 0"   # Sundays 17:00
+    agent: seo
+    framework: deepseek-flash
+    prompt: >
+      Run the weekly Grey & Associates SERP report now by executing:
+        python3 -I /workspace/projects/seo/serp-rankings/greyandassociates/run_report.py
+      The script pulls live Google SERPs (London, en, desktop, depth 20) for
+      all 55 site keywords, including every long-tail town page, writes the
+      dated report to serp-rankings/greyandassociates, and emails it to
+      steve.w@greyandassociates.co.uk. It is idempotent: if today's report
+      already exists it exits without re-sending. Reply with the one-line
+      headline only (in top 10 / top 20 / outside top 20).
+    enabled: true
+
 watchers:
   gmail:
     enabled: false
@@ -136,6 +151,10 @@ sidecar:
   default_model: "claude-opus-4-6"
 
 ratelimiter:
+  # RPM is the only shared minute cap. Token totals are per conversation,
+  # sized to that framework's context window (DeepSeek Pro 128k, Flash 1M,
+  # Grok 2M, Claude 200k, Qwen 131k). itpm/otpm are not a shared pool;
+  # they remain so older env files still parse.
   rpm: ${RATE_LIMIT_RPM:-100}
   itpm: ${RATE_LIMIT_ITPM:-80000}
   otpm: ${RATE_LIMIT_OTPM:-16000}

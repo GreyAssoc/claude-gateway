@@ -19,6 +19,7 @@ import (
 	"github.com/you/claude-gateway/internal/format"
 	"github.com/you/claude-gateway/internal/orchestrator"
 	"github.com/you/claude-gateway/internal/pgdb"
+	"github.com/you/claude-gateway/internal/ratelimiter"
 	"github.com/you/claude-gateway/internal/skills"
 )
 
@@ -86,14 +87,14 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 			"/cronlist — list scheduled jobs\n" +
 			"/cronrun name — run a cron job now\n" +
 			"/dbcheck — check PostgreSQL conversations\n" +
-			"/framework [name] — framework for this agent only (inherit to drop)\n" +
+			"/framework [name] — framework for this agent and every process it starts (inherit to drop)\n" +
 			"/googleauth [code|status] — Google Workspace OAuth\n" +
 			"/grokauth [status] — sign in SuperGrok (subscription, not API)\n" +
 			"/journal — view daily journal\n" +
 			"/journalsearch — search journal entries\n" +
 			"/memorieslist — list curated memories\n" +
 			"/model — show actual API model in use\n" +
-			"/models — model for this agent only (Qwen / DeepSeek / Grok)\n" +
+			"/models — model for this agent and every process it starts (Qwen / DeepSeek / Grok)\n" +
 			"/memoryforget — remove a memory by text match\n" +
 			"/memorylist — list memories by category\n" +
 			"/memoryremember <text> — save a memory\n" +
@@ -456,35 +457,84 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		}
 	}
 
-	// Local Qwen/Ollama do not consume Anthropic/DeepSeek quota. Counting
-	// their 150k-context usage against OTPM (16k/min) blocks DeepSeek
-	// for the rest of the window after a single local reply.
+	// Each agent conversation is counted against its own framework window.
+	// Qwen is local and is never queued. A full DeepSeek window does not
+	// block Grok, and two DeepSeek agents do not share one input total.
 	turn, prompt, switchOnly := b.routeAgentMessage(msg)
 	if switchOnly {
 		b.sendFocusMessage(msg.Chat.ID, turn)
 		return
 	}
 
-	if !isLocalQwen(b.frameworkFor(msg.Chat.ID, turn)) && !b.limiter.CanProceed(1000) {
-		status := b.limiter.GetStatus()
-		position := b.limiter.EnqueueChat(msg.Chat.ID, func() {
-			// Use Background: queued requests have independent lifecycles
-			// and should not be cancelled by the original handler's context.
-			b.processMessageWith(context.Background(), msg, prompt, "", peopleNames, turn)
-		})
-		if position < 0 {
-			b.sendMessage(msg.Chat.ID,
-				fmt.Sprintf("Rate limited (DeepSeek/Grok/Claude tokens this minute; Qwen is unlimited).\nQueue full. Resets in %s.\nRPM %s · in %s · out %s",
-					status.WindowResets, status.RPM, status.ITPM, status.OTPM))
-		} else {
-			b.sendMessage(msg.Chat.ID,
-				fmt.Sprintf("Rate limited (DeepSeek/Grok/Claude tokens this minute; Qwen is unlimited).\nQueued at position %d. Resets in %s.\nRPM %s · in %s · out %s",
-					position, status.WindowResets, status.RPM, status.ITPM, status.OTPM))
-		}
+	scope := b.usageScope(msg.Chat.ID, turn)
+	if !b.admitOrExplain(msg.Chat.ID, scope, 1000, func() {
+		// Use Background: queued requests have independent lifecycles
+		// and should not be cancelled by the original handler's context.
+		b.processMessageWith(context.Background(), msg, prompt, "", peopleNames, turn)
+	}) {
 		return
 	}
 
 	b.processMessageWith(ctx, msg, prompt, "", peopleNames, turn)
+}
+
+func mdPlain(s string) string {
+	return strings.NewReplacer(
+		"_", "\\_",
+		"*", "\\*",
+		"`", "\\`",
+		"[", "\\[",
+	).Replace(s)
+}
+
+func (b *Bot) usageScope(chatID int64, turn agentSlot) ratelimiter.Scope {
+	fw := b.frameworkFor(chatID, turn)
+	return ratelimiter.Scope{
+		Framework: fw,
+		SessionID: sessionIDFor(chatID, turn.Key),
+		Model:     b.modelForFramework(fw),
+	}
+}
+
+// admitOrExplain returns true when the caller should run the turn now.
+// RPM exhaustion queues. A full context window stops only this conversation.
+func (b *Bot) admitOrExplain(chatID int64, scope ratelimiter.Scope, estimate int, queued func()) bool {
+	if b.limiter == nil || ratelimiter.Unlimited(scope.Framework) {
+		return true
+	}
+	d := b.limiter.Admit(scope, estimate)
+	if d.OK {
+		return true
+	}
+	if d.Reason == ratelimiter.ReasonContext {
+		model := d.Usage.Model
+		if model == "" {
+			model = scope.Model
+		}
+		if model == "" {
+			model = scope.Framework
+		}
+		b.sendMessage(chatID, fmt.Sprintf(
+			"This conversation is at %s / %s of the %s context window (%s).\nOther agents are not counted in this number.\nSend /compact to continue this one.",
+			format.Tokens(d.Usage.ContextTokens),
+			format.Tokens(d.Usage.ContextWindow),
+			scope.Framework,
+			model,
+		))
+		return false
+	}
+	status := d.Status
+	position := b.limiter.EnqueueChat(chatID, queued)
+	if position < 0 {
+		b.sendMessage(chatID, fmt.Sprintf(
+			"Rate limited (requests this minute).\nQueue full. Resets in %s.\nRPM %s",
+			status.WindowResets, status.RPM))
+	} else {
+		b.sendMessage(chatID, fmt.Sprintf(
+			"Rate limited (requests this minute).\nQueued at position %d. Resets in %s.\nRPM %s",
+			position, status.WindowResets, status.RPM))
+	}
+	return false
 }
 
 func (b *Bot) routeAgentMessage(msg *tgbotapi.Message) (turn agentSlot, prompt string, switchOnly bool) {
@@ -880,11 +930,22 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 		b.lastAPIModelMu.Unlock()
 	}
 
+	// Record this conversation's context occupancy on its own counter.
+	// Qwen is stored too, but it does not consume RPM.
+	scope := ratelimiter.Scope{
+		Framework: fw,
+		SessionID: sessionID,
+		Model:     opts.Model,
+	}
+	if resp.Model != "" {
+		scope.Model = resp.Model
+	}
+	if b.limiter != nil && (resp.Usage != nil || resp.Context != nil) {
+		b.limiter.Record(scope, resp.Usage, resp.Context, !ratelimiter.Unlimited(fw))
+	}
+
 	// Record usage
 	if resp.Usage != nil {
-		if !isLocalQwen(fw) {
-			b.limiter.Record(resp.Usage)
-		}
 		b.recordSessionUsage(msg.Chat.ID, resp.Usage)
 
 		// Record to DB with a dedicated timeout so queued requests
@@ -916,6 +977,9 @@ func (b *Bot) processMessageWith(ctx context.Context, msg *tgbotapi.Message, pro
 	// surface a Claude-Code-style notification to the user and persist
 	// the event so the memory module can recall the summary later.
 	if resp.Compaction != nil && resp.Compaction.Triggered && resp.Compaction.OK {
+		if b.limiter != nil {
+			b.limiter.ResetScope(scope)
+		}
 		b.handleCompactionEvent(msg.Chat.ID, sessionID, resp.Compaction)
 	}
 
@@ -1024,12 +1088,29 @@ func (b *Bot) handleStatus(ctx context.Context, msg *tgbotapi.Message) {
 		fmt.Sprintf("Chatting with: @%s", focus.Display),
 		fmt.Sprintf("Sidecar: %s", sidecarStatus),
 		"",
-		"*Rate Limits:*",
+		"*Requests this minute:*",
 		fmt.Sprintf("  RPM: %s", rl.RPM),
-		fmt.Sprintf("  ITPM: %s", rl.ITPM),
-		fmt.Sprintf("  OTPM: %s", rl.OTPM),
 		fmt.Sprintf("  Headroom: %.0f%%", rl.Headroom*100),
 		fmt.Sprintf("  Window resets: %s", rl.WindowResets),
+		"",
+		"*Context (each conversation, not pooled):*",
+	}
+	if len(rl.Conversations) == 0 {
+		lines = append(lines, "  (none yet)")
+	}
+	for i, c := range rl.Conversations {
+		if i >= 12 {
+			lines = append(lines, fmt.Sprintf("  … and %d more", len(rl.Conversations)-12))
+			break
+		}
+		model := c.Model
+		if model == "" {
+			model = c.Framework
+		}
+		lines = append(lines, fmt.Sprintf("  %s · %s · %s / %s · out %s this turn",
+			mdPlain(c.SessionID), mdPlain(model),
+			format.Tokens(c.ContextTokens), format.Tokens(c.ContextWindow),
+			format.Tokens(c.OutputTokens)))
 	}
 
 	if rl.QueueDepth > 0 {
@@ -1055,6 +1136,9 @@ func (b *Bot) handleReset(ctx context.Context, msg *tgbotapi.Message) {
 	if err != nil {
 		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Reset failed: %v", err))
 		return
+	}
+	if b.limiter != nil {
+		b.limiter.ResetScope(b.usageScope(msg.Chat.ID, turn))
 	}
 
 	b.sessionsMu.Lock()
@@ -1343,32 +1427,59 @@ func (b *Bot) tryAgentSlashCommand(ctx context.Context, msg *tgbotapi.Message) b
 			peopleNames = names
 		}
 	}
+	scope := b.usageScope(msg.Chat.ID, turn)
+	if !b.admitOrExplain(msg.Chat.ID, scope, 1000, func() {
+		b.processMessageWith(context.Background(), msg, rest, "", peopleNames, turn)
+	}) {
+		return true
+	}
 	b.processMessageWith(ctx, msg, rest, "", peopleNames, turn)
 	return true
 }
 
 func (b *Bot) handleCost(msg *tgbotapi.Message) {
+	var lines []string
+	lines = append(lines, "*Context windows*", "Each conversation is its own input. They are not added together.", "")
+	if b.limiter != nil {
+		prefix := fmt.Sprintf("tg-%d", msg.Chat.ID)
+		n := 0
+		for _, c := range b.limiter.GetStatus().Conversations {
+			if c.SessionID != prefix && !strings.HasPrefix(c.SessionID, prefix+"-ag-") {
+				continue
+			}
+			n++
+			model := c.Model
+			if model == "" {
+				model = c.Framework
+			}
+			lines = append(lines, fmt.Sprintf("%s · %s · %s / %s · out %s this turn",
+				mdPlain(c.SessionID), mdPlain(model),
+				format.Tokens(c.ContextTokens), format.Tokens(c.ContextWindow),
+				format.Tokens(c.OutputTokens)))
+		}
+		if n == 0 {
+			lines = append(lines, "(no conversation counters yet)")
+		}
+	}
+
 	b.sessionsMu.RLock()
 	usage, ok := b.sessions[msg.Chat.ID]
 	b.sessionsMu.RUnlock()
-
-	if !ok {
+	if ok {
+		duration := time.Since(usage.StartedAt).Round(time.Minute)
+		lines = append(lines, "",
+			"*Billed this chat (sum of API calls, not a context window)*",
+			fmt.Sprintf("Requests: %d", usage.Requests),
+			fmt.Sprintf("Input tokens: %s", format.Tokens(usage.InputTokens)),
+			fmt.Sprintf("Output tokens: %s", format.Tokens(usage.OutputTokens)),
+			fmt.Sprintf("Session duration: %s", duration.String()),
+		)
+	}
+	if len(lines) == 3 {
 		b.sendMessage(msg.Chat.ID, "No usage recorded for this session yet.")
 		return
 	}
-
-	duration := time.Since(usage.StartedAt).Round(time.Minute)
-	b.sendMarkdownMessage(msg.Chat.ID, fmt.Sprintf(
-		"*Session Cost*\n\n"+
-			"Requests: %d\n"+
-			"Input tokens: %s\n"+
-			"Output tokens: %s\n"+
-			"Session duration: %s",
-		usage.Requests,
-		format.Tokens(usage.InputTokens),
-		format.Tokens(usage.OutputTokens),
-		duration.String(),
-	))
+	b.sendMarkdownMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 }
 
 func (b *Bot) handleCronList(msg *tgbotapi.Message) {
@@ -1830,11 +1941,10 @@ func (b *Bot) handleSkillCommand(ctx context.Context, msg *tgbotapi.Message, ski
 	parts = append(parts, skills.FormatSkillsXML([]skills.Skill{skill}))
 	systemPrompt := strings.Join(parts, "\n\n")
 
-	// Rate limit check
-	if !b.limiter.CanProceed(1000) {
-		status := b.limiter.GetStatus()
-		b.sendMessage(msg.Chat.ID,
-			fmt.Sprintf("Rate limited. Window resets in %s.", status.WindowResets))
+	scope := b.usageScope(msg.Chat.ID, turn)
+	if !b.admitOrExplain(msg.Chat.ID, scope, 1000, func() {
+		b.processMessageWith(context.Background(), msg, args, systemPrompt, nil, turn)
+	}) {
 		return
 	}
 
@@ -2439,7 +2549,7 @@ func (b *Bot) handleModel(msg *tgbotapi.Message) {
 	fmt.Fprintf(&text, "Framework: `%s` (%s)\n", framework, frameworkLabel(framework))
 	fmt.Fprintf(&text, "Configured: `%s`\n", configured)
 	if ov := b.slotFrameworkOverride(msg.Chat.ID, turn.Key); ov != "" {
-		text.WriteString("Source: this-chat override (`/models inherit` to drop)\n")
+		text.WriteString("Source: selected for this agent; processes it starts use it (`/models inherit` to drop)\n")
 	} else if turn.Framework != "" {
 		text.WriteString("Source: agent YAML pin\n")
 	} else {
@@ -2595,7 +2705,7 @@ func (b *Bot) handleModels(msg *tgbotapi.Message) {
 		return
 	}
 
-	reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("For @%s: `%s` — `%s`\nPick a model (this agent only). Gateway default stays Qwen.\n/models inherit to drop the override.", turn.Display, current, b.modelForFramework(current)))
+	reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("For @%s: `%s` — `%s`\nPick a model. It applies to this agent and to every process it starts. Gateway default stays Qwen.\n/models inherit to drop the selection.", turn.Display, current, b.modelForFramework(current)))
 	reply.ParseMode = tgbotapi.ModeMarkdown
 	reply.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	if _, err := b.api.Send(reply); err != nil {
@@ -2641,7 +2751,7 @@ func (b *Bot) switchSelectableModel(chatID int64, name string) {
 		return
 	}
 	b.setSlotFramework(chatID, turn.Key, key)
-	b.sendMarkdownMessage(chatID, fmt.Sprintf("@%s: `%s` → *%s* (`%s`)\nThis agent only. Gateway default stays Qwen. /models inherit to undo.", turn.Display, old, label, b.modelForFramework(key)))
+	b.sendMarkdownMessage(chatID, fmt.Sprintf("@%s: `%s` → *%s* (`%s`)\nThis agent and every process it starts, including quality control and repair. Gateway default stays Qwen. /models inherit to undo.", turn.Display, old, label, b.modelForFramework(key)))
 }
 
 // /framework claude   — switch to Claude Code
@@ -2708,7 +2818,7 @@ func (b *Bot) handleFramework(_ context.Context, msg *tgbotapi.Message) {
 	}
 	old := b.frameworkFor(msg.Chat.ID, turn)
 	b.setSlotFramework(msg.Chat.ID, turn.Key, arg)
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf("@%s: `%s` → *%s* (`%s`, this agent only). Gateway default stays Qwen.", turn.Display, old, arg, b.modelForFramework(arg)))
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("@%s: `%s` → *%s* (`%s`). This agent and every process it starts. Gateway default stays Qwen.", turn.Display, old, arg, b.modelForFramework(arg)))
 }
 
 // sendCommandMenu sends a grid of tappable inline buttons for quick access to commands.

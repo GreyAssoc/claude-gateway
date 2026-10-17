@@ -194,12 +194,27 @@ func (s *Scheduler) executeJob(name string) {
 	log.Printf("Cron executing: %s agent=%s model=%s cwd=%s", name, spec.AgentDisplay, spec.Model, spec.WorkDir)
 
 	paid := spec.Backend != nil && spec.Backend.Name() != "qwen" && spec.Backend.Name() != "vllm"
-	if paid && !s.limiter.CanProceed(2000) {
-		log.Printf("Cron %s skipped: rate limited", name)
-		if s.notify != nil {
-			s.notify(fmt.Sprintf("⏭️ Cron job *%s* skipped — rate limited.", name))
+	fw := cfgJob.Framework
+	if fw == "" && spec.Backend != nil {
+		fw = spec.Backend.Name()
+	}
+	sessionID := spec.SessionID
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("cron-%s", name)
+	}
+	scope := ratelimiter.Scope{Framework: fw, SessionID: sessionID, Model: spec.Model}
+	if paid && s.limiter != nil {
+		if d := s.limiter.Admit(scope, 2000); !d.OK {
+			why := "the shared request cap for this minute is full"
+			if d.Reason == ratelimiter.ReasonContext {
+				why = fmt.Sprintf("this job's context window is full (%d/%d)", d.Usage.ContextTokens, d.Usage.ContextWindow)
+			}
+			log.Printf("Cron %s skipped: %s", name, why)
+			if s.notify != nil {
+				s.notify(fmt.Sprintf("⏭️ Cron job *%s* skipped — %s.", name, why))
+			}
+			return
 		}
-		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -213,10 +228,6 @@ func (s *Scheduler) executeJob(name string) {
 		}
 	}()
 
-	sessionID := spec.SessionID
-	if sessionID == "" {
-		sessionID = fmt.Sprintf("cron-%s", name)
-	}
 	sys := spec.SystemPrompt
 	if sys == "" {
 		sys = cronSystemPrompt
@@ -246,8 +257,8 @@ func (s *Scheduler) executeJob(name string) {
 		return
 	}
 
-	if resp.Usage != nil && paid {
-		s.limiter.Record(resp.Usage)
+	if s.limiter != nil && (resp.Usage != nil || resp.Context != nil) {
+		s.limiter.Record(scope, resp.Usage, resp.Context, paid && !ratelimiter.Unlimited(fw))
 	}
 
 	text := resp.Text

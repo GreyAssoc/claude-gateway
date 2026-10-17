@@ -112,8 +112,11 @@ type Bot struct {
 
 	// slotFW is a per-chat per-agent runtime framework override (qwen/deepseek/grok).
 	// Empty / missing means inherit DNA YAML then the gateway default (Switcher.Active).
-	slotFW   map[string]string
-	slotFWMu sync.RWMutex
+	// agentModelsPath, when set, is the file those overrides are saved to so a
+	// restarted gateway and a shell-started content pipeline see the same choice.
+	slotFW          map[string]string
+	slotFWMu        sync.RWMutex
+	agentModelsPath string
 
 	// lastAPIModel tracks the most recent API-reported model per chat.
 	lastAPIModel   map[int64]string
@@ -225,7 +228,10 @@ func New(cfg *config.Config, agentClient agent.Backend, limiter *ratelimiter.Lim
 	if err != nil {
 		return nil, fmt.Errorf("creating telegram bot: %w", err)
 	}
-	api.Client = &http.Client{Timeout: 30 * time.Second}
+	// getUpdates long-polls for u.Timeout (30s) and does not send response
+	// headers until that wait ends. The client deadline must be longer,
+	// or every quiet poll is cancelled with "awaiting headers".
+	api.Client = &http.Client{Timeout: 90 * time.Second}
 
 	log.Printf("Telegram bot authorized as @%s", api.Self.UserName)
 
@@ -253,12 +259,14 @@ func New(cfg *config.Config, agentClient agent.Backend, limiter *ratelimiter.Lim
 		activeReqs:      make(map[string]*reqCancel),
 		currentAgent:    make(map[int64]agentSlot),
 		slotFW:          make(map[string]string),
+		agentModelsPath: agentModelsPath(),
 		lastAPIModel:    make(map[int64]string),
 		skipQwenHistory: make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(b)
 	}
+	b.loadAgentModels()
 	return b, nil
 }
 

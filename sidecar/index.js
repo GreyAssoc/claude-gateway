@@ -1,6 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import dns from "node:dns/promises";
 import http, { createServer } from "node:http";
 import https from "node:https";
@@ -17,6 +18,159 @@ app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.SIDECAR_PORT || 3001;
 const DEFAULT_CWD = process.env.WORK_DIR || "/home/user/project";
+const require = createRequire(import.meta.url);
+
+// The Agent SDK's "native binary exists but failed to launch / libc" error
+// is any spawn errno (ENOENT, EACCES, ENOTDIR, …). A non-executable file,
+// a musl binary with no /lib/ld-musl-*, and a missing cwd all look the same.
+// Probe real binaries and only hand the SDK one that execs.
+let claudeExecutableTask;
+
+function claudeExecutableCandidates() {
+  const arch = process.arch === "arm64" ? "arm64" : "x64";
+  const names = [
+    `@anthropic-ai/claude-agent-sdk-linux-${arch}/claude`,
+    `@anthropic-ai/claude-agent-sdk-linux-${arch}-musl/claude`,
+  ];
+  const out = [];
+  const add = (p) => {
+    if (!p || out.includes(p)) return;
+    out.push(p);
+  };
+  add(process.env.CLAUDE_CODE_EXECUTABLE);
+  for (const name of names) {
+    try {
+      add(require.resolve(name));
+    } catch {
+      // Optional platform package not installed.
+    }
+  }
+  // Image-owned binaries. /root/.claude is overwritten at startup from the
+  // host mount, so it is last — a host build often cannot exec in Debian.
+  add("/usr/local/lib/claude-code/claude");
+  add("/usr/local/bin/claude");
+  add("/root/.claude/local/bin/claude");
+  return out;
+}
+
+function prepareWorkDir(workDir) {
+  const dir = workDir && String(workDir).trim() ? String(workDir).trim() : DEFAULT_CWD;
+  let st;
+  try {
+    st = fs.statSync(dir);
+  } catch (err) {
+    if (err && err.code === "ENOENT" && dir.startsWith("/workspace/") && fs.existsSync("/workspace")) {
+      fs.mkdirSync(dir, { recursive: true });
+      console.warn(`[cwd] created missing working directory ${dir}`);
+      return dir;
+    }
+    const missing = new Error(
+      `Working directory does not exist: ${dir}. Claude Code reports a missing directory as a native-binary libc mismatch.`
+    );
+    missing.code = "ENOENT";
+    throw missing;
+  }
+  if (!st.isDirectory()) {
+    throw new Error(`Working directory is not a directory: ${dir}`);
+  }
+  return dir;
+}
+
+function probeClaudeBinary(bin, cwd) {
+  return new Promise((resolve) => {
+    if (!bin || !fs.existsSync(bin)) {
+      resolve({ ok: false, reason: "missing" });
+      return;
+    }
+    try {
+      fs.accessSync(bin, fs.constants.X_OK);
+    } catch {
+      try {
+        fs.chmodSync(bin, 0o755);
+      } catch {
+        // Read-only layer. Probe still reports the real errno.
+      }
+    }
+    let out = "";
+    let errText = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const child = spawn(bin, ["--version"], {
+      cwd: cwd || "/tmp",
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish({ ok: false, reason: "timeout" });
+    }, 8000);
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { errText += d; });
+    child.on("error", (e) => {
+      finish({ ok: false, reason: e.code || "error", detail: e.message });
+    });
+    child.on("exit", (code) => {
+      if (code === 0) {
+        finish({ ok: true, version: (out || errText).trim().split("\n")[0] });
+        return;
+      }
+      finish({
+        ok: false,
+        reason: `exit ${code}`,
+        detail: (errText || out).trim().slice(0, 240),
+      });
+    });
+  });
+}
+
+function resolveClaudeExecutable() {
+  if (!claudeExecutableTask) {
+    claudeExecutableTask = (async () => {
+      const failures = [];
+      for (const bin of claudeExecutableCandidates()) {
+        const result = await probeClaudeBinary(bin, "/tmp");
+        if (result.ok) {
+          console.log(`[claude-bin] using ${bin} (${result.version || "ok"})`);
+          return { path: bin, failures };
+        }
+        const why = `${bin}: ${result.reason}${result.detail ? " " + result.detail : ""}`;
+        failures.push(why);
+        console.warn(`[claude-bin] skip ${why}`);
+      }
+      console.error(`[claude-bin] no Claude Code binary launched. ${failures.join(" | ")}`);
+      return { path: "", failures };
+    })();
+  }
+  return claudeExecutableTask;
+}
+
+// Spawn with the real cwd. A missing directory is ENOENT and the SDK blames libc.
+const claudeLaunchOk = new Set();
+async function assertClaudeLaunch(bin, cwd) {
+  const key = `${bin}\0${cwd}`;
+  if (claudeLaunchOk.has(key)) return;
+  const here = await probeClaudeBinary(bin, cwd);
+  if (here.ok) {
+    claudeLaunchOk.add(key);
+    return;
+  }
+  const tmp = cwd === "/tmp" ? here : await probeClaudeBinary(bin, "/tmp");
+  if (tmp.ok) {
+    throw new Error(
+      `Claude Code cannot start with working directory ${cwd} (${here.reason || "launch failed"}). ` +
+      "The binary itself runs. Claude Code reports this as a libc mismatch."
+    );
+  }
+  throw new Error(
+    `Claude Code binary failed to launch (${here.reason || "error"}): ${bin}` +
+    (here.detail ? ` ${here.detail}` : "")
+  );
+}
 
 // --- Compaction config ---------------------------------------------------
 //
@@ -163,6 +317,9 @@ const PROVIDERS = {
     baseURL: "https://api.deepseek.com/anthropic",
     apiKeyEnv: "DEEPSEEK_API_KEY",
     defaultModel: "deepseek-v4-pro",
+    // Subagents and SDK tool processes must stay on the requested model
+    // (V4 Pro or Flash). Without this they fall back to another model.
+    setModelEnvVars: true,
   },
   // xAI Anthropic SDK compat: base_url is https://api.x.ai (SDK appends /v1/messages).
   // Accept XAI_API_KEY (official) or GROK_API_KEY (alias used in this project's .env).
@@ -467,6 +624,26 @@ function grokSubscriptionEnv() {
   return withToolPath(env);
 }
 
+// stampChildModelEnv records the model of this ask on every process the
+// agent starts. The grey-website orchestrator reads AGENT_PROVIDER and
+// AGENT_MODEL, so quality control, repair, and any other child stay on
+// the model selected for the parent. An empty provider clears a value
+// inherited from the sidecar process itself.
+function stampChildModelEnv(env, provider, model) {
+  if (!env || typeof env !== "object") return env;
+  const p = String(provider || "").trim();
+  const m = String(model || "").trim();
+  if (!p) {
+    delete env.AGENT_PROVIDER;
+    delete env.AGENT_MODEL;
+    return env;
+  }
+  env.AGENT_PROVIDER = p;
+  if (m) env.AGENT_MODEL = m;
+  else delete env.AGENT_MODEL;
+  return env;
+}
+
 function grokBinaryExists() {
   try {
     fs.accessSync("/usr/local/bin/grok", fs.constants.X_OK);
@@ -483,6 +660,17 @@ function grokIsLoggedIn() {
   } catch {
     return false;
   }
+}
+
+// The CLI's own text says `grok login --device-code`. That signs in whichever
+// machine runs the command. The sidecar keeps its session in its own
+// /root/.grok volume, so the Telegram command is the one that writes it.
+function grokSignInError(message) {
+  const text = String(message || "");
+  if (/not signed in|grok login --device-code|Headless mode requires a grok\.com session/i.test(text)) {
+    return "SuperGrok is not signed in inside the sidecar. Send /grokauth in Telegram and approve the device login. A grok login on another machine does not sign this sidecar in.";
+  }
+  return text;
 }
 
 function parseDeviceAuth(text) {
@@ -1132,7 +1320,11 @@ async function runGog(args, abortState) {
   const result = await spawnAsync("gog", args, {
     timeout: 90000,
     maxBuffer: 1024 * 1024,
-    env: { ...process.env, HOME: "/root" },
+    env: stampChildModelEnv(
+      { ...process.env, HOME: "/root" },
+      abortState && abortState.agentProvider,
+      abortState && abortState.agentModel,
+    ),
   }, abortState);
   const out = ((result.stdout || "") + (result.stderr || "")).trim() || "(empty)";
   if (result.status === 1 && /ENOENT|not found/i.test(out)) {
@@ -1470,13 +1662,18 @@ function vllmGoFlags(cwd) {
   return flags;
 }
 
-function vllmToolEnv(cwd) {
+function vllmToolEnv(cwd, abortState) {
   const root = cwd || "/workspace";
-  return withToolPath({
+  const env = withToolPath({
     ...process.env,
     HOME: "/root",
     PWD: root,
   }, root);
+  return stampChildModelEnv(
+    env,
+    abortState && abortState.agentProvider,
+    abortState && abortState.agentModel,
+  );
 }
 
 // spawnSync blocks the Node event loop, so WebSocket pongs stop and the
@@ -1614,7 +1811,7 @@ async function vllmExecTool(name, input, cwd, abortState, send, allowedTools) {
         cwd: cwd || "/workspace",
         timeout,
         maxBuffer: 1024 * 1024,
-        env: vllmToolEnv(cwd),
+        env: vllmToolEnv(cwd, abortState),
         send,
         progressLabel: cmd.replace(/\s+/g, " ").slice(0, 90),
       }, abortState);
@@ -1639,7 +1836,7 @@ async function vllmExecTool(name, input, cwd, abortState, send, allowedTools) {
         cwd: cwd || "/workspace",
         timeout: 15000,
         maxBuffer: 512 * 1024,
-        env: vllmToolEnv(cwd),
+        env: vllmToolEnv(cwd, abortState),
       }, abortState);
       const files = (result.stdout || "").split("\n").filter(Boolean);
       const re = globToRegExp(pat);
@@ -1657,7 +1854,7 @@ async function vllmExecTool(name, input, cwd, abortState, send, allowedTools) {
           cwd: cwd || "/workspace",
           timeout: 20000,
           maxBuffer: 512 * 1024,
-          env: vllmToolEnv(cwd),
+          env: vllmToolEnv(cwd, abortState),
         },
         abortState
       );
@@ -1910,6 +2107,8 @@ async function runReviewTeamIsolated(teamName, task, cwd, parentSend, abortState
       cwd: cwd || "/workspace",
       max_turns: 12,
       allowed_tools: ["Read", "Glob", "Grep", "Write"],
+      // Same served model as the agent that started the team.
+      model: abortState && abortState.agentModel,
     }, (obj) => {
       if (!obj || typeof obj !== "object") return;
       if (obj.type === "result") text = obj.text || "";
@@ -2577,6 +2776,10 @@ function postJson(urlStr, { headers, body, timeoutMs, abortState }) {
 // next request start in parallel with the one still on the GPU.
 var gpuTickets = [];
 var gpuBusy = false;
+// After /stop or a deadline, a stream that never settles must not stay at
+// the head of the queue. 2s is long enough for req.destroy() to land and
+// short enough that the next agent is not stuck behind a dead one.
+var gpuAbortReleaseMs = 2000;
 
 // Mid-stream req.destroy() emits response 'close' (complete=false) and
 // not 'end'. A finished body emits 'end' then 'close' with complete=true.
@@ -2590,11 +2793,20 @@ function vllmResponseEvent(kind, complete, settled) {
 
 function gpuAgentName(abortState) {
   const sid = String((abortState && abortState.sessionId) || "");
-  const bare = sid.replace(/^[a-z0-9]+:/i, "");
-  const m = bare.match(/(?:^|-)ag-([a-z0-9]+)$/i);
-  if (m) return m[1];
+  // Provider prefixes stack (vllm:cron-…). Only a real Telegram main chat
+  // is @default. Bare cron jobs used to match nothing and were labeled
+  // @default, so /progress showed a queue behind an idle @default while
+  // morning_briefing / end_of_day held the GPU.
+  const bare = sid.replace(/^(?:[a-z0-9]+:)+/i, "");
+  const cronAgent = bare.match(/^cron-.+-ag-([a-z0-9]+)$/i);
+  if (cronAgent) return cronAgent[1];
+  const cronJob = bare.match(/^cron-(.+)$/i);
+  if (cronJob) return "cron-" + cronJob[1];
+  const agent = bare.match(/(?:^|-)ag-([a-z0-9]+)$/i);
+  if (agent) return agent[1];
   if (/orch-/i.test(sid)) return "orchestrator";
-  return "default";
+  if (bare === "" || bare === "default" || /^tg-\d+$/i.test(bare)) return "default";
+  return bare.slice(0, 48);
 }
 
 // i=0 && !running used to fall through to "queued 1 of 1 behind @self"
@@ -2662,6 +2874,34 @@ function abortInFlight(abortState) {
   const name = gpuAgentName(abortState);
   console.log(`[gpu-abort] @${name} tickets=${gpuTickets.length} busy=${gpuBusy}`);
   dropAbortedGpuTickets();
+  for (const t of gpuTickets) {
+    if (t.abortState === abortState && t.running) scheduleAbortedGpuRelease(t);
+  }
+}
+
+// cancel() rejects the HTTP promise when the socket is still ours. A prefill
+// that never emits a byte, or a destroy() that never fires 'close', leaves
+// the ticket running and gpuBusy true. Release it so the next agent can use
+// the 3090. The old request is destroyed again here; vLLM stops when the
+// client socket goes away.
+function scheduleAbortedGpuRelease(ticket) {
+  if (!ticket || ticket.forceTimer) return;
+  ticket.forceTimer = setTimeout(() => {
+    ticket.forceTimer = null;
+    const idx = gpuTickets.indexOf(ticket);
+    if (idx < 0) return;
+    const req = ticket.abortState && ticket.abortState.httpReq;
+    if (req && typeof req.destroy === "function") {
+      try { req.destroy(new Error("aborted")); } catch (_) { /* already dead */ }
+    }
+    gpuTickets.splice(idx, 1);
+    ticket.running = false;
+    if (!gpuTickets.some((t) => t.running)) gpuBusy = false;
+    ticket.fail(new Error("aborted"));
+    console.warn(`[gpu] released hung ticket @${gpuAgentName(ticket.abortState)}`);
+    broadcastGpuQueue();
+    pumpGpu();
+  }, gpuAbortReleaseMs);
 }
 
 function pumpGpu() {
@@ -2685,9 +2925,16 @@ function pumpGpu() {
       })
       .then((v) => ticket.succeed(v), (e) => ticket.fail(e))
       .finally(() => {
+        if (ticket.forceTimer) {
+          clearTimeout(ticket.forceTimer);
+          ticket.forceTimer = null;
+        }
         const idx = gpuTickets.indexOf(ticket);
         if (idx >= 0) gpuTickets.splice(idx, 1);
-        gpuBusy = false;
+        ticket.running = false;
+        // A force-released ticket's finally runs after the next job has
+        // already taken the GPU. Do not clear that job's busy flag.
+        if (!gpuTickets.some((t) => t.running)) gpuBusy = false;
         broadcastGpuQueue();
         pumpGpu();
       });
@@ -2725,6 +2972,9 @@ function enqueueVllm(fn, abortState) {
 }
 
 function resetGpuQueueForTests() {
+  for (const t of gpuTickets) {
+    if (t.forceTimer) clearTimeout(t.forceTimer);
+  }
   gpuTickets.length = 0;
   gpuBusy = false;
 }
@@ -2813,11 +3063,16 @@ function vllmChatStreamUnlocked(baseURL, auth, body, abortState, onDelta) {
     const settle = (err, value) => {
       if (settled) return;
       settled = true;
+      clearTimeout(wallTimer);
       disarm();
       if (err) reject(err);
       else resolve(value);
     };
     const fail = (err) => settle(err || new Error("aborted"));
+    // Node's req timeout is inactivity. A thinking stream resets it on every
+    // token, so one completion used to hold the 3090 until the process died.
+    const wallMs = parseInt(process.env.VLLM_STREAM_WALL_MS || "600000", 10) || 600000;
+    let wallTimer = null;
     console.log(`[vllm-stream] POST ${urlStr} bytes=${payload.length}`);
     const req = lib.request({
       hostname: u.hostname,
@@ -2884,6 +3139,11 @@ function vllmChatStreamUnlocked(baseURL, auth, body, abortState, onDelta) {
       };
       let firstByte = false;
       res.on("data", (chunk) => {
+        if (abortState && abortState.aborted) {
+          try { req.destroy(new Error("aborted")); } catch (_) { /* closing */ }
+          fail(new Error("aborted"));
+          return;
+        }
         if (!firstByte) {
           firstByte = true;
           console.log(`[vllm-stream] first byte after headers status=${res.statusCode}`);
@@ -2926,6 +3186,10 @@ function vllmChatStreamUnlocked(baseURL, auth, body, abortState, onDelta) {
       });
     });
     disarm = watchVllmRequest(req, abortState, fail);
+    wallTimer = setTimeout(() => {
+      try { req.destroy(new Error("vLLM stream wall clock")); } catch (_) { /* already closed */ }
+      fail(new Error("vLLM stream exceeded wall clock"));
+    }, wallMs);
     req.on("timeout", () => {
       try { req.destroy(new Error("vLLM request timed out")); } catch (_) {}
       fail(new Error("vLLM request timed out"));
@@ -2940,7 +3204,7 @@ function vllmChatStreamUnlocked(baseURL, auth, body, abortState, onDelta) {
   });
 }
 
-async function handleVllmAsk(msg, send, sharedAbort) {
+async function handleVllmAsk(msg, send, sharedAbort, ws) {
   const { session_id, prompt, cwd, max_turns, model, system_prompt, allowed_tools } = msg;
   if (!prompt) {
     send({ type: "error", error: "prompt is required" });
@@ -2948,6 +3212,8 @@ async function handleVllmAsk(msg, send, sharedAbort) {
   }
 
   const sessionId = session_id || "default";
+  // Unscoped cron sessions are "cron-<job>", not the Telegram @default chat.
+  const cronAsk = /(^|:)cron-/.test(String(sessionId));
   const isolated = /(?:^|:)orch-/.test(String(sessionId)) || Boolean(msg.isolated);
   const allowedTools = Array.isArray(allowed_tools) && allowed_tools.length ? allowed_tools : null;
   const workDir = cwd || DEFAULT_CWD;
@@ -2982,19 +3248,28 @@ async function handleVllmAsk(msg, send, sharedAbort) {
   const prior = activeRequests.get(sessionId);
   if (prior) markAborted(prior);
   const abortState = sharedAbort || { aborted: false };
+  // Local GPU work is tied to the socket that started it. DeepSeek is not.
+  abortState.localGpu = true;
+  // Bash and other tools this ask starts must keep this model.
+  abortState.agentProvider = "vllm";
+  abortState.agentModel = modelName;
+  if (ws) abortState.owner = ws;
   abortState.send = send;
   abortState.sessionId = sessionId;
   send({ type: "progress", tool: "model", input: "starting" });
   const keepalive = setInterval(() => send({ type: "heartbeat" }), 15000);
   activeRequests.set(sessionId, abortState);
-  const timeoutMs = parseInt(msg.timeout_ms, 10) || 0;
-  let timeoutTimer = null;
-  if (timeoutMs > 0) {
-    timeoutTimer = setTimeout(() => {
-      console.log(`[vllm-ask ${sessionId}] aborting after timeout_ms=${timeoutMs}`);
-      markAborted(abortState);
-    }, timeoutMs);
-  }
+  // Gateway cron cancels its waiter at 10 minutes and a Telegram turn at
+  // 120. The abort frame is best-effort. Without this timer the GPU call
+  // kept streaming and the queue still listed the job.
+  const askedTimeout = parseInt(msg.timeout_ms, 10) || 0;
+  const askBudget = askedTimeout > 0
+    ? askedTimeout
+    : (cronAsk ? 10 * 60 * 1000 : 120 * 60 * 1000);
+  const timeoutTimer = setTimeout(() => {
+    console.log(`[vllm-ask ${sessionId}] aborting after ${askBudget}ms`);
+    markAborted(abortState);
+  }, askBudget);
 
   console.log(
     `[vllm-ask ${sessionId}] agent ${baseURL}/v1/chat/completions model=${modelName} ` +
@@ -3306,7 +3581,9 @@ async function handleVllmAsk(msg, send, sharedAbort) {
       // Tools still running — don't treat a "Let me edit:" line as the answer.
       // Leave one extra model turn after tools so it can write a real close.
       // Isolated review agents must not grow past the requested cap.
-      if (!isolated && turn >= maxTurns - 1) {
+      // Cron must stop at its turn cap. Extending it let a briefing run
+      // dozens of extra GPU calls after the gateway had already given up.
+      if (!isolated && !cronAsk && turn >= maxTurns - 1) {
         maxTurns = Math.min(maxTurns + 3, 60);
       }
 
@@ -3390,9 +3667,11 @@ async function handleVllmAsk(msg, send, sharedAbort) {
         cache_read_input_tokens: 0,
       },
       context: {
-        tokens_used: inTok,
+        // Last prompt, not the sum of every tool round. The sum walks past
+        // the window and the next cron run looks like the context is full.
+        tokens_used: session.lastPromptTokens || 0,
         context_window: vllmContextLimit(),
-        usage_ratio_pct: Math.round((inTok / Math.max(1, vllmContextLimit() - maxOut)) * 100),
+        usage_ratio_pct: Math.round(((session.lastPromptTokens || 0) / Math.max(1, vllmContextLimit() - maxOut)) * 100),
       },
       ...(compaction && compaction.ok ? { compaction } : {}),
     });
@@ -3599,7 +3878,7 @@ async function consumeSdkQuery(prompt, options, bag) {
 
 // --- WebSocket Handlers ---
 
-async function handleAsk(msg, send) {
+async function handleAsk(msg, send, ws) {
   const { session_id, prompt, cwd, max_turns, system_prompt, allowed_tools, model, provider } = msg;
 
   if (!prompt) {
@@ -3608,19 +3887,25 @@ async function handleAsk(msg, send) {
   }
 
   if (provider === "grok") {
-    await handleGrokAsk(msg, send);
+    await handleGrokAsk(msg, send, ws);
     return;
   }
 
   // Claude Code's own system prompt + hooks + CLAUDE.md cannot fit in
   // vLLM window. Talk to /v1/chat/completions directly.
   if (provider === "vllm") {
-    await handleVllmAsk(msg, send);
+    await handleVllmAsk(msg, send, undefined, ws);
     return;
   }
 
   const sessionId = session_id || "default";
-  const workDir = cwd || DEFAULT_CWD;
+  let workDir;
+  try {
+    workDir = prepareWorkDir(cwd || DEFAULT_CWD);
+  } catch (err) {
+    send({ type: "error", error: err.message });
+    return;
+  }
   const session = sessions.get(sessionId);
 
   // If a previous compaction queued a summary, prepend it to this prompt.
@@ -3647,7 +3932,10 @@ async function handleAsk(msg, send) {
   let sdkSessionId = null;
   let usage = {};
   let apiModel = "";
-  const abortState = { aborted: false };
+  // owner is the gateway socket that started this turn. A different
+  // provider's socket closing must not set aborted — that is what turned
+  // a reconnect into "(Stopped by user)" on every DeepSeek agent at once.
+  const abortState = { aborted: false, owner: ws };
   activeRequests.set(sessionId, abortState);
 
   try {
@@ -3740,6 +4028,9 @@ async function handleAsk(msg, send) {
     if (!isolated) {
       options.env.CLAUDE_GATEWAY_SKIP_GO_HOOK = "1";
     }
+    // Bash this ask starts (the content pipeline, quality control, repair)
+    // reads these and must not pick a different model.
+    stampChildModelEnv(options.env, provider, options.model || model);
     // Claude Code's default sandbox isolates GOCACHE and still uses
     // GOTOOLCHAIN=auto against go.dev — `go test` then "hangs" at startup.
     options.sandbox = { enabled: false };
@@ -3759,6 +4050,16 @@ async function handleAsk(msg, send) {
         send({ type: "progress", text: clean.slice(0, 300) });
       }
     };
+
+    const claudeBin = await resolveClaudeExecutable();
+    if (!claudeBin.path) {
+      throw new Error(
+        "Claude Code native binary failed to launch. " +
+        (claudeBin.failures.join("; ") || "no candidate binary")
+      );
+    }
+    await assertClaudeLaunch(claudeBin.path, workDir);
+    options.pathToClaudeCodeExecutable = claudeBin.path;
 
     // DeepSeek/Claude Code stops at maxTurns (40 from Telegram) and that
     // used to be the whole reply. Resume the same session and keep working.
@@ -3948,6 +4249,13 @@ async function handleAsk(msg, send) {
       return;
     }
 
+    if (err && typeof err.message === "string" && err.message.includes("failed to launch")) {
+      let exists = false;
+      try { exists = fs.statSync(workDir).isDirectory(); } catch { exists = false; }
+      if (!exists) {
+        err.message = `Working directory does not exist: ${workDir}. Claude Code reports that as a native-binary libc mismatch.`;
+      }
+    }
     console.error(`[ws-ask ${sessionId}] error:`, err.message);
     if (err.stderr) console.error(`  stderr: ${err.stderr}`);
     if (err.stack) console.error(`  stack: ${err.stack}`);
@@ -3961,7 +4269,7 @@ async function handleAsk(msg, send) {
   }
 }
 
-async function handleGrokAsk(msg, send) {
+async function handleGrokAsk(msg, send, ws) {
   const { session_id, prompt, cwd, system_prompt, model, allowed_tools } = msg;
   const sessionId = session_id || "default";
   const isolated = /(?:^|:)orch-/.test(String(sessionId)) || Boolean(msg.isolated);
@@ -3992,7 +4300,7 @@ async function handleGrokAsk(msg, send) {
     send({ type: "heartbeat" });
   }, 15000);
 
-  const abortState = { aborted: false, child: null };
+  const abortState = { aborted: false, child: null, owner: ws };
   activeRequests.set(sessionId, abortState);
 
   if (isolated) {
@@ -4026,7 +4334,7 @@ async function handleGrokAsk(msg, send) {
     const text = await new Promise((resolve, reject) => {
       const child = spawn("grok", args, {
         cwd: workDir,
-        env: grokSubscriptionEnv(),
+        env: stampChildModelEnv(grokSubscriptionEnv(), "grok", effectiveModel),
         stdio: ["ignore", "pipe", "pipe"],
       });
       abortState.child = child;
@@ -4119,7 +4427,7 @@ async function handleGrokAsk(msg, send) {
     });
   } catch (err) {
     console.error(`[ws-ask ${sessionId}] grok-cli error:`, err.message);
-    send({ type: "error", error: err.message, is_rate_limited: is429(err.message) });
+    send({ type: "error", error: grokSignInError(err.message), is_rate_limited: is429(err.message) });
   } finally {
     clearInterval(keepalive);
     activeRequests.delete(sessionId);
@@ -4127,7 +4435,7 @@ async function handleGrokAsk(msg, send) {
   }
 }
 
-async function handleRunAgent(msg, send) {
+async function handleRunAgent(msg, send, ws) {
   const { prompt, system_prompt, cwd, allowed_tools, timeout_ms, model, provider } = msg;
 
   if (!prompt) {
@@ -4136,7 +4444,7 @@ async function handleRunAgent(msg, send) {
   }
 
   if (provider === "grok") {
-    await handleGrokAsk(msg, send);
+    await handleGrokAsk(msg, send, ws);
     return;
   }
   if (provider === "vllm") {
@@ -4147,7 +4455,7 @@ async function handleRunAgent(msg, send) {
       max_turns: msg.max_turns || 12,
     };
     sessions.delete(isolated.session_id);
-    await handleVllmAsk(isolated, send);
+    await handleVllmAsk(isolated, send, undefined, ws);
     sessions.delete(isolated.session_id);
     return;
   }
@@ -4180,6 +4488,7 @@ async function handleRunAgent(msg, send) {
     workDir,
   );
   childEnv.PWD = workDir;
+  stampChildModelEnv(childEnv, provider, effectiveModel);
 
   console.log(`[ws-agent] Spawning isolated process (cwd: ${workDir}, model: ${effectiveModel || "default"}, provider: ${provider || "claude"}, timeout: ${timeoutMs}ms)`);
 
@@ -4264,6 +4573,8 @@ async function runCompaction(opts) {
   } else if (model) {
     queryOptions.model = model;
   }
+  const claudeBin = await resolveClaudeExecutable();
+  if (claudeBin.path) queryOptions.pathToClaudeCodeExecutable = claudeBin.path;
 
   let summaryText = "";
   try {
@@ -4471,6 +4782,23 @@ app.get("/sessions", (_req, res) => {
 
 // --- Server Setup ---
 
+// --- ws-close-test-start ---
+// One gateway process opens a socket per provider (claude, deepseek, grok,
+// qwen). Closing one must not stop the others. DeepSeek/Claude/Grok jobs
+// are not socket-tied: a reconnect is not a user /stop. Only a local GPU
+// turn owned by the closed socket is aborted, otherwise the 3090 keeps
+// generating for a client that has gone.
+function requestsToAbortOnClose(activeRequests, closedWs) {
+  const out = [];
+  if (!activeRequests || !closedWs) return out;
+  for (const [sid, st] of activeRequests) {
+    if (!st || st.owner !== closedWs) continue;
+    if (st.localGpu) out.push(sid);
+  }
+  return out;
+}
+// --- ws-close-test-end ---
+
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
@@ -4478,7 +4806,7 @@ wss.on("connection", (ws) => {
   console.log("Gateway connected via WebSocket");
   ws.isAlive = true;
 
-  ws.on("pong", () => { ws.isAlive = true; });
+  ws.on("pong", () => { ws.isAlive = true; ws.missedPongs = 0; });
 
   ws.on("message", (raw) => {
     let msg;
@@ -4502,8 +4830,8 @@ wss.on("connection", (ws) => {
     const handle = async () => {
       try {
         switch (type) {
-          case "ask": await handleAsk(msg, send); break;
-          case "run-agent": await handleRunAgent(msg, send); break;
+          case "ask": await handleAsk(msg, send, ws); break;
+          case "run-agent": await handleRunAgent(msg, send, ws); break;
           case "reset": handleReset(msg, send); break;
           case "check-session": handleCheckSession(msg, send); break;
           case "compact": await handleCompact(msg, send); break;
@@ -4542,19 +4870,27 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    console.log("Gateway disconnected");
-    for (const [sid, st] of activeRequests) {
-      markAborted(st);
+    const victims = requestsToAbortOnClose(activeRequests, ws);
+    console.log(`Gateway socket closed; stopping ${victims.length} local-gpu request(s). DeepSeek/Claude/Grok sessions keep running.`);
+    for (const sid of victims) {
+      markAborted(activeRequests.get(sid));
       console.log(`[ws-close] aborted in-flight ${sid}`);
     }
   });
   ws.on("error", (err) => { console.error("WebSocket error:", err.message); });
 });
 
-// Ping all clients every 30s to detect dead connections
+// Ping all clients every 30s. One missed pong used to terminate the socket,
+// and the close handler then aborted every in-flight agent. Three misses
+// (about 90s) is a dead socket. Live DeepSeek turns survive a single stall.
 const pingInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
-    if (!ws.isAlive) return ws.terminate();
+    if (!ws.isAlive) {
+      ws.missedPongs = (ws.missedPongs || 0) + 1;
+      if (ws.missedPongs >= 3) return ws.terminate();
+    } else {
+      ws.missedPongs = 0;
+    }
     ws.isAlive = false;
     ws.ping();
   });
@@ -4581,6 +4917,9 @@ httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`  HTTP:      http://0.0.0.0:${PORT}/health`);
   console.log(`  WebSocket: ws://0.0.0.0:${PORT}/ws`);
   console.log(`  Work dir:  ${DEFAULT_CWD}`);
+  resolveClaudeExecutable().catch((err) => {
+    console.error(`[claude-bin] probe failed: ${err.message}`);
+  });
   logProviderKeysAtBoot();
   const hs = loadHarnessSkills();
   console.log(`[harness] ${hs.length} skill(s) from ${HARNESS_SKILLS_DIR} always=${hs.filter((s) => s.always).map((s) => s.name).join(",") || "none"}`);
@@ -4592,7 +4931,9 @@ httpServer.listen(PORT, "0.0.0.0", () => {
   );
 });
 
-httpServer.timeout = 3600000;
+// timeout is inactivity on the HTTP socket. A non-zero value cuts a
+// WebSocket out from under a long DeepSeek turn (the bot allows 120 min).
+httpServer.timeout = 0;
 httpServer.requestTimeout = 0;
 httpServer.headersTimeout = 120000;
 httpServer.keepAliveTimeout = 30000;

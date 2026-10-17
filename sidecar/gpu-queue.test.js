@@ -12,7 +12,7 @@ if (start < 0 || end < start) {
 }
 
 function loadQueue() {
-  const ctx = vm.createContext({ console });
+  const ctx = vm.createContext({ console, setTimeout, clearTimeout });
   vm.runInContext(src.slice(start, end), ctx);
   return ctx;
 }
@@ -133,6 +133,37 @@ test("a stopped waiter is removed so a newer job is not queued behind it", async
   await assert.rejects(waiting, /aborted/);
   assert.equal(await fresh, "fresh");
   assert.match(freshLines.at(-1), /GPU: generating \(@agentcreator\)/);
+});
+
+test("cron jobs are not labeled @default", () => {
+  const q = loadQueue();
+  const name = (sessionId) => q.gpuAgentName({ sessionId });
+  assert.equal(name("vllm:cron-end_of_day"), "cron-end_of_day");
+  assert.equal(name("vllm:cron-morning_briefing"), "cron-morning_briefing");
+  assert.equal(name("vllm:cron-home_solar_battery-ag-homesolar"), "homesolar");
+  assert.equal(name("vllm:tg-42"), "default");
+  assert.equal(name("vllm:tg-42-ag-homesolar"), "homesolar");
+  assert.notEqual(name("vllm:cron-end_of_day"), "default");
+});
+
+test("a hung generation does not stay in front after abort", async () => {
+  const q = loadQueue();
+  q.resetGpuQueueForTests();
+  q.gpuAbortReleaseMs = 30;
+  const hungState = agent("greydocs", []);
+  const hanging = q.enqueueVllm(() => new Promise(() => {}), hungState);
+  await new Promise((r) => setImmediate(r));
+  q.abortInFlight(hungState);
+  const lines = [];
+  const next = q.enqueueVllm(() => Promise.resolve("next"), agent("homesolar", lines));
+  const result = await Promise.race([
+    next,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("still behind hung job")), 500)),
+  ]);
+  assert.equal(result, "next");
+  await assert.rejects(hanging, /aborted/);
+  assert.equal(q.gpuTickets.length, 0);
+  assert.equal(q.gpuBusy, false);
 });
 
 test("only one vLLM call runs at a time", async () => {

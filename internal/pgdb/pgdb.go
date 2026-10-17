@@ -114,6 +114,22 @@ type Conversation struct {
 const conversationSelect = `c.id, c.session_id, c.role, c.content, COALESCE(c.token_estimate, 0), c.created_at, COALESCE(c.agent_id, 0), COALESCE(a.handle, '')`
 const conversationFrom = `conversations c LEFT JOIN agents a ON a.id = c.agent_id`
 
+// Used when startup could not add conversations.agent_id (gateway is not
+// the table owner). Same scan shape as conversationSelect: agent id 0 and
+// an empty handle. Referencing the missing column makes every history read
+// fail and the next prompt goes out with no prior turns.
+const conversationSelectNoAgent = `c.id, c.session_id, c.role, c.content, COALESCE(c.token_estimate, 0), c.created_at, 0::bigint, ''::text`
+const conversationFromNoAgent = `conversations c`
+
+// conversationSQL returns the SELECT list and FROM clause that match the
+// live schema. Callers must keep using scanConversation's column order.
+func (d *DB) conversationSQL() (selectList, from string) {
+	if d.agentCol {
+		return conversationSelect, conversationFrom
+	}
+	return conversationSelectNoAgent, conversationFromNoAgent
+}
+
 func scanConversation(s interface{ Scan(...any) error }) (Conversation, error) {
 	var c Conversation
 	err := s.Scan(&c.ID, &c.SessionID, &c.Role, &c.Content, &c.TokenEstimate, &c.CreatedAt, &c.AgentID, &c.AgentHandle)
@@ -285,9 +301,10 @@ func (d *DB) RecentConversations(ctx context.Context, sessionID string, limit in
 	if limit <= 0 {
 		return nil, nil
 	}
+	cols, from := d.conversationSQL()
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT `+conversationSelect+`
-		 FROM `+conversationFrom+`
+		`SELECT `+cols+`
+		 FROM `+from+`
 		 WHERE c.session_id = $1
 		 ORDER BY c.created_at DESC
 		 LIMIT $2`,
@@ -317,9 +334,10 @@ func (d *DB) RecentConversationsAllSessions(ctx context.Context, limit int) ([]C
 	if limit <= 0 {
 		return nil, nil
 	}
+	cols, from := d.conversationSQL()
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT `+conversationSelect+`
-		 FROM `+conversationFrom+`
+		`SELECT `+cols+`
+		 FROM `+from+`
 		 ORDER BY c.created_at DESC
 		 LIMIT $1`,
 		limit,
@@ -347,9 +365,10 @@ func (d *DB) ConversationsByDate(ctx context.Context, date string) ([]Conversati
 	if _, err := time.Parse("2006-01-02", date); err != nil {
 		return nil, fmt.Errorf("conversations by date: invalid date %q: %w", date, err)
 	}
+	cols, from := d.conversationSQL()
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT `+conversationSelect+`
-		 FROM `+conversationFrom+`
+		`SELECT `+cols+`
+		 FROM `+from+`
 		 WHERE c.created_at::date = $1::date
 		 ORDER BY c.created_at ASC`,
 		date,
@@ -402,10 +421,11 @@ func (d *DB) SearchSimilar(ctx context.Context, embedding []float32, excludeIDs 
 		args = append(args, sessionID)
 	}
 
+	cols, from := d.conversationSQL()
 	query := fmt.Sprintf(
-		`SELECT `+conversationSelect+`,
+		`SELECT `+cols+`,
 		        1 - (c.embedding <=> $1::vector) AS similarity
-		 FROM `+conversationFrom+`
+		 FROM `+from+`
 		 WHERE c.embedding IS NOT NULL
 		   AND 1 - (c.embedding <=> $1::vector) >= $3%s%s
 		 ORDER BY c.embedding <=> $1::vector

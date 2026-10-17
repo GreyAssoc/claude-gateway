@@ -9,63 +9,143 @@ import (
 	"github.com/you/claude-gateway/internal/agent"
 )
 
-func TestCanProceed_UnderLimits(t *testing.T) {
+func TestAdmit_UnderLimits(t *testing.T) {
 	l := New(50, 40000, 8000, 0.85)
-
-	if !l.CanProceed(1000) {
-		t.Error("Expected CanProceed=true when no usage recorded")
+	d := l.Admit(Scope{Framework: "deepseek", SessionID: "a", Model: "deepseek-v4-pro"}, 1000)
+	if !d.OK {
+		t.Error("Expected admit when no usage recorded")
+	}
+	if d.Usage.ContextWindow != 128_000 {
+		t.Errorf("window = %d, want 128000", d.Usage.ContextWindow)
 	}
 }
 
-func TestCanProceed_OverRPM(t *testing.T) {
-	l := New(10, 40000, 8000, 1.0) // margin=1.0 for simpler math
-
-	// Record 10 requests
+func TestAdmit_OverRPM(t *testing.T) {
+	l := New(10, 40000, 8000, 1.0)
+	scope := Scope{Framework: "claude", SessionID: "s", Model: "claude-opus-4-6"}
 	for i := 0; i < 10; i++ {
-		l.Record(&agent.Usage{InputTokens: 100, OutputTokens: 50})
+		l.Record(scope, &agent.Usage{InputTokens: 100, OutputTokens: 50}, nil, true)
 	}
-
-	if l.CanProceed(100) {
-		t.Error("Expected CanProceed=false after exceeding RPM")
+	d := l.Admit(scope, 100)
+	if d.OK || d.Reason != ReasonRPM {
+		t.Fatalf("admit = %+v, want RPM block", d)
 	}
 }
 
-func TestCanProceed_OverITPM(t *testing.T) {
-	l := New(100, 1000, 8000, 1.0)
+func TestAdmit_ContextIsThisConversationOnly(t *testing.T) {
+	l := New(100, 80_000, 16_000, 0.90)
+	deepseek := Scope{Framework: "deepseek", SessionID: "tg-forex", Model: "deepseek-v4-pro"}
+	grok := Scope{Framework: "grok", SessionID: "tg-research", Model: "grok-4.5"}
+	otherDeepseek := Scope{Framework: "deepseek", SessionID: "tg-grey", Model: "deepseek-v4-pro"}
 
-	l.Record(&agent.Usage{InputTokens: 500, OutputTokens: 50})
+	// Sidecar summed every tool round into input_tokens (88555) and counted
+	// thinking in output (49309). Context occupancy of this one prompt is 40k.
+	// The sum must not become the counter, and it must not land on grok.
+	l.Record(deepseek, &agent.Usage{InputTokens: 88555, OutputTokens: 49309}, &agent.ContextStatus{
+		TokensUsed:    40_000,
+		ContextWindow: 128_000,
+	}, true)
 
-	// 500 existing + 600 estimated = 1100 > 1000
-	if l.CanProceed(600) {
-		t.Error("Expected CanProceed=false when estimated ITPM exceeds limit")
+	got := l.Admit(deepseek, 1000)
+	if !got.OK {
+		t.Fatalf("deepseek blocked: %+v", got)
+	}
+	if got.Usage.ContextTokens != 40_000 || got.Usage.ContextWindow != 128_000 {
+		t.Fatalf("deepseek usage = %+v, want 40000/128000", got.Usage)
+	}
+	if got.Usage.OutputTokens != 49309 {
+		t.Fatalf("output = %d, want this turn's 49309", got.Usage.OutputTokens)
 	}
 
-	// 500 existing + 400 estimated = 900 < 1000
-	if !l.CanProceed(400) {
-		t.Error("Expected CanProceed=true when estimated ITPM is under limit")
+	other := l.Admit(grok, 1000)
+	if !other.OK || other.Usage.ContextTokens != 0 || other.Usage.ContextWindow != 2_000_000 {
+		t.Fatalf("grok should be an empty 2M window, got %+v", other)
+	}
+
+	l.Record(otherDeepseek, &agent.Usage{InputTokens: 90_000, OutputTokens: 10_000}, &agent.ContextStatus{
+		TokensUsed:    90_000,
+		ContextWindow: 128_000,
+	}, true)
+	// 90k stays on that session. The forex session is still 40k, not 130k.
+	forex := l.Admit(deepseek, 1000)
+	if forex.Usage.ContextTokens != 40_000 {
+		t.Fatalf("forex context = %d, want 40000 (not pooled with the other deepseek agent)", forex.Usage.ContextTokens)
+	}
+	grey := l.Admit(otherDeepseek, 1000)
+	if !grey.OK || grey.Usage.ContextTokens != 90_000 {
+		t.Fatalf("grey = %+v", grey)
+	}
+}
+
+func TestAdmit_ReplacesInsteadOfSummingRounds(t *testing.T) {
+	l := New(100, 80_000, 16_000, 1)
+	scope := Scope{Framework: "deepseek", SessionID: "s", Model: "deepseek-v4-pro"}
+	l.Record(scope, nil, &agent.ContextStatus{TokensUsed: 50_000, ContextWindow: 128_000}, true)
+	l.Record(scope, nil, &agent.ContextStatus{TokensUsed: 60_000, ContextWindow: 128_000}, true)
+	d := l.Admit(scope, 0)
+	if d.Usage.ContextTokens != 60_000 {
+		t.Fatalf("context = %d, want 60000 replaced, not 110000 summed", d.Usage.ContextTokens)
+	}
+}
+
+func TestAdmit_BlocksOnlyTheFullConversation(t *testing.T) {
+	l := New(100, 80_000, 16_000, 0.90)
+	full := Scope{Framework: "deepseek", SessionID: "full", Model: "deepseek-v4-pro"}
+	open := Scope{Framework: "deepseek", SessionID: "open", Model: "deepseek-v4-pro"}
+	l.Record(full, nil, &agent.ContextStatus{TokensUsed: 120_000, ContextWindow: 128_000}, true)
+	l.Record(open, nil, &agent.ContextStatus{TokensUsed: 10_000, ContextWindow: 128_000}, true)
+
+	blocked := l.Admit(full, 1000)
+	if blocked.OK || blocked.Reason != ReasonContext {
+		t.Fatalf("full conversation = %+v, want context block", blocked)
+	}
+	allowed := l.Admit(open, 1000)
+	if !allowed.OK || allowed.Usage.ContextTokens != 10_000 {
+		t.Fatalf("other deepseek conversation should proceed, got %+v", allowed)
+	}
+}
+
+func TestAdmit_QwenDoesNotConsumeRPM(t *testing.T) {
+	l := New(1, 80_000, 16_000, 1)
+	qwen := Scope{Framework: "qwen", SessionID: "local", Model: "qwen3.8-27b"}
+	l.Record(qwen, &agent.Usage{InputTokens: 150_000, OutputTokens: 20_000}, &agent.ContextStatus{
+		TokensUsed:    150_000,
+		ContextWindow: 131_072,
+	}, false)
+	if d := l.Admit(qwen, 1000); !d.OK {
+		t.Fatalf("qwen should be unlimited, got %+v", d)
+	}
+	paid := Scope{Framework: "deepseek", SessionID: "paid", Model: "deepseek-v4-pro"}
+	if d := l.Admit(paid, 1000); !d.OK {
+		t.Fatalf("qwen tokens blocked deepseek: %+v", d)
+	}
+	if s := l.GetStatus(); s.RPM != "0/1" {
+		t.Fatalf("RPM = %s, want 0/1", s.RPM)
 	}
 }
 
 func TestRecord_NilUsage(t *testing.T) {
 	l := New(50, 40000, 8000, 0.85)
-
-	// Should not panic
-	l.Record(nil)
+	l.Record(Scope{}, nil, nil, true)
 }
 
 func TestGetStatus(t *testing.T) {
 	l := New(50, 40000, 8000, 0.85)
-	l.Record(&agent.Usage{InputTokens: 1000, OutputTokens: 200})
+	l.Record(Scope{Framework: "grok", SessionID: "s", Model: "grok-4.5"}, &agent.Usage{InputTokens: 1000, OutputTokens: 200}, nil, true)
 
 	s := l.GetStatus()
 	if s.RPM != "1/50" {
 		t.Errorf("RPM = %q, want 1/50", s.RPM)
 	}
-	if s.ITPM != "1000/40000" {
-		t.Errorf("ITPM = %q, want 1000/40000", s.ITPM)
+	if s.ITPM != "per-conversation" || s.OTPM != "per-conversation" {
+		t.Errorf("token fields = %q %q, want per-conversation", s.ITPM, s.OTPM)
 	}
-	if s.OTPM != "200/8000" {
-		t.Errorf("OTPM = %q, want 200/8000", s.OTPM)
+	if len(s.Conversations) != 1 {
+		t.Fatalf("conversations = %d, want 1", len(s.Conversations))
+	}
+	c := s.Conversations[0]
+	if c.ContextTokens != 1000 || c.OutputTokens != 200 || c.ContextWindow != 2_000_000 {
+		t.Errorf("conversation = %+v", c)
 	}
 	if s.Headroom <= 0 || s.Headroom > 1 {
 		t.Errorf("Headroom = %f, want between 0 and 1", s.Headroom)
@@ -93,29 +173,33 @@ func TestEnqueue_RespectsMaxQueue(t *testing.T) {
 func TestWindowReset(t *testing.T) {
 	l := New(10, 40000, 8000, 1.0)
 
-	// Record to fill RPM
+	scope := Scope{Framework: "claude", SessionID: "s", Model: "claude-opus-4-6"}
 	for i := 0; i < 10; i++ {
-		l.Record(&agent.Usage{InputTokens: 100, OutputTokens: 50})
+		l.Record(scope, &agent.Usage{InputTokens: 100, OutputTokens: 50}, nil, true)
 	}
 
-	if l.CanProceed(100) {
-		t.Error("Expected CanProceed=false when at RPM limit")
+	if l.Admit(scope, 100).OK {
+		t.Error("Expected admit=false when at RPM limit")
 	}
 
-	// Manually set window start to >1 min ago to force reset
+	// RPM window expires. The conversation's context figure must stay.
 	l.mu.Lock()
 	l.windowStart = time.Now().Add(-2 * time.Minute)
 	l.mu.Unlock()
 
-	if !l.CanProceed(100) {
-		t.Error("Expected CanProceed=true after window reset")
+	d := l.Admit(scope, 100)
+	if !d.OK {
+		t.Error("Expected admit=true after RPM window reset")
+	}
+	if d.Usage.ContextTokens != 100 {
+		t.Errorf("context = %d, want 100 kept across the RPM reset", d.Usage.ContextTokens)
 	}
 }
 
 func TestDropQueuedFor(t *testing.T) {
 	l := New(1, 40000, 8000, 1.0)
-	l.Record(&agent.Usage{InputTokens: 100, OutputTokens: 50})
-	if l.CanProceed(100) {
+	l.Record(Scope{Framework: "claude", SessionID: "s"}, &agent.Usage{InputTokens: 100, OutputTokens: 50}, nil, true)
+	if l.Admit(Scope{Framework: "claude", SessionID: "s"}, 100).OK {
 		t.Fatal("need a full window so enqueue is used")
 	}
 	fired := 0
@@ -188,7 +272,7 @@ func TestClose_WaitsForDBWriteLoop(t *testing.T) {
 
 	// Record several snapshots to fill the channel
 	for i := 0; i < 5; i++ {
-		l.Record(&agent.Usage{InputTokens: 100, OutputTokens: 50})
+		l.Record(Scope{Framework: "claude", SessionID: "s"}, &agent.Usage{InputTokens: 100, OutputTokens: 50}, nil, true)
 	}
 
 	// Close must wait for the dbWriteLoop goroutine to drain
@@ -210,7 +294,7 @@ func TestClose_ConcurrentAccess(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < 50; i++ {
-			l.Record(&agent.Usage{InputTokens: 10, OutputTokens: 5})
+			l.Record(Scope{Framework: "claude", SessionID: "s"}, &agent.Usage{InputTokens: 10, OutputTokens: 5}, nil, true)
 		}
 	}()
 

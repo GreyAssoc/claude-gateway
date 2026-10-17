@@ -100,6 +100,25 @@ func TestPruneAutoFactsKeepMaxGuard(t *testing.T) {
 	}
 }
 
+// TestConversationSQLOmitsAgentColumnWhenMissing verifies history reads do not
+// reference conversations.agent_id unless that column was migrated.
+func TestConversationSQLOmitsAgentColumnWhenMissing(t *testing.T) {
+	missing := &DB{}
+	cols, from := missing.conversationSQL()
+	if strings.Contains(cols, "agent_id") || strings.Contains(from, "agent_id") {
+		t.Fatalf("missing-column query references agent_id: SELECT %s FROM %s", cols, from)
+	}
+	if !strings.Contains(cols, "0::bigint") || !strings.Contains(cols, "''::text") {
+		t.Fatalf("missing-column query must keep scan shape, got %s", cols)
+	}
+
+	present := &DB{agentCol: true}
+	cols, from = present.conversationSQL()
+	if !strings.Contains(cols, "c.agent_id") || !strings.Contains(from, "c.agent_id") {
+		t.Fatalf("agent query missing agent_id: SELECT %s FROM %s", cols, from)
+	}
+}
+
 // TestRecentConversationsLimitGuard verifies that non-positive limits return nil.
 func TestRecentConversationsLimitGuard(t *testing.T) {
 	d := &DB{} // nil inner db — only guard path runs

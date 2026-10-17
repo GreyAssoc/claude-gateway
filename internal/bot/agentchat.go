@@ -368,7 +368,7 @@ func (b *Bot) switchMessage(chatID int64, slot agentSlot) string {
 	fw := b.frameworkFor(chatID, slot)
 	fmt.Fprintf(&bld, "\nModel: %s (`%s`)", frameworkLabel(fw), b.modelForFramework(fw))
 	if ov := b.slotFrameworkOverride(chatID, slot.Key); ov != "" {
-		bld.WriteString(" — this chat only")
+		bld.WriteString(" — selected for this agent; processes it starts use the same model")
 	} else if slot.Framework != "" {
 		bld.WriteString(" — pinned in agent YAML")
 	} else {
@@ -390,7 +390,7 @@ func (b *Bot) switchMessage(chatID int64, slot agentSlot) string {
 	} else {
 		bld.WriteString("\nMessages without @ go to this agent. @AnotherName switches. /default or @default returns to the main assistant.")
 	}
-	bld.WriteString("\n/models or /framework here change this agent only.")
+	bld.WriteString("\n/models or /framework here change this agent and every process it starts.")
 	return bld.String()
 }
 
@@ -427,15 +427,20 @@ func (b *Bot) slotFrameworkOverride(chatID int64, slotKey string) string {
 func (b *Bot) setSlotFramework(chatID int64, slotKey, fw string) {
 	key := reqKey(chatID, slotKey)
 	b.slotFWMu.Lock()
-	defer b.slotFWMu.Unlock()
 	if b.slotFW == nil {
 		b.slotFW = make(map[string]string)
 	}
 	if fw == "" {
 		delete(b.slotFW, key)
-		return
+	} else {
+		b.slotFW[key] = fw
 	}
-	b.slotFW[key] = fw
+	snap := make(map[string]string, len(b.slotFW))
+	for k, v := range b.slotFW {
+		snap[k] = v
+	}
+	b.slotFWMu.Unlock()
+	b.writeAgentModels(snap)
 }
 
 func (b *Bot) frameworkFor(chatID int64, turn agentSlot) string {

@@ -33,8 +33,12 @@ func (d *DB) EnsureSchema(ctx context.Context) error {
 	}
 	// No FK: conversations is often owned by the postgres superuser, and
 	// REFERENCES would make this ALTER fail and (previously) kill startup.
+	// A non-owner still gets 42501 from ADD COLUMN IF NOT EXISTS even when
+	// the column is already there, so only log when it is actually missing.
 	if _, err := d.db.ExecContext(ctx, `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS agent_id INT`); err != nil {
-		log.Printf("pgdb: add conversations.agent_id: %v", err)
+		if !d.hasAgentColumn(ctx) {
+			log.Printf("pgdb: add conversations.agent_id: %v", err)
+		}
 	} else if _, err := d.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_conv_agent ON conversations (agent_id)`); err != nil {
 		log.Printf("pgdb: idx_conv_agent: %v", err)
 	}

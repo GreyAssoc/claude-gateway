@@ -166,15 +166,15 @@ func TestLoadChatAgentPinsForexProject(t *testing.T) {
 		t.Fatalf("agent-creator must not inherit a project path, got %q", creator.ProjectPath)
 	}
 
-	if ag.Framework != "qwen" {
-		t.Fatalf("forex-trading framework = %q, want qwen", ag.Framework)
+	if ag.Framework != "" {
+		t.Fatalf("forex-trading framework = %q, want empty so Qwen stays the gateway default", ag.Framework)
 	}
 	em, ok := m.GetChatAgent("grey-email")
 	if !ok {
 		t.Fatal("expected grey-email")
 	}
-	if em.Framework != "qwen" {
-		t.Fatalf("grey-email framework = %q, want qwen", em.Framework)
+	if em.Framework != "" {
+		t.Fatalf("grey-email framework = %q, want empty so Qwen stays the gateway default", em.Framework)
 	}
 }
 

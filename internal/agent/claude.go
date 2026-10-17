@@ -316,6 +316,7 @@ func (c *Client) AskWithOptions(ctx context.Context, opts AskOptions) (*Response
 		AllowedTools: opts.AllowedTools,
 		Model:        c.wireModel(opts.Model),
 		Provider:     c.provider,
+		TimeoutMs:    deadlineTimeoutMS(ctx),
 	}
 
 	if err := c.writeJSONRetry(req); err != nil {
@@ -376,6 +377,7 @@ func (c *Client) AskStreaming(ctx context.Context, opts AskOptions, onProgress f
 		AllowedTools: opts.AllowedTools,
 		Model:        c.wireModel(opts.Model),
 		Provider:     c.provider,
+		TimeoutMs:    deadlineTimeoutMS(ctx),
 	}
 
 	if err := c.writeJSONRetry(req); err != nil {
@@ -472,6 +474,25 @@ func (c *Client) RunIsolatedAgent(ctx context.Context, opts RunAgentOptions) (*R
 			}
 		}
 	}
+}
+
+// deadlineTimeoutMS is the caller's remaining budget. The sidecar aborts
+// a Qwen turn when it expires, so a cron job cannot keep the GPU after the
+// gateway waiter has already returned.
+func deadlineTimeoutMS(ctx context.Context) int {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	ms := time.Until(deadline).Milliseconds()
+	if ms < 1 {
+		return 1
+	}
+	const day = int64(24 * time.Hour / time.Millisecond)
+	if ms > day {
+		return int(day)
+	}
+	return int(ms)
 }
 
 // AbortSession sends a fire-and-forget abort message to the sidecar, asking it
@@ -709,10 +730,13 @@ func (c *Client) dial() error {
 		return err
 	}
 
-	// Set generous read deadline — refreshed on every pong
-	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	// Read deadline covers a stalled socket. It is refreshed on every
+	// message (DeepSeek heartbeats are every 15s) and on every pong.
+	// 90s was short enough that a late pong during a long turn dropped
+	// the socket and the sidecar reported "(Stopped by user)".
+	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		return conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	})
 
 	// Close old connection and signal old goroutines to exit
@@ -742,12 +766,29 @@ func (c *Client) dial() error {
 	return nil
 }
 
+// releaseReadLoop reports whether this readLoop still owns the live socket.
+// dial() swaps c.conn and then closes the old socket, so the old loop wakes
+// up after the replacement is already current. That loop must not fail
+// in-flight requests or reconnect again — a second close was enough to make
+// the sidecar abort every provider's session at once.
+func (c *Client) releaseReadLoop(conn *websocket.Conn) bool {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	if c.conn != conn {
+		return false
+	}
+	c.healthy.Store(false)
+	return true
+}
+
 // readLoop reads messages from the WebSocket and routes them to pending requests.
-// Each connection gets its own readLoop goroutine. When the connection drops,
-// the goroutine exits, fails all pending requests, and triggers reconnection.
+// Each connection gets its own readLoop goroutine. When the live connection
+// drops, the goroutine exits, fails all pending requests, and triggers reconnection.
 func (c *Client) readLoop(conn *websocket.Conn) {
 	defer func() {
-		c.healthy.Store(false)
+		if !c.releaseReadLoop(conn) {
+			return
+		}
 		c.failAllPending(fmt.Errorf("websocket connection lost"))
 		c.triggerReconnect()
 	}()
@@ -760,6 +801,7 @@ func (c *Client) readLoop(conn *websocket.Conn) {
 			}
 			return
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
 		var resp wsResponse
 		if err := json.Unmarshal(data, &resp); err != nil {

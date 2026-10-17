@@ -1,8 +1,12 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // TestCloseIdempotent verifies that Close() can be called multiple times
@@ -113,3 +117,58 @@ func TestFailAllPendingFullChannel(t *testing.T) {
 }
 
 var errTestSentinel = fmt.Errorf("test connection lost")
+
+func TestDeadlineTimeoutMS(t *testing.T) {
+	if got := deadlineTimeoutMS(context.Background()); got != 0 {
+		t.Fatalf("no deadline = %d, want 0", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	got := deadlineTimeoutMS(ctx)
+	if got < 9*60*1000 || got > 10*60*1000 {
+		t.Fatalf("10 min deadline = %d ms", got)
+	}
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	if got := deadlineTimeoutMS(expired); got != 1 {
+		t.Fatalf("expired deadline = %d, want 1", got)
+	}
+}
+
+// A replaced socket's read loop must not clear requests the new socket owns,
+// and must not mark that new socket unhealthy.
+func TestReplacedReadLoopLeavesPending(t *testing.T) {
+	c := &Client{
+		pending:     make(map[string]*pendingReq),
+		reconnectCh: make(chan struct{}, 1),
+	}
+	oldConn := &websocket.Conn{}
+	newConn := &websocket.Conn{}
+	c.conn = newConn
+	c.healthy.Store(true)
+
+	ch := make(chan wsResponse, 1)
+	c.pending["live"] = &pendingReq{ch: ch}
+
+	if c.releaseReadLoop(oldConn) {
+		t.Fatal("replaced read loop must not own the socket")
+	}
+	if !c.healthy.Load() {
+		t.Fatal("replaced read loop marked the new socket unhealthy")
+	}
+	if _, ok := c.pending["live"]; !ok {
+		t.Fatal("replaced read loop cleared a live request")
+	}
+	select {
+	case <-c.reconnectCh:
+		t.Fatal("replaced read loop queued another reconnect")
+	default:
+	}
+
+	if !c.releaseReadLoop(newConn) {
+		t.Fatal("live read loop should own the socket")
+	}
+	if c.healthy.Load() {
+		t.Fatal("live socket drop should mark the client unhealthy")
+	}
+}

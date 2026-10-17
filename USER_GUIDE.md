@@ -285,16 +285,9 @@ Several agents can work at once (tools in parallel; Qwen GPU is one generation a
 
 ### Per-agent models
 
-The gateway **opens on Qwen**. Cron stays on Qwen (`CRON_FRAMEWORK`). Each specialist can use a different backend; `/models` and `/framework` apply **only to the agent you are chatting with**.
+The gateway **opens on Qwen**. Cron stays on Qwen (`CRON_FRAMEWORK`) unless that job names a model. Each specialist can use a different backend. `/models` and `/framework` select the model for the agent you are chatting with, and every process that agent starts uses that same model.
 
 **Pin in YAML** (sticky default for that folder):
-
-```yaml
----
-name: grey-email
-framework: qwen
----
-```
 
 ```yaml
 ---
@@ -304,9 +297,9 @@ framework: deepseek
 ---
 ```
 
-`framework:` values: `qwen` | `deepseek` | `grok` | `claude`. Omit the key to inherit gateway Qwen.
+`framework:` values: `qwen` | `deepseek` | `grok` | `claude`. Omit the key to inherit gateway Qwen. grey-email and grey-surveyor omit it.
 
-**Swap in chat** (this agent only):
+**Swap in chat** (this agent, and every process it starts):
 
 ```
 @forex-trading
@@ -340,9 +333,9 @@ or `/framework inherit` — drops the chat override (YAML pin remains if set).
 | `/framework inherit` | Same as `/models inherit` | `/framework inherit` |
 | `/model` | Framework, configured id, YAML vs override vs default | `/model` |
 
-The “Now chatting with @…” line shows `Model: … (this chat only | pinned in agent YAML | gateway default)`.
+The “Now chatting with @…” line shows `Model: …` and then whether that model was selected for this agent, pinned in agent YAML, or is the gateway default. A selection applies to every process that agent starts.
 
-Switching `@forex-trading` does **not** change `@grey-email`, `@default`, cron, or the process default. Gateway default stays Qwen unless you change `FRAMEWORK=` in `.env` (startup only).
+Switching `@forex-trading` does **not** change `@grey-email`, `@default`, cron, or the process default. Gateway default stays Qwen unless you change `FRAMEWORK=` in `.env` (startup only). The content pipeline follows the model selected for `@grey-website`.
 
 ---
 
@@ -361,7 +354,7 @@ Switching `@forex-trading` does **not** change `@grey-email`, `@default`, cron, 
 | `/agents` | Folder specialists (tap to switch). Orchestrator `/agents` is the review-agent list in §14 |
 | `/progress` | Peek without cancelling (`/progress @Name`, `/progress all`) |
 | `/default` | Leave specialist; chat with the main assistant |
-| `/models` | Model for **this agent only** (Qwen / DeepSeek / Grok). `/models inherit` drops the override |
+| `/models` | Model for **this agent and every process it starts** (Qwen / DeepSeek / Grok). `/models inherit` drops the selection |
 | `/framework` | Same as `/models`, by backend name. `/framework inherit` to inherit gateway Qwen |
 | `/model` | Show this agent's framework and last API model |
 | `/cronlist` | List all scheduled jobs (schedule, enabled, next run) |

@@ -24,7 +24,8 @@ FROM node:20-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       python3 python3-pip git ca-certificates curl \
-      libreoffice-calc openssh-client rsync cups-client jq && \
+      libreoffice-calc openssh-client rsync cups-client jq \
+      musl && \
     rm -rf /var/lib/apt/lists/*
 
 # Python packages for grey-docs skills (awards, notices, schedule of condition)
@@ -47,6 +48,16 @@ ENV PATH="/root/.claude/local/bin:$PATH"
 
 # Log installed Claude Code version (must support Opus 4.6, released Feb 2026)
 RUN claude --version || true
+
+# Startup copies the host ~/.claude mount over /root/.claude, which can
+# replace this binary with a host build the container cannot exec.
+# Keep an image-owned copy outside that directory.
+RUN mkdir -p /usr/local/lib/claude-code \
+ && bin="$(readlink -f /root/.claude/local/bin/claude 2>/dev/null || true)" \
+ && if [ -n "$bin" ] && [ -x "$bin" ]; then \
+      cp -a "$bin" /usr/local/lib/claude-code/claude && \
+      chmod 755 /usr/local/lib/claude-code/claude; \
+    fi
 
 # Also keep the npm CLI for backward compatibility with /run-agent endpoint
 RUN npm install -g @anthropic-ai/claude-code
@@ -86,6 +97,20 @@ RUN NODE_OPTIONS=--dns-result-order=ipv4first \
       sleep 5; \
     done && \
     test -d node_modules/@anthropic-ai/claude-agent-sdk
+
+# The SDK spawns this file directly. A non-executable bit or a musl build
+# whose loader is missing both surface as "exists but failed to launch".
+# musl is installed above so either platform package can exec.
+RUN set -e; \
+    found=0; \
+    for b in \
+      node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude \
+      node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl/claude \
+      node_modules/@anthropic-ai/claude-agent-sdk-linux-arm64/claude \
+      node_modules/@anthropic-ai/claude-agent-sdk-linux-arm64-musl/claude; do \
+      if [ -f "$b" ]; then chmod 755 "$b"; "$b" --version; found=1; fi; \
+    done; \
+    test "$found" = 1
 
 # Go toolchain — agents run `go test` / `go build` against /workspace.
 # Copied from the official bookworm image so glibc matches node:20-slim.

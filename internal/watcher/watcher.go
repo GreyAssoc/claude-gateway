@@ -15,6 +15,14 @@ import (
 	"github.com/you/claude-gateway/internal/ratelimiter"
 )
 
+func watcherScope(a agent.Backend, sessionID string) ratelimiter.Scope {
+	fw := "claude"
+	if a != nil && a.Name() != "" {
+		fw = a.Name()
+	}
+	return ratelimiter.Scope{Framework: fw, SessionID: sessionID, Model: fw}
+}
+
 // NotifyFunc sends notifications to the user.
 type NotifyFunc func(text string)
 
@@ -181,8 +189,11 @@ func (g *gmailWatcher) check(ctx context.Context) {
 	g.lastCheck = time.Now()
 	g.mu.Unlock()
 
-	if !g.limiter.CanProceed(500) {
-		return // silently skip when rate limited
+	scope := watcherScope(g.agent, "watcher-gmail")
+	if g.limiter != nil {
+		if d := g.limiter.Admit(scope, 500); !d.OK {
+			return // this watcher's own window or RPM; other agents are unaffected
+		}
 	}
 
 	prompt := strings.ReplaceAll(g.prompt, "{since}", since.Format(time.RFC3339))
@@ -196,8 +207,8 @@ func (g *gmailWatcher) check(ctx context.Context) {
 		return
 	}
 
-	if resp.Usage != nil {
-		g.limiter.Record(resp.Usage)
+	if g.limiter != nil && (resp.Usage != nil || resp.Context != nil) {
+		g.limiter.Record(scope, resp.Usage, resp.Context, !ratelimiter.Unlimited(scope.Framework))
 	}
 
 	output := strings.TrimSpace(resp.Text)
@@ -245,8 +256,11 @@ func newCalendarWatcher(a agent.Backend, l *ratelimiter.Limiter, n NotifyFunc, w
 }
 
 func (c *calendarWatcher) check(ctx context.Context) {
-	if !c.limiter.CanProceed(500) {
-		return
+	scope := watcherScope(c.agent, "watcher-calendar")
+	if c.limiter != nil {
+		if d := c.limiter.Admit(scope, 500); !d.OK {
+			return
+		}
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -258,8 +272,8 @@ func (c *calendarWatcher) check(ctx context.Context) {
 		return
 	}
 
-	if resp.Usage != nil {
-		c.limiter.Record(resp.Usage)
+	if c.limiter != nil && (resp.Usage != nil || resp.Context != nil) {
+		c.limiter.Record(scope, resp.Usage, resp.Context, !ratelimiter.Unlimited(scope.Framework))
 	}
 
 	output := strings.TrimSpace(resp.Text)
