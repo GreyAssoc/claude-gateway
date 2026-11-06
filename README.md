@@ -76,6 +76,7 @@ Two Compose services (`gateway`, `sidecar`) plus host PostgreSQL and optional lo
 | **Multi-provider** | `claude`, `deepseek`, `grok`, `qwen` (default often Qwen); per-agent `/models` / YAML `framework:` |
 | **Session control** | `/stop`, progress (`/progress`, `/who`), auto-compaction at context threshold |
 | **SaaS builder** | `@saas-builder` multi-role pipeline with project ledger under `<project>/saas-builder/` |
+| **Agent creator** | `@agent-creator` scaffolds/edits other Telegram specialists and review teams (see [example](#example-agent-agent-creator)) |
 | **Install** | Interactive `install.sh` wizard (Linux / macOS / Windows 11 WSL2) + `make` / Compose |
 
 ### Repo layout (high level)
@@ -191,6 +192,54 @@ Draft an email to Sarah about the invoice
 ```
 
 Named agents, SaaS builder flow, Google permissions, and rate limits are detailed in the user guide (§3–§16).
+
+---
+
+## Example agent: `@agent-creator`
+
+Specialists are folders under `.claude/agents/<handle>/`. Each has a DNA markdown file (and optional private `skill-*.md` files). The gateway registers them for Telegram as `@Handle`. **`@agent-creator`** is the meta-agent that **designs and writes those specialists** (and review teams) for you.
+
+### What it is for
+
+You talk to `@agent-creator` in Telegram when you want a new agent or to change an existing one. It does not run forex, email, or other product work unless you ask it to copy a pattern from an existing agent file. Its job is **scaffold and edit agent DNA**.
+
+### What it can create
+
+| Kind | Where it writes | How you use it |
+|---|---|---|
+| **Specialist agent** | `.claude/agents/<handle>/<handle>.md` (+ optional `skill-*.md`) | Message `@Handle` in Telegram |
+| **Review team** | `.claude/teams/coding/<team-name>/*.md` | Orchestrator `/review…` commands |
+
+Specialist DNA typically includes:
+
+- YAML frontmatter: `name`, optional `project:` (pinned cwd — no “find the repo” hunting), optional `framework:` (`qwen` / `deepseek` / `grok` / `claude`)
+- A bold project path on the first body line when the agent owns a repo
+- **Conversation first** — chat without tools until the ask is concrete (file, bug, test, deploy)
+- Hard rules (e.g. never commit/push/deploy or touch live money unless asked)
+
+### How a session with it feels
+
+```
+You:    @agent-creator let's make an agent for client invoices
+Agent:  Asks a few clarifying questions (handle, one-line job, project path, must-not-do)
+You:    handle grey-invoices, project /workspace/projects/invoices, no deploy
+Agent:  Writes .claude/agents/grey-invoices/grey-invoices.md
+        (and a skill file if needed)
+        Tells you to try @GreyInvoices — gateway watches the agents folder
+```
+
+Private skill example in that folder: `skill-agent-scaffold.md` (`command: agent-scaffold`) — the checklist it follows when scaffolding a new specialist.
+
+### Why this example matters
+
+`@agent-creator` shows the gateway’s agent model in one picture:
+
+1. **Agents are files**, not only prompts baked into Go.
+2. **Telegram `@handles`** map to folders the gateway syncs into Postgres.
+3. **Pinned projects + frameworks** keep specialists on the right repo and model.
+4. You can grow the system by **talking to an agent that writes other agents**, then immediately messaging the new `@Handle`.
+
+Other specialists (`@forex-trading`, `@saas-builder`, website agents, …) follow the same folder/DNA pattern; they differ in job, project pin, and skills.
 
 ---
 
