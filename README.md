@@ -75,7 +75,7 @@ Two Compose services (`gateway`, `sidecar`) plus host PostgreSQL and optional lo
 | **Local triage** | Ollama/vLLM pre-screen to save tokens; graceful degrade if local LLM is down |
 | **Multi-provider** | `claude`, `deepseek`, `grok`, `qwen` (default often Qwen); per-agent `/models` / YAML `framework:` |
 | **Session control** | `/stop`, progress (`/progress`, `/who`), auto-compaction at context threshold |
-| **SaaS builder** | `@saas-builder` multi-role pipeline with project ledger under `<project>/saas-builder/` |
+| **SaaS builder** | `@saas-builder` multi-role pipeline with project ledger under `<project>/saas-builder/` (see [example](#example-agent-saas-builder)) |
 | **Agent creator** | `@agent-creator` scaffolds/edits other Telegram specialists and review teams (see [example](#example-agent-agent-creator)) |
 | **Install** | Interactive `install.sh` wizard (Linux / macOS / Windows 11 WSL2) + `make` / Compose |
 
@@ -239,7 +239,81 @@ Private skill example in that folder: `skill-agent-scaffold.md` (`command: agent
 3. **Pinned projects + frameworks** keep specialists on the right repo and model.
 4. You can grow the system by **talking to an agent that writes other agents**, then immediately messaging the new `@Handle`.
 
-Other specialists (`@forex-trading`, `@saas-builder`, website agents, …) follow the same folder/DNA pattern; they differ in job, project pin, and skills.
+Other specialists (`@forex-trading`, website agents, …) follow the same folder/DNA pattern as `@agent-creator`; they differ in job, project pin, and skills. **`@saas-builder` is a separate class** — see below.
+
+---
+
+## Example agent: `@saas-builder`
+
+`@saas-builder` is the gateway’s **product-building pipeline agent**. Unlike most specialists, it is not pinned to one repo in YAML. You name the project directory and the kind of work; the gateway drives a **four-role loop** until that work is done (or you stop it).
+
+Frontmatter: `class: class-saas-builder`. That class is unique — other agents keep the standard path (including Qwen). SaaS builder **refuses Qwen**; use DeepSeek or Grok (`/models`).
+
+### What it is for
+
+Build or extend a micro-SaaS (or any product tree under `/workspace/projects/`) with disciplined roles:
+
+| Role | Job |
+|---|---|
+| **Intake** | Interview one question at a time; write `<project>/saas-builder/docs/scope.md` from existing specs + gaps |
+| **Architecture** | Own architecture + backlog; issue task specs; integrate |
+| **Coding** | Implement exactly one task spec; tests + result package |
+| **Review** | Independently verify diff vs spec; verdict only — does not rewrite code |
+
+The **gateway** is the driver (`next.sh` between roles). Each role runs in a **fresh sidecar session**. Progress lives in the **product**, not in the agent folder.
+
+### Where files go
+
+| Location | Contents |
+|---|---|
+| `<project>/` | Real product source (app code, README, …) |
+| `<project>/saas-builder/` | Ledger, scope, handoffs, task notes, copied templates, optional `PLAN.md` |
+| `.claude/agents/saas-builder/` | Role prompts + templates (**read/copy only** — never edit to fit a product) |
+
+### How a session feels
+
+```
+You:    @saas-builder
+        /workspace/projects/calendar
+        a single feature
+
+Agent:  Intake reads existing docs, fills saas-builder/docs/scope.md,
+        asks one question about the first gap
+        …
+
+Gateway: Scope ready — start building?
+
+You:    yes
+
+Gateway: Architecture → Coding → Review (fresh sessions) until the
+         named work is built (one slice for a single feature)
+```
+
+You can send directory + kind of work in one message. Kind of work options: entire project, single feature, refactor (same tree), plan-first, or a custom outcome.
+
+### Control commands
+
+| You send | What happens |
+|---|---|
+| `yes` / `/start_building` | Run Architecture → Coding → Review until the ledger is done |
+| `no` | Keep scope on disk; do not build yet |
+| `/progress` | Phase, repo, kind of work, slice, task, next actor, in-flight? |
+| `/stop` | Pause; cancel in-flight role |
+| `/resume` (or `/pipeline_resume`) | Continue the same project (does not skip gates or switch repos) |
+| Another project directory after `/stop` or finish | Start/resume that project; previous `saas-builder/` left intact |
+
+The loop also pauses on human gates, Intake returning, no progress twice, or 40 role steps — then `/resume` continues.
+
+### Why this example matters
+
+Together with `@agent-creator`:
+
+1. **`@agent-creator`** *writes agents* (files under `.claude/agents/`).
+2. **`@saas-builder`** *builds products* (files under a project tree) with a gated multi-role pipeline the gateway orchestrates.
+
+That is the two-layer agent story: create specialists when you need new handles; use saas-builder when you need an entire feature or product built with intake → architecture → coding → review.
+
+Full operator detail: [USER_GUIDE.md § SaaS builder](USER_GUIDE.md) · class note: [`docs/autonomous-agent-class.md`](docs/autonomous-agent-class.md).
 
 ---
 
